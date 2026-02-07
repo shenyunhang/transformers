@@ -39,19 +39,19 @@ from ...video_processing_utils import BaseVideoProcessor
 from ...feature_extraction_sequence_utils import SequenceFeatureExtractor
 from ...configuration_utils import PreTrainedConfig
 from ...utils import logging
-from ..deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+from ..youtu.configuration_youtu import YoutuConfig
 from ..siglip2.configuration_siglip2 import Siglip2VisionConfig
 # from ..siglip2.modeling_siglip2 import Siglip2VisionModel, Siglip2VisionTransformer
-from ..deepseek_v3.modeling_deepseek_v3 import DeepseekV3Attention
-from ..llama.modeling_llama import (
-    LlamaDecoderLayer,
-    LlamaForCausalLM,
-    LlamaModel,
-    LlamaPreTrainedModel,
-    LlamaRMSNorm,
-    LlamaRotaryEmbedding,
+from ..youtu.modeling_youtu import (
+    YoutuAttention,
+    YoutuMLP,
+    YoutuDecoderLayer,
+    YoutuForCausalLM,
+    YoutuModel,
+    YoutuPreTrainedModel,
+    YoutuRMSNorm,
+    YoutuRotaryEmbedding,
 )
-from ..qwen3.modeling_qwen3 import Qwen3MLP
 from ...feature_extraction_utils import BatchFeature
 from ...image_utils import ImageInput
 from ...processing_utils import ProcessingKwargs, ProcessorMixin, Unpack, VideosKwargs, AudioKwargs, ImagesKwargs
@@ -161,7 +161,7 @@ class YoutuVITAVisionConfig(PreTrainedConfig):
         self.out_hidden_size = out_hidden_size
 
 
-class YoutuVITATextConfig(DeepseekV3Config):
+class YoutuVITATextConfig(YoutuConfig):
     r"""
     This is the configuration class to store the configuration of a [`YoutuVITAModel`]. It is used to instantiate an YoutuVITA
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -1057,23 +1057,23 @@ class YoutuVITAVisionPatchMerger(nn.Module):
         return x
 
 
-class YoutuVITATextRMSNorm(LlamaRMSNorm):
+class YoutuVITATextRMSNorm(YoutuRMSNorm):
     pass
 
 
-class YoutuVITATextRotaryEmbedding(LlamaRotaryEmbedding):
+class YoutuVITATextRotaryEmbedding(YoutuRotaryEmbedding):
     pass
 
 
-class YoutuVITATextMLP(Qwen3MLP):
+class YoutuVITATextMLP(YoutuMLP):
     pass
 
 
-class YoutuVITATextAttention(DeepseekV3Attention):
+class YoutuVITATextAttention(YoutuAttention):
     pass
 
 
-class YoutuVITATextDecoderLayer(LlamaDecoderLayer):
+class YoutuVITATextDecoderLayer(YoutuDecoderLayer):
     pass
 
 class YoutuVITAAudioPreTrainedModel(PreTrainedModel):
@@ -1674,7 +1674,7 @@ class YoutuVITAVisionModel(YoutuVITAVisionPreTrainedModel):
         )
 
 
-class YoutuVITATextModel(YoutuVITAPreTrainedModel, LlamaModel):
+class YoutuVITATextModel(YoutuVITAPreTrainedModel, YoutuModel):
     config: YoutuVITATextConfig
 
 

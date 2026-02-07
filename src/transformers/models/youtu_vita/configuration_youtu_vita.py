@@ -277,6 +277,9 @@ class YoutuVITATextConfig(PreTrainedConfig):
         else:
             self.embedding_initializer_range = embedding_initializer_range
 
+    def convert_rope_params_to_dict(self, ignore_keys_at_rope_validation: set | None = None, **kwargs):
+        raise AttributeError("Not overwritten for the YoutuVITA model!")
+
 
 class YoutuVITAConfig(PreTrainedConfig):
     r"""
