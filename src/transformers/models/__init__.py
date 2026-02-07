@@ -431,6 +431,7 @@ if TYPE_CHECKING:
     from .yolos import *
     from .yoso import *
     from .youtu import *
+    from .youtu_vita import *
     from .zamba import *
     from .zamba2 import *
     from .zoedepth import *

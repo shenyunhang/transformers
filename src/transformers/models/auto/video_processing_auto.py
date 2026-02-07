@@ -76,6 +76,7 @@ else:
             ("video_llava", "VideoLlavaVideoProcessor"),
             ("videomae", "VideoMAEVideoProcessor"),
             ("vjepa2", "VJEPA2VideoProcessor"),
+            ("youtu_vita", "YoutuVITAVideoProcessor"),
         ]
     )
 
