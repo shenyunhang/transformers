@@ -157,7 +157,6 @@ class YoutuVITAProcessor(ProcessorMixin):
                     input_ids,
                     images_or_paths,
                     self.tokenizer,
-                    # image_token_length=self.image_token_length,
                     **output_kwargs["images_kwargs"],
                 )
             )
@@ -183,18 +182,10 @@ class YoutuVITAProcessor(ProcessorMixin):
                 self.tokenizer,
                 **output_kwargs["videos_kwargs"],
             )
-            if audios is None:
-                print(
-                    f"{videos_or_paths=} {len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw.size()=}"
-                )
-            elif images is None:
-                print(
-                    f"{videos_or_paths=} {len(input_ids)=} {len(audios)=} {[x.size() for x in audios]=} {len(audio_indices)=}"
-                )
-            else:
-                print(
-                    f"{videos_or_paths=} {len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw.size()=} {len(audios)=} {[x.size() for x in audios]=} {len(audio_indices)=}"
-                )
+            if images is not None:
+                print(f"{len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw=}")
+            if audios is not None:
+                print(f"{len(input_ids)=} {len(audios)=} {[x.size() for x in audios]=} {len(audio_indices)=}")
 
             if audios is None:
                 audio_seqlens = None

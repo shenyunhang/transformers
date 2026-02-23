@@ -1821,7 +1821,7 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
         use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
-        if (past_key_values is None or len(past_key_values) == 0) and images is not None:
+        if images is not None:
             device = self.get_input_embeddings().weight.data.device
             dtype = self.get_input_embeddings().weight.data.dtype
             images = images.to(dtype).to(device)
@@ -1905,7 +1905,7 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
             fake_images = None
             image_embeds = None
 
-        if (past_key_values is None or len(past_key_values) == 0) and audios is not None:
+        if audios is not None:
             audio_embeds, audio_lengths = self.audio_model(audios)
             # if torch.distributed.get_rank() == 0:
             #     print(f"audio_embeds {audio_embeds.size()}")
@@ -2064,6 +2064,44 @@ class YoutuVITAForCausalLM(YoutuVITAPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Cache | None = None,
+        attention_mask: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        images: torch.FloatTensor | None = None,
+        image_indices: torch.LongTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        audios: torch.FloatTensor | None = None,
+        audio_indices: torch.LongTensor | None = None,
+        is_first_iteration: bool | None = False,
+        **kwargs,
+    ):
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            use_cache=use_cache,
+            images=images,
+            image_indices=image_indices,
+            image_grid_thw=image_grid_thw,
+            audios=audios,
+            audio_indices=audio_indices,
+            is_first_iteration=is_first_iteration,
+            **kwargs,
+        )
+
+        if not is_first_iteration and use_cache:
+            model_inputs["images"] = None
+            model_inputs["audios"] = None
+
+        return model_inputs
 
 
 @dataclass

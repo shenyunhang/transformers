@@ -163,169 +163,11 @@ class YoutuVITAVisionConfig(PreTrainedConfig):
 
 class YoutuVITATextConfig(YoutuConfig):
     r"""
-    This is the configuration class to store the configuration of a [`YoutuVITAModel`]. It is used to instantiate an YoutuVITA
-    model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the YoutuVITA-LLM-2B.
-    e.g. [tencent/YoutuVITA-LLM-2B](https://huggingface.co/tencent/YoutuVITA-LLM-2B)
-
-    Configuration objects inherit from [`PreTrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PreTrainedConfig`] for more information.
-
-    Args:
-        vocab_size (`int`, *optional*, defaults to 128256):
-            Vocabulary size of the Deep model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`YoutuVITAModel`]
-        hidden_size (`int`, *optional*, defaults to 2048):
-            Dimension of the hidden representations.
-        intermediate_size (`int`, *optional*, defaults to 6144):
-            Dimension of the MLP representations.
-        num_hidden_layers (`int`, *optional*, defaults to 32):
-            Number of hidden layers in the Transformer decoder.
-        num_attention_heads (`int`, *optional*, defaults to 16):
-            Number of attention heads for each attention layer in the Transformer decoder.
-        num_key_value_heads (`int`, *optional*, defaults to 16):
-            In MLA, num_key_value_heads=num_attention_heads.
-        kv_lora_rank (`int`, *optional*, defaults to 512):
-            Rank of the LoRA matrices for key and value projections.
-        q_lora_rank (`int`, *optional*, defaults to 1536):
-            Rank of the LoRA matrices for query projections.
-        qk_rope_head_dim (`int`, *optional*, defaults to 64):
-            Dimension of the query/key heads that use rotary position embeddings.
-        v_head_dim (`int`, *optional*, defaults to 128):
-            Dimension of the value heads.
-        qk_nope_head_dim (`int`, *optional*, defaults to 128):
-            Dimension of the query/key heads that don't use rotary position embeddings.
-        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
-            The non-linear activation function (function or string) in the decoder.
-        max_position_embeddings (`int`, *optional*, defaults to 131072):
-            The maximum sequence length that this model might ever be used with.
-        initializer_range (`float`, *optional*):
-            The standard deviation of the truncated_normal_initializer for initializing all weight matrices, except embedding matrices.
-        embedding_initializer_range (`float`, *optional*):
-            The standard deviation of the truncated_normal_initializer for initializing all embedding matrices.
-        rms_norm_eps (`float`, *optional*, defaults to 1e-06):
-            The epsilon used by the rms normalization layers.
-        use_cache (`bool`, *optional*, defaults to `True`):
-            Whether or not the model should return the last key/values attentions (not used by all models). Only
-            relevant if `config.is_decoder=True`.
-        pad_token_id (`int`, *optional*):
-            Padding token id.
-        bos_token_id (`int`, *optional*, defaults to 128000):
-            Beginning of stream token id.
-        eos_token_id (`int`, *optional*, defaults to 128001):
-            End of stream token id.
-        tie_word_embeddings (`bool`, *optional*, defaults to `True`):
-            Whether to tie weight embeddings
-        rope_parameters (`RopeParameters`, *optional*):
-            Dictionary containing the configuration parameters for the RoPE embeddings. The dictionary should contain
-            a value for `rope_theta` and optionally parameters used for scaling in case you want to use RoPE
-            with longer `max_position_embeddings`.
-        rope_interleave (`bool`, *optional*, defaults to `True`):
-            Whether to interleave the rotary position embeddings.
-        attention_bias (`bool`, defaults to `False`, *optional*, defaults to `False`):
-            Whether to use a bias in the query, key, value and output projection layers during self-attention.
-        attention_dropout (`float`, *optional*, defaults to 0.0):
-            The dropout ratio for the attention probabilities.
-    ```python
-    >>> from transformers import YoutuVITAModel, YoutuVITAConfig
-    >>> # Initializing a YoutuVITA-LLM-2B style configuration
-    >>> configuration = YoutuVITAConfig()
-    >>> # Accessing the model configuration
-    >>> configuration = model.config
-    ```"""
-
+    YoutuVITATextConfig
+    """
     model_type = "youtu_vita_text"
     base_config_key = "text_config"
-    base_model_tp_plan = {
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
-    }
-    attribute_map = {}
-
-    def __init__(
-        self,
-        vocab_size: int | None = 128256,
-        hidden_size: int | None = 2048,
-        intermediate_size: int | None = 6144,
-        num_hidden_layers: int | None = 32,
-        num_attention_heads: int | None = 16,
-        num_key_value_heads: int | None = 16,
-        kv_lora_rank: int | None = 512,
-        q_lora_rank: int | None = 1536,
-        qk_rope_head_dim: int | None = 64,
-        v_head_dim: int | None = 128,
-        qk_nope_head_dim: int | None = 128,
-        hidden_act: str | None = "silu",
-        max_position_embeddings: int | None = 131072,
-        initializer_range: float | None = None,
-        embedding_initializer_range: float | None = None,
-        rms_norm_eps: int | None = 1e-6,
-        use_cache: bool | None = True,
-        pad_token_id: int | None = None,
-        bos_token_id: int | None = 128000,
-        eos_token_id: int | None = 128001,
-        tie_word_embeddings: bool | None = True,
-        rope_parameters: RopeParameters | dict[str, RopeParameters] = None,
-        rope_interleave: bool | None = True,
-        attention_bias: bool | None = False,
-        attention_dropout: float | None = 0.0,
-        **kwargs,
-    ):
-        super().__init__(
-            vocab_size=vocab_size,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            num_hidden_layers=num_hidden_layers,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            kv_lora_rank=kv_lora_rank,
-            q_lora_rank=q_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            v_head_dim=v_head_dim,
-            qk_nope_head_dim=qk_nope_head_dim,
-            hidden_act=hidden_act,
-            max_position_embeddings=max_position_embeddings,
-            rms_norm_eps=rms_norm_eps,
-            use_cache=use_cache,
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            rope_parameters=rope_parameters,
-            rope_interleave=rope_interleave,
-            attention_bias=attention_bias,
-            attention_dropout=attention_dropout,
-            **kwargs,
-        )
-
-        # remove unused attribute
-        del self.n_shared_experts
-        del self.n_routed_experts
-        del self.routed_scaling_factor
-        del self.n_group
-        del self.topk_group
-        del self.num_experts_per_tok
-        del self.first_k_dense_replace
-        del self.norm_topk_prob
-        del self.pretraining_tp
-        del self.moe_intermediate_size
-
-        # if initializer_range is None, set it to 2.0 / (5.0 * self.hidden_size) ** 0.5 (if hidden size is valid)
-        if self.initializer_range is None:
-            if self.hidden_size != 0:
-                self.initializer_range = 2.0 / (5.0 * self.hidden_size) ** 0.5
-            else:
-                self.initializer_range = 0.02
-
-        # if embedding_initializer_range is None, set it to 2.0 * self.initializer_range
-        if embedding_initializer_range is None:
-            self.embedding_initializer_range = 2.0 * self.initializer_range
-        else:
-            self.embedding_initializer_range = embedding_initializer_range
-
-    def convert_rope_params_to_dict(self, ignore_keys_at_rope_validation: set | None = None, **kwargs):
-        raise AttributeError("Not overwritten for the YoutuVITA model!")
+    pass
 
 
 class YoutuVITAConfig(PreTrainedConfig):
@@ -1708,7 +1550,7 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
 
-        if (past_key_values is None or len(past_key_values) == 0) and images is not None:
+        if images is not None:
             device = self.get_input_embeddings().weight.data.device
             dtype = self.get_input_embeddings().weight.data.dtype
             images = images.to(dtype).to(device)
@@ -1779,7 +1621,7 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
             fake_images = None
             image_embeds = None
 
-        if (past_key_values is None or len(past_key_values) == 0) and audios is not None:
+        if audios is not None:
             audio_embeds, audio_lengths = self.audio_model(audios)
             # if torch.distributed.get_rank() == 0:
             #     print(f"audio_embeds {audio_embeds.size()}")
@@ -1935,6 +1777,44 @@ class YoutuVITAForCausalLM(YoutuVITAPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Cache | None = None,
+        attention_mask: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        images: torch.FloatTensor | None = None,
+        image_indices: torch.LongTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        audios: torch.FloatTensor | None = None,
+        audio_indices: torch.LongTensor | None = None,
+        is_first_iteration: bool | None = False,
+        **kwargs,
+    ):
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            use_cache=use_cache,
+            images=images,
+            image_indices=image_indices,
+            image_grid_thw=image_grid_thw,
+            audios=audios,
+            audio_indices=audio_indices,
+            is_first_iteration=is_first_iteration,
+            **kwargs,
+        )
+
+        if not is_first_iteration and use_cache:
+            model_inputs["images"] = None
+            model_inputs["audios"] = None
+
+        return model_inputs
 
 
 from transformers.trainer_pt_utils import LabelSmoother
@@ -6716,7 +6596,6 @@ class YoutuVITAProcessor(ProcessorMixin):
         audios_or_paths: AudioInput | None = None,
         **kwargs: Unpack[YoutuVITAProcessorKwargs],
     ) -> BatchFeature:
-
         print(f"{text=}")
         print(f"{images_or_paths=}")
         print(f"{videos_or_paths=}")
@@ -6763,7 +6642,6 @@ class YoutuVITAProcessor(ProcessorMixin):
                 input_ids,
                 images_or_paths,
                 self.tokenizer,
-                # image_token_length=self.image_token_length,
                 **output_kwargs["images_kwargs"],
             )
             print(f"{images_or_paths=} {len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw=}")
@@ -6781,23 +6659,17 @@ class YoutuVITAProcessor(ProcessorMixin):
                 audio_indices,
                 image_grid_thw,
                 second_per_grids,
-            # ) = self.video_processor.add_video_input_contiguous(
+                # ) = self.video_processor.add_video_input_contiguous(
             ) = self.video_processor.add_video_input_discrete_or_contiguous(
                 input_ids,
                 videos_or_paths,
                 self.tokenizer,
                 **output_kwargs["videos_kwargs"],
             )
-            if audios is None:
-                print(f"{videos_or_paths=} {len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw.size()=}")
-            elif images is None:
-                print(
-                    f"{videos_or_paths=} {len(input_ids)=} {len(audios)=} {[x.size() for x in audios]=} {len(audio_indices)=}"
-                )
-            else:
-                print(
-                    f"{videos_or_paths=} {len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw.size()=} {len(audios)=} {[x.size() for x in audios]=} {len(audio_indices)=}"
-                )
+            if images is not None:
+                print(f"{len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw=}")
+            if audios is not None:
+                print(f"{len(input_ids)=} {len(audios)=} {[x.size() for x in audios]=} {len(audio_indices)=}")
 
             if audios is None:
                 audio_seqlens = None
