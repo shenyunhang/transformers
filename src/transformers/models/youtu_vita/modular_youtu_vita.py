@@ -29,7 +29,6 @@ import ffmpeg
 import time
 
 from ... import initialization as init
-from ...modeling_rope_utils import RopeParameters
 from ...modeling_utils import PreTrainedModel
 from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, BaseModelOutputWithPooling
 from ...generation import GenerationMixin
@@ -1847,7 +1846,7 @@ class DEFAULT_TOKEN:
             print(f"♾️ {field.name} {getattr(self, field.name)}")
 
 
-class UTU_VITA_TOKEN(DEFAULT_TOKEN):
+class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
 
     IM_START = "<|begin_of_text|>"
     IM_END = "<|end_of_text|>"
@@ -1953,105 +1952,8 @@ class UTU_VITA_TOKEN(DEFAULT_TOKEN):
             ]
         )
 
-class UTU_VL_TOKEN(DEFAULT_TOKEN):
 
-    IM_START = "<|begin_of_text|>"
-    IM_END = "<|end_of_text|>"
-    USER = "user"
-    ASSISTANT = "assistant"
-    SYSTEM = "system"
-
-    THINK_START_TOKEN = "<think>"
-    THINK_END_TOKEN = "</think>"
-    CODE_START_TOKEN = "<code>"
-    CODE_END_TOKEN = "</code>"
-    ANSWER_START_TOKEN = "<answer>"
-    ANSWER_END_TOKEN = "</answer>"
-
-    TOOL_CALL_START_TOKEN = "<tool_call>"
-    TOOL_CALL_END_TOKEN = "</tool_call>"
-    TOOL_RESPONSE_START_TOKEN = "<tool_response>"
-    TOOL_RESPONSE_END_TOKEN = "</tool_response>"
-
-    IMG_TAG_TOKEN = "<|image|>"
-    IMG_CONTEXT_TOKEN = "<|image_pad|>"
-    IMG_START_TOKEN = "<|vision_start|>"
-    IMG_END_TOKEN = "<|vision_end|>"
-
-    VID_TAG_TOKEN = "<|video|>"
-    VID_CONTEXT_TOKEN = "<|video_pad|>"
-    VID_START_TOKEN = "<|video_start|>"
-    VID_END_TOKEN = "<|video_end|>"
-
-    POLY_START_TOKEN = "<poly>"
-    POLY_END_TOKEN = "</poly>"
-    INS_START_TOKEN = "<ins>"
-    INS_END_TOKEN = "</ins>"
-    CKPT_START_TOKEN = "<kpt>"
-    CKPT_END_TOKEN = "</kpt>"
-    BOX_START_TOKEN = "<box>"
-    BOX_END_TOKEN = "</box>"
-    REF_START_TOKEN = "<ref>"
-    REF_END_TOKEN = "</ref>"
-    FG_TOKEN = "<FG>"
-    BG_TOKEN = "<BG>"
-    OTHERS_TOKEN = "<OTHERS>"
-
-    def __init__(self):
-        logger.info(f"♾️ {self.__class__.__name__=}")
-        print(f"♾️ {self.__class__.__name__=}")
-        super().__init__()
-
-        for i in range(2048):
-            for axis in ["x", "y"]:
-                setattr(self, f"{axis}_{i}_TOKEN", f"<{axis}_{i}>")
-
-        for i in range(1, 1001):
-            setattr(self, f"custom_{i}_TOKEN", f"<custom_{i}>")
-
-    def get_special_tokens(self):
-        return (
-            [getattr(self, f"{axis}_{i}_TOKEN") for i in range(2048) for axis in ["x", "y"]]
-            + [getattr(self, f"custom_{i}_TOKEN") for i in range(1, 1001)]
-            + [
-                self.POLY_START_TOKEN,
-                self.POLY_END_TOKEN,
-                self.INS_START_TOKEN,
-                self.INS_END_TOKEN,
-                self.CKPT_START_TOKEN,
-                self.CKPT_END_TOKEN,
-                self.BOX_START_TOKEN,
-                self.BOX_END_TOKEN,
-                self.REF_START_TOKEN,
-                self.REF_END_TOKEN,
-                self.FG_TOKEN,
-                self.BG_TOKEN,
-                self.OTHERS_TOKEN,
-                self.THINK_START_TOKEN,
-                self.THINK_END_TOKEN,
-                self.CODE_START_TOKEN,
-                self.CODE_END_TOKEN,
-                self.ANSWER_START_TOKEN,
-                self.ANSWER_END_TOKEN,
-                self.TOOL_CALL_START_TOKEN,
-                self.TOOL_CALL_END_TOKEN,
-                self.TOOL_RESPONSE_START_TOKEN,
-                self.TOOL_RESPONSE_END_TOKEN,
-                self.IM_START,
-                self.IM_END,
-                self.IMG_TAG_TOKEN,
-                self.IMG_CONTEXT_TOKEN,
-                self.IMG_START_TOKEN,
-                self.IMG_END_TOKEN,
-                self.VID_TAG_TOKEN,
-                self.VID_CONTEXT_TOKEN,
-                self.VID_START_TOKEN,
-                self.VID_END_TOKEN,
-            ]
-        )
-
-
-class VITA_TOKEN(DEFAULT_TOKEN):
+class Qwen3_VITA_TOKEN(DEFAULT_TOKEN):
     IM_START = "<|im_start|>"
     IM_END = "<|im_end|>"
     USER = "user"
@@ -2122,33 +2024,12 @@ class VITA_TOKEN(DEFAULT_TOKEN):
         ]
 
 
-# _GLOBAL_TOKEN = VITA_TOKEN()
-# _GLOBAL_TOKEN = UTU_VL_TOKEN()
-_GLOBAL_TOKEN = UTU_VITA_TOKEN()
-
-# _GLOBAL_TOKEN = None
+# _GLOBAL_TOKEN = Qwen3_VITA_TOKEN()
+_GLOBAL_TOKEN = Youtu_VITA_TOKEN()
 
 
 def get_token():
     _ensure_var_is_initialized(_GLOBAL_TOKEN, "token")
-    return _GLOBAL_TOKEN
-
-
-def set_token(args):
-    global _GLOBAL_TOKEN
-
-    if args.dataset_type == "vita":
-        _GLOBAL_TOKEN = VITA_TOKEN()
-
-    elif args.dataset_type == "utu_vl":
-        _GLOBAL_TOKEN = UTU_VL_TOKEN()
-
-    if args.dataset_type == "utu_vita" or args.dataset_type == "utu_vita_pretrain":
-        _GLOBAL_TOKEN = UTU_VITA_TOKEN()
-
-    else:
-        raise NotImplementedError
-
     return _GLOBAL_TOKEN
 
 

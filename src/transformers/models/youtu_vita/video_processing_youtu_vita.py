@@ -35,15 +35,12 @@ import torch
 import torchaudio
 
 from ...video_processing_utils import BaseVideoProcessor
-from .modeling_youtu_vita import UTU_VITA_TOKEN
+from .modeling_youtu_vita import Youtu_VITA_TOKEN
 from .processing_youtu_vita import YoutuVITAVideosKwargs
 
 
-# _GLOBAL_TOKEN = VITA_TOKEN()
-# _GLOBAL_TOKEN = UTU_VL_TOKEN()
-_GLOBAL_TOKEN = UTU_VITA_TOKEN()
-
-# _GLOBAL_TOKEN = None
+# _GLOBAL_TOKEN = Qwen3_VITA_TOKEN()
+_GLOBAL_TOKEN = Youtu_VITA_TOKEN()
 
 
 def get_token():

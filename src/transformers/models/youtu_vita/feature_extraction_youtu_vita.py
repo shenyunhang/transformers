@@ -29,15 +29,12 @@ import time
 import torch
 
 from ...feature_extraction_sequence_utils import SequenceFeatureExtractor
-from .modeling_youtu_vita import UTU_VITA_TOKEN, YoutuVITAAudioKwargs
+from .modeling_youtu_vita import Youtu_VITA_TOKEN, YoutuVITAAudioKwargs
 from .tokenization_youtu_vita import AudioTokenizer, GLM4VoiceTokenizer, WavFrontendTokenizer
 
 
-# _GLOBAL_TOKEN = VITA_TOKEN()
-# _GLOBAL_TOKEN = UTU_VL_TOKEN()
-_GLOBAL_TOKEN = UTU_VITA_TOKEN()
-
-# _GLOBAL_TOKEN = None
+# _GLOBAL_TOKEN = Qwen3_VITA_TOKEN()
+_GLOBAL_TOKEN = Youtu_VITA_TOKEN()
 
 
 def get_token():
