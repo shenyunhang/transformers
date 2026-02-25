@@ -833,7 +833,7 @@ class YoutuVITAAudioSmall(nn.Module):
         # speech = speech.to(device=kwargs["device"])
         # speech_lengths = speech_lengths.to(device=kwargs["device"])
         speech = speech.to(device=self.embed.weight.data.device, dtype=self.embed.weight.data.dtype)
-        speech_lengths = speech_lengths.to(device=self.embed.weight.data.device, dtype=self.embed.weight.data.dtype)
+        speech_lengths = speech_lengths.to(device=self.embed.weight.data.device, dtype=torch.int64)
 
         # language = kwargs.get("language", "auto")
         language_query = self.embed(
@@ -2068,7 +2068,7 @@ def update_tokenizer_for_glm4voice(tokenizer):
 
 class GLM4VoiceTokenizer:
 
-    sample_rate = 16000
+    sampling_rate = 16000
 
     is_discrete = True
     is_contiguous = False
@@ -2209,17 +2209,17 @@ class GLM4VoiceTokenizer:
             audios, indices = [], []
             for idx, utt in enumerate(utts):
                 if isinstance(utt, tuple):
-                    audio, sample_rate = utt
+                    audio, sampling_rate = utt
                 else:
-                    audio, sample_rate = torchaudio.load(utt)
+                    audio, sampling_rate = torchaudio.load(utt)
                 # audio = audio.to(device)
-                if sample_rate != 16000:
-                    if sample_rate not in self._resample_buffer:
-                        self._resample_buffer[sample_rate] = torchaudio.transforms.Resample(
-                            orig_freq=sample_rate, new_freq=16000
+                if sampling_rate != 16000:
+                    if sampling_rate not in self._resample_buffer:
+                        self._resample_buffer[sampling_rate] = torchaudio.transforms.Resample(
+                            orig_freq=sampling_rate, new_freq=16000
                         ) #.to(device)
-                    # self._resample_buffer[sample_rate].to(device)
-                    audio = self._resample_buffer[sample_rate](audio)
+                    # self._resample_buffer[sampling_rate].to(device)
+                    audio = self._resample_buffer[sampling_rate](audio)
                 # if audio.shape[0] > 1:
                 #     audio = audio[:1]
                 # audio = audio[0]
@@ -2287,7 +2287,7 @@ def update_tokenizer_for_wav_frontend(tokenizer):
 class WavFrontendTokenizer:
     def __init__(self,):
 
-        self.sample_rate = 16000
+        self.sampling_rate = 16000
 
         self.is_discrete = True
         self.is_contiguous = True
@@ -2324,25 +2324,25 @@ class WavFrontendTokenizer:
             self.load_model()
 
         if isinstance(audio_or_path, tuple):
-            audio, sample_rate = audio_or_path
+            audio, sampling_rate = audio_or_path
         else:
-            audio, sample_rate = torchaudio.load(audio_or_path)
-        # print(f"{audio.size()=} {sample_rate=}")
+            audio, sampling_rate = torchaudio.load(audio_or_path)
+        # print(f"{audio.size()=} {sampling_rate=}")
         if audio.dim() == 2:
             audio = audio.mean(0)
 
-        if sample_rate != self.sample_rate:
-            if sample_rate not in self._resample_buffer:
-                # print(f"torchaudio.transforms.Resample {sample_rate=} {self.sample_rate=} {self.device=}", flush=True)
-                self._resample_buffer[sample_rate] = torchaudio.transforms.Resample(
-                    orig_freq=sample_rate, new_freq=self.sample_rate
+        if sampling_rate != self.sampling_rate:
+            if sampling_rate not in self._resample_buffer:
+                # print(f"torchaudio.transforms.Resample {sampling_rate=} {self.sampling_rate=} {self.device=}", flush=True)
+                self._resample_buffer[sampling_rate] = torchaudio.transforms.Resample(
+                    orig_freq=sampling_rate, new_freq=self.sampling_rate
                 ).to(self.device)
             audio = audio.to(self.device)
-            self._resample_buffer[sample_rate].to(self.device)
-            audio = self._resample_buffer[sample_rate](audio[None, :])[0, :]
+            self._resample_buffer[sampling_rate].to(self.device)
+            audio = self._resample_buffer[sampling_rate](audio[None, :])[0, :]
             audio = audio.cpu()
         # resampler = torchaudio.transforms.Resample(
-        #     orig_freq=sample_rate, new_freq=self.sample_rate
+        #     orig_freq=sampling_rate, new_freq=self.sampling_rate
         # )
         # audio = resampler(audio[None, :])[0, :]
         # audio = audio.to(self.device)
@@ -2362,7 +2362,7 @@ class WavFrontendTokenizer:
         return {
             "audio": speech,
             "audio_token_length_func": len,
-            "duration_seconds": len(audio) / self.sample_rate,
+            "duration_seconds": len(audio) / self.sampling_rate,
         }
 
     @torch.no_grad()
@@ -2626,6 +2626,12 @@ def get_audio_tokenizer(
         audio_tokenizer_type_list = []
         model_name_or_path_list = []
 
+    if isinstance(model_name_or_path_list, str):
+        model_name_or_path_list = model_name_or_path_list.split()
+
+    if isinstance(audio_tokenizer_type_list, str):
+        audio_tokenizer_type_list = audio_tokenizer_type_list.split()
+
     tokenizer_contiguous = None
     tokenizer_discrete = None
     for audio_tokenizer_type, model_name_or_path in zip(
@@ -2730,6 +2736,11 @@ class YoutuVITAImagesKwargs(ImagesKwargs, total=False):
     discrete_image_idxs: list
     contiguous_image_idxs: list
 
+    vision_resolution_type: str
+    vision_normalize_type: str
+    image_min_num_tokens: int
+    image_max_num_tokens: int
+
 
 class YoutuVITAAudioKwargs(AudioKwargs, total=False):
     """
@@ -2737,17 +2748,20 @@ class YoutuVITAAudioKwargs(AudioKwargs, total=False):
     discrete_audio_idxs: list
     contiguous_audio_idxs: list
 
+    temporal_merge_size: int
+
     # audio_tokenizer_type: str
     # audio_tokenizer_path: str
 
 class YoutuVITAVideosKwargs(VideosKwargs, total=False):
     """
     """
-    resolution_type: str
-    min_num_tokens: int
-    max_num_tokens: int
-    image_min_num_tokens: int
-    image_max_num_tokens: int
+    vision_resolution_type: str
+    video_min_num_tokens: int
+    video_max_num_tokens: int
+    video_image_min_num_tokens: int
+    video_image_max_num_tokens: int
+    video_max_num_frames: int
     temporal_patch_size: int
     spatial_merge_size: int
     patch_size: int
@@ -2767,13 +2781,16 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
             "padding_side": "left",
         },
         "images_kwargs": {
+            "vision_resolution_type": "native",
+            "vision_normalize_type": "siglip",
         },
         "videos_kwargs": {
-            "resolution_type": "native",
-            "min_num_tokens": 64,
-            "max_num_tokens": 8192,
-            "image_min_num_tokens": 4,
-            "image_max_num_tokens": 256,
+            "vision_resolution_type": "native",
+            "video_min_num_tokens": 64,
+            "video_max_num_tokens": 8192,
+            "video_image_min_num_tokens": 4,
+            "video_image_max_num_tokens": 256,
+            "video_max_num_frames": 64,
             "temporal_patch_size": 1,
             "spatial_merge_size": 2,
             "patch_size":16,
@@ -2785,6 +2802,7 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
             "sampling_rate": 16000,
             "padding": "max_length",
             "return_attention_mask": True,
+            "temporal_merge_size": 1,
         },
     }
 
@@ -2800,6 +2818,7 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         flow_path=None,
         rank=None,
         text_audio_interval_ratio=None,
+        temporal_merge_size=1,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -2812,6 +2831,7 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         )
 
         self.text_audio_interval_ratio = text_audio_interval_ratio
+        self.temporal_merge_size = temporal_merge_size
 
         # self.load_model()
 
@@ -2826,22 +2846,28 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
     def load_model(self):
         self.audio_tokenizer.load_model()
 
-    def process_audio(self, audio_or_path, is_discrete=False, is_contiguous=False, **kwargs):
-
+    def process_audio(
+        self, audio_or_path, is_discrete=False, is_contiguous=False, **kwargs
+    ):
         assert not (is_discrete and is_contiguous)
         assert is_discrete or is_contiguous
 
         if is_discrete and self.audio_tokenizer.tokenizer_discrete is not None:
             if isinstance(audio_or_path, str):
                 tokenizer_type = self.audio_tokenizer.tokenizer_discrete.tokenizer_type
-                cache_path = os.path.splitext(audio_or_path)[0] + f"-{tokenizer_type}.json"
+                cache_path = (
+                    os.path.splitext(audio_or_path)[0] + f"-{tokenizer_type}.json"
+                )
 
                 audio_data = load_cache(cache_path)
                 if audio_data is not None:
                     return audio_data
 
             audio_data = self.audio_tokenizer.encode(
-                audio_or_path, is_discrete=is_discrete, is_contiguous=is_contiguous, **kwargs
+                audio_or_path,
+                is_discrete=is_discrete,
+                is_contiguous=is_contiguous,
+                **kwargs,
             )
             # print(f"{len(audio_data)=}")
 
@@ -2852,7 +2878,10 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
 
         if is_contiguous:
             audio_dict = self.audio_tokenizer.encode(
-                audio_or_path, is_discrete=is_discrete, is_contiguous=is_contiguous, **kwargs
+                audio_or_path,
+                is_discrete=is_discrete,
+                is_contiguous=is_contiguous,
+                **kwargs,
             )
             return audio_dict
 
@@ -2869,228 +2898,12 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         return self.audio_tokenizer.is_contiguous
 
     def text_audio_interval(self, content_input_id, AUD_START_ID, AUD_END_ID):
-
         return text_audio_interval(
             content_input_id,
             AUD_START_ID,
             AUD_END_ID,
             self.text_audio_interval_ratio,
         )
-
-    def add_audio_input_contiguous(
-        self, input_ids, audio_or_paths, tokenizer, targets=None, is_pretrain=False,
-        **kwargs,
-    ):
-        GLOBAL_TOKEN = get_token()
-
-        AUD_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.AUD_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        AUD_TAG_ID = tokenizer(GLOBAL_TOKEN.AUD_TAG_TOKEN, add_special_tokens=False).input_ids
-        AUD_START_ID = tokenizer(GLOBAL_TOKEN.AUD_START_TOKEN, add_special_tokens=False).input_ids
-        AUD_END_ID = tokenizer(GLOBAL_TOKEN.AUD_END_TOKEN, add_special_tokens=False).input_ids
-
-        assert len(AUD_CONTEXT_ID) == 1
-        assert len(AUD_START_ID) == 1
-        assert len(AUD_END_ID) == 1
-
-        AUD_CONTEXT_ID = AUD_CONTEXT_ID[0]
-        AUD_TAG_ID = AUD_TAG_ID[0]
-        AUD_START_ID = AUD_START_ID[0]
-        AUD_END_ID = AUD_END_ID[0]
-
-        aud_positions = [i for i, x in enumerate(input_ids) if x == AUD_TAG_ID]
-        assert len(aud_positions) == len(
-            audio_or_paths
-        ), f"{len(aud_positions)=} {len(audio_or_paths)=} {AUD_TAG_ID=}"
-
-        audios = []
-        audio_indices = []
-        new_input_ids = []
-        new_targets = []
-        st = 0
-        for aud_idx, aud_pos in enumerate(aud_positions):
-            # audio = audio_tokenizer.encode(audio_or_paths[aud_idx], is_contiguous=True)
-            audio, audio_token_length_func = self.process_audio(
-                audio_or_paths[aud_idx], is_contiguous=True
-            )
-            audios.append(audio)
-            # audio_token_length = audio.size(0)
-            # audio_token_length = audio_token_length_func(audio.size(0))
-            audio_token_length = audio_token_length_func(audio)
-
-            new_input_ids += input_ids[st:aud_pos]
-            if targets is not None:
-                new_targets += targets[st:aud_pos]
-
-            new_input_ids += [AUD_START_ID]
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            audio_indice_b = torch.zeros(
-                1, audio_token_length, dtype=torch.int64
-            )  # This will change in collate_fn
-            audio_indice_s = (
-                torch.arange(len(new_input_ids), len(new_input_ids) + audio_token_length)
-                .unsqueeze(0)
-                .repeat(1, 1)
-            )
-            audio_indice_b_s = torch.stack(
-                [audio_indice_b, audio_indice_s], dim=0
-            )  # 2, num_audio, audio_length
-            audio_indices.append(audio_indice_b_s)
-
-            new_input_ids += [AUD_CONTEXT_ID] * audio_token_length
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * audio_token_length
-
-            new_input_ids += [AUD_END_ID]
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            st = aud_pos + 1
-
-        new_input_ids += input_ids[st:]
-        if targets is not None:
-            new_targets += targets[st:]
-
-        input_ids = new_input_ids
-        if targets is not None:
-            targets = new_targets
-
-        if targets is not None:
-            return input_ids, audios, audio_indices, targets
-
-        return input_ids, audios, audio_indices
-
-    def add_audio_input_discrete_and_contiguous(
-        self, input_ids, audio_or_paths, tokenizer, targets=None, is_pretrain=False,
-        **kwargs,
-    ):
-
-        GLOBAL_TOKEN = get_token()
-
-        AUD_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.AUD_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        AUD_TAG_ID = tokenizer(GLOBAL_TOKEN.AUD_TAG_TOKEN, add_special_tokens=False).input_ids
-        AUD_START_ID = tokenizer(GLOBAL_TOKEN.AUD_START_TOKEN, add_special_tokens=False).input_ids
-        AUD_END_ID = tokenizer(GLOBAL_TOKEN.AUD_END_TOKEN, add_special_tokens=False).input_ids
-
-        AUD_FIRST_ID = tokenizer.convert_tokens_to_ids("<|audio_0|>")
-
-        assert len(AUD_CONTEXT_ID) == 1
-        assert len(AUD_START_ID) == 1
-        assert len(AUD_END_ID) == 1
-
-        AUD_CONTEXT_ID = AUD_CONTEXT_ID[0]
-        AUD_TAG_ID = AUD_TAG_ID[0]
-        AUD_START_ID = AUD_START_ID[0]
-        AUD_END_ID = AUD_END_ID[0]
-
-        aud_positions = [i for i, x in enumerate(input_ids) if x == AUD_TAG_ID]
-        assert len(aud_positions) == len(
-            audio_or_paths
-        ), f"{len(aud_positions)=} {len(audio_or_paths)=} {AUD_TAG_ID=}"
-
-        audios = []
-        audio_indices = []
-        new_input_ids = []
-        new_targets = []
-        st = 0
-        for aud_idx, aud_pos in enumerate(aud_positions):
-
-            new_input_ids += input_ids[st:aud_pos]
-            if targets is not None:
-                new_targets += targets[st:aud_pos]
-
-            # --------------------------------------------------------------------------
-            # add discrete
-
-            audio_tokens = self.process_audio(audio_or_paths[aud_idx], is_discrete=True)
-            audio_tokens = [i + AUD_FIRST_ID for i in audio_tokens]
-
-            new_input_ids += [AUD_START_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [AUD_START_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            new_input_ids += audio_tokens
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += audio_tokens
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(audio_tokens)
-
-            new_input_ids += [AUD_END_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [AUD_END_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            # --------------------------------------------------------------------------
-            # add contiguous
-
-            # audio = audio_tokenizer.encode(audio_or_paths[aud_idx], is_contiguous=True)
-            audio, audio_token_length_func = self.process_audio(
-                audio_or_paths[aud_idx], is_contiguous=True
-            )
-            audios.append(audio)
-            # audio_token_length = audio.size(0)
-            # audio_token_length = audio_token_length_func(audio.size(0))
-            audio_token_length = audio_token_length_func(audio)
-
-            new_input_ids += [AUD_START_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [AUD_START_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            audio_indice_b = torch.zeros(
-                1, audio_token_length, dtype=torch.int64
-            )  # This will change in collate_fn
-            audio_indice_s = (
-                torch.arange(len(new_input_ids), len(new_input_ids) + audio_token_length)
-                .unsqueeze(0)
-                .repeat(1, 1)
-            )
-            audio_indice_b_s = torch.stack(
-                [audio_indice_b, audio_indice_s], dim=0
-            )  # 2, num_audio, audio_length
-            audio_indices.append(audio_indice_b_s)
-
-            new_input_ids += [AUD_CONTEXT_ID] * audio_token_length
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * audio_token_length
-
-            new_input_ids += [AUD_END_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [AUD_END_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            st = aud_pos + 1
-
-            # if max(audio_token_length) > 512:
-            #     raise Exception(f"Audio is to long {speech_lengths}")
-
-        new_input_ids += input_ids[st:]
-        if targets is not None:
-            new_targets += targets[st:]
-
-        input_ids = new_input_ids
-        if targets is not None:
-            targets = new_targets
-
-        if targets is not None:
-            return input_ids, audios, audio_indices, targets
-
-        return input_ids, audios, audio_indices
 
     def add_audio_input_discrete_or_contiguous(
         self,
@@ -3105,15 +2918,20 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         audio_chunk_max_second=30,
         **kwargs,
     ):
-
         GLOBAL_TOKEN = get_token()
 
         AUD_CONTEXT_ID = tokenizer(
             GLOBAL_TOKEN.AUD_CONTEXT_TOKEN, add_special_tokens=False
         ).input_ids
-        AUD_TAG_ID = tokenizer(GLOBAL_TOKEN.AUD_TAG_TOKEN, add_special_tokens=False).input_ids
-        AUD_START_ID = tokenizer(GLOBAL_TOKEN.AUD_START_TOKEN, add_special_tokens=False).input_ids
-        AUD_END_ID = tokenizer(GLOBAL_TOKEN.AUD_END_TOKEN, add_special_tokens=False).input_ids
+        AUD_TAG_ID = tokenizer(
+            GLOBAL_TOKEN.AUD_TAG_TOKEN, add_special_tokens=False
+        ).input_ids
+        AUD_START_ID = tokenizer(
+            GLOBAL_TOKEN.AUD_START_TOKEN, add_special_tokens=False
+        ).input_ids
+        AUD_END_ID = tokenizer(
+            GLOBAL_TOKEN.AUD_END_TOKEN, add_special_tokens=False
+        ).input_ids
 
         if self.audio_tokenizer.tokenizer_discrete is not None:
             AUD_FIRST_ID = tokenizer.convert_tokens_to_ids(
@@ -3130,9 +2948,9 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         AUD_END_ID = AUD_END_ID[0]
 
         aud_positions = [i for i, x in enumerate(input_ids) if x == AUD_TAG_ID]
-        assert len(aud_positions) == len(
-            audio_or_paths
-        ), f"{len(aud_positions)=} {len(audio_or_paths)=} {AUD_TAG_ID=}"
+        assert len(aud_positions) == len(audio_or_paths), (
+            f"{len(aud_positions)=} {len(audio_or_paths)=} {AUD_TAG_ID=}"
+        )
 
         if not discrete_audio_idxs and not contiguous_audio_idxs:
             contiguous_audio_idxs = list(range(len(audio_or_paths)))
@@ -3143,13 +2961,14 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         new_targets = []
         if targets is not None and self.audio_tokenizer.num_codebook > 1:
             # additional_targets_list = [[] for _ in range(self.audio_tokenizer.num_codebook - 1)]
-            additional_targets_list = [[] for _ in range(self.audio_tokenizer.num_codebook)]
+            additional_targets_list = [
+                [] for _ in range(self.audio_tokenizer.num_codebook)
+            ]
         else:
             additional_targets_list = None
 
         st = 0
         for aud_idx, aud_pos in enumerate(aud_positions):
-
             new_input_ids += input_ids[st:aud_pos]
             if targets is not None:
                 new_targets += targets[st:aud_pos]
@@ -3162,8 +2981,9 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
             # --------------------------------------------------------------------------
             # add discrete
             if aud_idx in discrete_audio_idxs:
-
-                audio_tokens = self.process_audio(audio_or_paths[aud_idx], is_discrete=True)
+                audio_tokens = self.process_audio(
+                    audio_or_paths[aud_idx], is_discrete=True
+                )
                 if self.audio_tokenizer.num_codebook > 1:
                     # assert audio_tokens.ndim == 2
                     # audio_tokens = audio_tokens.tolist()
@@ -3189,9 +3009,13 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                         for j in range(i, self.audio_tokenizer.num_codebook - 1):
                             audio_tokens_ += f"<|audio_{i}_{j}_pad|>"
 
-                        audio_tokens_ = tokenizer(audio_tokens_, add_special_tokens=False).input_ids
+                        audio_tokens_ = tokenizer(
+                            audio_tokens_, add_special_tokens=False
+                        ).input_ids
                         if i > 0:
-                            CB_AUD_FIRST_ID = tokenizer.convert_tokens_to_ids(f"<|audio_{i}_0|>")
+                            CB_AUD_FIRST_ID = tokenizer.convert_tokens_to_ids(
+                                f"<|audio_{i}_0|>"
+                            )
                             audio_tokens_ = [x - CB_AUD_FIRST_ID for x in audio_tokens_]
                         additional_audio_tokens.append(audio_tokens_)
 
@@ -3206,26 +3030,32 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                 if targets is not None:
                     new_targets += [AUD_START_ID]
                 if additional_targets_list is not None:
-                    additional_targets_list = [x + [AUD_START_ID] for x in additional_targets_list]
+                    additional_targets_list = [
+                        x + [AUD_START_ID] for x in additional_targets_list
+                    ]
 
                 new_input_ids += audio_tokens
                 if targets is not None:
                     new_targets += audio_tokens
                 if additional_targets_list is not None:
                     additional_targets_list = [
-                        x + y for x, y in zip(additional_targets_list, additional_audio_tokens)
+                        x + y
+                        for x, y in zip(
+                            additional_targets_list, additional_audio_tokens
+                        )
                     ]
 
                 new_input_ids += [AUD_END_ID]
                 if targets is not None:
                     new_targets += [AUD_END_ID]
                 if additional_targets_list is not None:
-                    additional_targets_list = [x + [AUD_END_ID] for x in additional_targets_list]
+                    additional_targets_list = [
+                        x + [AUD_END_ID] for x in additional_targets_list
+                    ]
 
             # --------------------------------------------------------------------------
             # add contiguous
             if aud_idx in contiguous_audio_idxs:
-
                 # audio = audio_tokenizer.encode(audio_or_paths[aud_idx], is_contiguous=True)
                 audio_dict = self.process_audio(
                     audio_or_paths[aud_idx], is_contiguous=True
@@ -3252,14 +3082,18 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                         audio_chunk.append(audio_frame)
 
                     else:
-                        audio_second_chunks.append(sum([len(x) * second_per_audio for x in audio_chunks]))
+                        audio_second_chunks.append(
+                            sum([len(x) * second_per_audio for x in audio_chunks])
+                        )
                         audio_chunks.append(torch.stack(audio_chunk, dim=0))
 
                         audio_chunk = []
                         audio_chunk.append(audio_frame)
 
                 if len(audio_chunk) > 0:
-                    audio_second_chunks.append(sum([len(x) * second_per_audio for x in audio_chunks]))
+                    audio_second_chunks.append(
+                        sum([len(x) * second_per_audio for x in audio_chunks])
+                    )
                     audio_chunks.append(torch.stack(audio_chunk, dim=0))
 
                 audios.extend(audio_chunks)
@@ -3268,21 +3102,26 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                 timestamp_format = "HHMMSS"
 
                 for audio, audio_second in zip(audio_chunks, audio_second_chunks):
-
                     # add timestamp
                     if len(audio_chunks) > 1:
                         if timestamp_format == "HHMMSS":
                             audio_second = round(audio_second)
-                            timestamp = time.strftime("%H:%M:%S", time.gmtime(audio_second))
+                            timestamp = time.strftime(
+                                "%H:%M:%S", time.gmtime(audio_second)
+                            )
                         else:
                             timestamp = f"{audio_second:.2f}"
-                        _input_id = tokenizer(timestamp, add_special_tokens=False).input_ids
+                        _input_id = tokenizer(
+                            timestamp, add_special_tokens=False
+                        ).input_ids
                         new_input_ids += _input_id
                         if targets is not None:
                             if is_pretrain:
                                 new_targets += _input_id
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
+                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(
+                                    _input_id
+                                )
 
                     new_input_ids += [AUD_START_ID]
                     if targets is not None:
@@ -3292,15 +3131,20 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                             new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
                     if additional_targets_list is not None:
                         additional_targets_list = [
-                            x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] for x in additional_targets_list
+                            x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                            for x in additional_targets_list
                         ]
 
-                    audio_token_length = audio_token_length_func(audio)
+                    audio_token_length = (
+                        audio_token_length_func(audio) // self.temporal_merge_size
+                    )
                     audio_indice_b = torch.zeros(
                         1, audio_token_length, dtype=torch.int64
                     )  # This will change in collate_fn
                     audio_indice_s = (
-                        torch.arange(len(new_input_ids), len(new_input_ids) + audio_token_length)
+                        torch.arange(
+                            len(new_input_ids), len(new_input_ids) + audio_token_length
+                        )
                         .unsqueeze(0)
                         .repeat(1, 1)
                     )
@@ -3311,7 +3155,9 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
 
                     new_input_ids += [AUD_CONTEXT_ID] * audio_token_length
                     if targets is not None:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * audio_token_length
+                        new_targets += [
+                            GLOBAL_TOKEN.IGNORE_TOKEN_ID
+                        ] * audio_token_length
                     if additional_targets_list is not None:
                         additional_targets_list = [
                             x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * audio_token_length
@@ -3326,7 +3172,8 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                             new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
                     if additional_targets_list is not None:
                         additional_targets_list = [
-                            x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] for x in additional_targets_list
+                            x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                            for x in additional_targets_list
                         ]
 
             st = aud_pos + 1
@@ -3383,11 +3230,15 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         self,
         image_processor=None,
         audio_processor=None,
-        resolution_type=None,
-        min_num_tokens=64,
-        max_num_tokens=8192,
-        image_min_num_tokens=4,
-        image_max_num_tokens=256,
+        vision_resolution_type=None,
+        video_max_num_frames=64,
+        video_max_fps=1,
+        video_min_num_tokens=64,
+        video_max_num_tokens=8192,
+        video_image_min_num_tokens=4,
+        video_image_max_num_tokens=256,
+        video_audio_chunk_min_second=2,
+        video_audio_chunk_max_second=30,
         temporal_patch_size=1,
         spatial_merge_size=2,
         patch_size=14,
@@ -3399,16 +3250,20 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         self.image_processor = image_processor
         self.audio_processor = audio_processor
 
-        self.resolution_type = resolution_type
+        self.vision_resolution_type = vision_resolution_type
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
         self.patch_size = patch_size
-        self.max_num_tokens = max_num_tokens
-        self.min_num_tokens = min_num_tokens
-        self.image_max_num_tokens = image_max_num_tokens
-        self.image_min_num_tokens = image_min_num_tokens
+        self.video_max_num_frames = video_max_num_frames
+        self.video_max_fps = video_max_fps
+        self.video_max_num_tokens = video_max_num_tokens
+        self.video_min_num_tokens = video_min_num_tokens
+        self.video_image_max_num_tokens = video_image_max_num_tokens
+        self.video_image_min_num_tokens = video_image_min_num_tokens
+        self.video_audio_chunk_min_second = video_audio_chunk_min_second
+        self.video_audio_chunk_max_second = video_audio_chunk_max_second
 
-        self.sample_rate = 16000
+        self.sampling_rate = 16000
 
         self.video_key_frame = video_key_frame
 
@@ -3421,50 +3276,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             del output["audio_processor"]
         return output
 
-    def get_frame_paths(self, frame_root, num_frames=8):
-        os.makedirs(frame_root, exist_ok=True)
-
-        self.frame_tmpl = "frame-{}-of-{}.jpg"
-        return [
-            os.path.join(frame_root, self.frame_tmpl.format(i, num_frames))
-            for i in range(1, num_frames + 1)
-        ]
-
-    def save_video_frames(self, vid_path, max_fps=1, num_frames=8):
-
-        vid = decord.VideoReader(vid_path, num_threads=1)
-
-        # step_size = len(vid) / (num_frames + 1)
-        step_size = len(vid) / num_frames
-
-        # step_size = max(1, step_size)
-        fps = vid.get_avg_fps()
-        fps = round(fps)
-        step_size = max(fps / max_fps, step_size)
-
-        # indices = [int(i * step_size) for i in range(1, num_frames + 1)]
-        indices = [int(i * step_size) for i in range(0, num_frames)]
-        indices = [i for i in indices if i < len(vid)]
-
-        num_frames = len(indices)
-
-        frame_paths = self.get_frame_paths(vid_path + ".saved_frames", num_frames)
-        flag = np.all([os.path.exists(p) for p in frame_paths])
-        if flag:
-            return frame_paths
-
-        images = [vid[i].asnumpy() for i in indices]
-        images = [PIL.Image.fromarray(arr) for arr in images]
-
-        for im, pth in zip(images, frame_paths):
-            # if not os.path.exists(pth):
-            #     im.save(pth)
-            im.save(pth)
-        # print(f"save_video_frames vid_path {vid_path} fps {fps} len(vid) {len(vid)} frame_paths {frame_paths}")
-        return frame_paths
-
-    def get_video_frames(self, vid_path, max_fps=1, num_frames=8):
-
+    def get_video_frames(self, vid_path, video_max_fps=1, video_max_num_frames=8):
         vid = decord.VideoReader(vid_path, num_threads=1)
 
         fps = vid.get_avg_fps()
@@ -3475,16 +3287,16 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             # TODO: fix this
             sample_fps = None
             sample_fps = 1
-            if len(indices) > num_frames:
-                random_indices = sorted(random.sample(range(len(indices)), num_frames))
+            if len(indices) > video_max_num_frames:
+                random_indices = sorted(random.sample(range(len(indices)), video_max_num_frames))
                 indices = [indices[i] for i in random_indices]
         else:
-            # step_size = len(vid) / (num_frames + 1)
-            step_size = len(vid) / num_frames
-            step_size = max(fps / max_fps, step_size)
+            # step_size = len(vid) / (video_max_num_frames + 1)
+            step_size = len(vid) / video_max_num_frames
+            step_size = max(fps / video_max_fps, step_size)
 
-            # indices = [int(i * step_size) for i in range(1, num_frames + 1)]
-            indices = [int(i * step_size) for i in range(0, num_frames)]
+            # indices = [int(i * step_size) for i in range(1, video_max_num_frames + 1)]
+            indices = [int(i * step_size) for i in range(0, video_max_num_frames)]
             sample_fps = 1 / (step_size / fps)
 
         indices = [i for i in indices if i < len(vid)]
@@ -3499,7 +3311,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         # print(f"get_video_frames vid_path {vid_path} fps {fps} len(vid) {len(vid)} frame_paths {frame_paths}")
         return images, sample_fps, timestamps, duration_seconds
 
-    def get_image_and_audio(self, video_file_or_dir, max_num_frames=8, max_fps=1):
+    def get_image_and_audio(self, video_file_or_dir, video_max_num_frames=8, video_max_fps=1):
 
         if isinstance(video_file_or_dir, str) and os.path.isfile(video_file_or_dir):
             mime_type, _ = mimetypes.guess_type(video_file_or_dir)
@@ -3524,12 +3336,8 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             duration_seconds = len(img_or_path_list) / fps
 
         elif os.path.isfile(video_file_or_dir) and mime_type.startswith("video/"):
-            # frame_paths = self.save_video_frames(
-            #     video_file_or_dir, num_frames=max_num_frames, max_fps=max_fps
-            # )
-            # img_or_path_list = frame_paths
             img_or_path_list, fps, timestamps, duration_seconds = self.get_video_frames(
-                video_file_or_dir, num_frames=max_num_frames, max_fps=max_fps
+                video_file_or_dir, video_max_num_frames=video_max_num_frames, video_max_fps=video_max_fps
             )
 
         elif os.path.isdir(video_file_or_dir):
@@ -3554,7 +3362,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                 fps = 2
             else:
                 fps = 1
-            target_frame = int(min(total_frames / fps * max_fps, max_num_frames))
+            target_frame = int(min(total_frames / fps * video_max_fps, video_max_num_frames))
             index = [int(1.0 * total_frames / target_frame) * x for x in range(target_frame)]
 
             selected_filepath = [all_filepath[x] for x in index]
@@ -3577,45 +3385,45 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         audio = None
         # if has_audio_track(video_file_or_dir):
         if has_audio(video_file_or_dir):
-            audio, sample_rate = torchaudio.load(video_file_or_dir)
-            # print(f"{audio.size()=} {sample_rate=}")
+            audio, sampling_rate = torchaudio.load(video_file_or_dir)
+            # print(f"{audio.size()=} {sampling_rate=}")
             if audio.dim() == 2:
                 audio = audio.mean(0)
 
-            if sample_rate != self.sample_rate:
+            if sampling_rate != self.sampling_rate:
                 resampler = torchaudio.transforms.Resample(
-                    orig_freq=sample_rate, new_freq=self.sample_rate
+                    orig_freq=sampling_rate, new_freq=self.sampling_rate
                 )
                 audio = resampler(audio[None, :])[0, :]
 
-        return img_or_path_list, fps, timestamps, (audio, self.sample_rate), duration_seconds
+        return img_or_path_list, fps, timestamps, (audio, self.sampling_rate), duration_seconds
 
-    def process_video(self, video_file_or_dir, max_num_frames=8, max_fps=1):
+    def process_video(self, video_file_or_dir, video_max_num_frames=8, video_max_fps=1):
 
-        images, fps, timestamps, (audio, sample_rate), duration_seconds = self.get_image_and_audio(
+        images, fps, timestamps, (audio, sampling_rate), duration_seconds = self.get_image_and_audio(
             video_file_or_dir,
-            max_num_frames=max_num_frames,
-            max_fps=max_fps,
+            video_max_num_frames=video_max_num_frames,
+            video_max_fps=video_max_fps,
         )
 
-        if self.resolution_type == "native":
+        if self.vision_resolution_type == "native":
             min_pixels = (
                 (self.patch_size * self.spatial_merge_size) ** 2
-                * self.min_num_tokens
+                * self.video_min_num_tokens
                 // len(images)
             )
             max_pixels = (
                 (self.patch_size * self.spatial_merge_size) ** 2
-                * self.max_num_tokens
+                * self.video_max_num_tokens
                 // len(images)
             )
 
             image_min_pixels = (
                 self.patch_size * self.spatial_merge_size
-            ) ** 2 * self.image_min_num_tokens
+            ) ** 2 * self.video_image_min_num_tokens
             image_max_pixels = (
                 self.patch_size * self.spatial_merge_size
-            ) ** 2 * self.image_max_num_tokens
+            ) ** 2 * self.video_image_max_num_tokens
 
             min_pixels = max(min_pixels, image_min_pixels)
             max_pixels = min(max_pixels, image_max_pixels)
@@ -3624,7 +3432,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             image_data = self.image_processor.process_images(
                 images,
                 is_contiguous=True,
-                resolution_type=self.resolution_type,
+                vision_resolution_type=self.vision_resolution_type,
                 min_pixels=min_pixels,
                 max_pixels=max_pixels,
             )
@@ -3640,11 +3448,11 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             best_width = image_data["image_width"]
 
         if audio is not None:
-            total_time = len(audio) / sample_rate
+            total_time = len(audio) / sampling_rate
             # print(f"{duration_seconds=} {total_time=}", flush=True)
 
             audio_dict = self.audio_processor.process_audio(
-                (audio, sample_rate), is_discrete=False, is_contiguous=True
+                (audio, sampling_rate), is_discrete=False, is_contiguous=True
             )
             audio = audio_dict["audio"]
             audio_token_length_func = audio_dict["audio_token_length_func"]
@@ -3679,7 +3487,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         else:
             second_per_grids = None
 
-        # print(f"{image_frames.size()=} {video_grid_thw=} {max_fps=} {max_num_frames=} {fps=} {second_per_grids=} ")
+        # print(f"{image_frames.size()=} {video_grid_thw=} {video_max_fps=} {video_max_num_frames=} {fps=} {second_per_grids=} ")
 
         return (
             image_frames,
@@ -3692,20 +3500,20 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         )
 
     def process_video_raw(
-        self, video_file_or_dir, max_num_frames=8, max_fps=1, use_audio_in_video=True
+        self, video_file_or_dir, video_max_num_frames=8, video_max_fps=1, use_audio_in_video=True
     ):
 
-        images, fps, timestamps, (audio, sample_rate) = self.get_image_and_audio(
+        images, fps, timestamps, (audio, sampling_rate) = self.get_image_and_audio(
             video_file_or_dir,
-            max_num_frames=max_num_frames,
-            max_fps=max_fps,
+            video_max_num_frames=video_max_num_frames,
+            video_max_fps=video_max_fps,
             use_audio_in_video=use_audio_in_video,
         )
 
         image_frames = images
 
         if audio is not None:
-            total_time = len(audio) / sample_rate
+            total_time = len(audio) / sampling_rate
 
             # audio_frames = torch.chunk(audio, chunks=len(image_frames), dim=0)
             full_timestamps = timestamps + [total_time]
@@ -3736,739 +3544,9 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         else:
             second_per_grids = None
 
-        # print(f"{len(image_frames)=} {video_grid_thw=} {max_fps=} {max_num_frames=} {fps=} {second_per_grids=} ")
+        # print(f"{len(image_frames)=} {video_grid_thw=} {video_max_fps=} {video_max_num_frames=} {fps=} {second_per_grids=} ")
 
         return image_frames, audio_frames, video_grid_thw, second_per_grids, timestamps
-
-    def add_video_input_contiguous(
-        self,
-        input_ids,
-        video_paths,
-        tokenizer,
-        targets=None,
-        is_pretrain=False,
-        max_num_frames=4096,
-        max_fps=1,
-        use_audio_in_video=True,
-        use_vision_in_video=True,
-        video_audio_chunk_min_second=2,
-        video_audio_chunk_max_second=30,
-        **kwargs,
-    ):
-
-        GLOBAL_TOKEN = get_token()
-
-        IMG_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.IMG_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        IMG_START_ID = tokenizer(GLOBAL_TOKEN.IMG_START_TOKEN, add_special_tokens=False).input_ids
-        IMG_END_ID = tokenizer(GLOBAL_TOKEN.IMG_END_TOKEN, add_special_tokens=False).input_ids
-
-        AUD_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.AUD_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        AUD_START_ID = tokenizer(GLOBAL_TOKEN.AUD_START_TOKEN, add_special_tokens=False).input_ids
-        AUD_END_ID = tokenizer(GLOBAL_TOKEN.AUD_END_TOKEN, add_special_tokens=False).input_ids
-
-        VID_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.VID_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        VID_START_ID = tokenizer(GLOBAL_TOKEN.VID_START_TOKEN, add_special_tokens=False).input_ids
-        VID_END_ID = tokenizer(GLOBAL_TOKEN.VID_END_TOKEN, add_special_tokens=False).input_ids
-
-        PATCH_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.PATCH_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        PATCH_START_ID = tokenizer(
-            GLOBAL_TOKEN.PATCH_START_TOKEN, add_special_tokens=False
-        ).input_ids
-        PATCH_END_ID = tokenizer(GLOBAL_TOKEN.PATCH_END_TOKEN, add_special_tokens=False).input_ids
-
-        IMG_TAG_ID = tokenizer(GLOBAL_TOKEN.IMG_TAG_TOKEN, add_special_tokens=False).input_ids
-        AUD_TAG_ID = tokenizer(GLOBAL_TOKEN.AUD_TAG_TOKEN, add_special_tokens=False).input_ids
-        VID_TAG_ID = tokenizer(GLOBAL_TOKEN.VID_TAG_TOKEN, add_special_tokens=False).input_ids
-
-        assert len(IMG_CONTEXT_ID) == 1
-        assert len(IMG_START_ID) == 1
-        assert len(IMG_END_ID) == 1
-
-        assert len(AUD_CONTEXT_ID) == 1
-        assert len(AUD_START_ID) == 1
-        assert len(AUD_END_ID) == 1
-
-        assert len(VID_CONTEXT_ID) == 1
-        assert len(VID_START_ID) == 1
-        assert len(VID_END_ID) == 1
-
-        assert len(PATCH_CONTEXT_ID) == 1
-        assert len(PATCH_START_ID) == 1
-        assert len(PATCH_END_ID) == 1
-
-        IMG_CONTEXT_ID = IMG_CONTEXT_ID[0]
-        IMG_START_ID = IMG_START_ID[0]
-        IMG_END_ID = IMG_END_ID[0]
-
-        AUD_CONTEXT_ID = AUD_CONTEXT_ID[0]
-        AUD_START_ID = AUD_START_ID[0]
-        AUD_END_ID = AUD_END_ID[0]
-
-        VID_CONTEXT_ID = VID_CONTEXT_ID[0]
-        VID_START_ID = VID_START_ID[0]
-        VID_END_ID = VID_END_ID[0]
-
-        PATCH_CONTEXT_ID = PATCH_CONTEXT_ID[0]
-        PATCH_START_ID = PATCH_START_ID[0]
-        PATCH_END_ID = PATCH_END_ID[0]
-
-        IMG_TAG_ID = IMG_TAG_ID[0]
-        AUD_TAG_ID = AUD_TAG_ID[0]
-        VID_TAG_ID = VID_TAG_ID[0]
-
-        nl_tokens = tokenizer("\n", add_special_tokens=False).input_ids
-
-        vid_positions = [i for i, x in enumerate(input_ids) if x == VID_TAG_ID]
-        assert len(vid_positions) == len(video_paths), video_paths
-
-        images = []
-        image_indices = []
-        audios = []
-        audio_indices = []
-        video_grid_thw = []
-        second_per_grids = []
-
-        new_input_ids = []
-        new_targets = []
-        st = 0
-        for vid_idx, vid_pos in enumerate(vid_positions):
-            (
-                image_frames,
-                audio_frames,
-                audio_token_length_func,
-                _video_grid_thw,
-                _second_per_grids,
-                second_frames,
-                duration_seconds,
-            ) = self.process_video(video_paths[vid_idx], max_num_frames, max_fps)
-
-            if audio_frames is not None:
-                # print(f"{len(image_frames)=} {len(audio_frames)=}")
-                # print(f"{[x.size() for x in image_frames]=}")
-                # print(f"{[x.size() for x in audio_frames]=}")
-
-                num_frames = min(len(image_frames), len(audio_frames))
-                image_frames = image_frames[:num_frames]
-                audio_frames = audio_frames[:num_frames]
-
-            new_input_ids += input_ids[st:vid_pos]
-            if targets is not None:
-                new_targets += targets[st:vid_pos]
-
-            if audio_frames is not None:
-                second_per_audio = 1.0 * duration_seconds / sum([len(x) for x in audio_frames])
-
-                image_chunks = []
-                image_second_chunks = []
-                audio_chunks = []
-                audio_second_chunks = []
-
-                image_chunk = []
-                image_second_chunk = []
-                audio_chunk = []
-                audio_second_chunk = []
-                for image_frame, audio_frame, second_frame in zip(
-                    image_frames, audio_frames, second_frames
-                ):
-                    audio_second = len(audio_frame) * second_per_audio
-                    audio_chunk_second = sum([len(x) * second_per_audio for x in audio_chunk])
-
-                    if audio_second + audio_chunk_second < video_audio_chunk_min_second:
-                        image_chunk.append(image_frame)
-                        image_second_chunk.append(second_frame)
-
-                        audio_chunk.append(audio_frame)
-                        audio_second_chunk.append(second_frame)
-
-                    elif audio_second + audio_chunk_second <= video_audio_chunk_max_second:
-                        image_chunk.append(image_frame)
-                        image_second_chunk.append(second_frame)
-
-                        audio_chunk.append(audio_frame)
-                        audio_second_chunk.append(second_frame)
-
-                        image_chunks.append(image_chunk)
-                        image_second_chunks.append(image_second_chunk)
-
-                        audio_chunk = [torch.cat(audio_chunk, dim=0)]
-                        audio_second_chunk = [audio_second_chunk[0]]
-                        audio_chunks.append(audio_chunk)
-                        audio_second_chunks.append(audio_second_chunk)
-
-                        image_chunk = []
-                        image_second_chunk = []
-
-                        audio_chunk = []
-                        audio_second_chunk = []
-
-                    elif audio_second + audio_chunk_second > video_audio_chunk_max_second:
-                        assert audio_chunk_second == 0
-
-                        image_chunk.append(image_frame)
-                        image_second_chunk.append(second_frame)
-
-                        audio_chunk_size = int(video_audio_chunk_max_second / second_per_audio)
-                        audio_chunk = torch.split(audio_frame, audio_chunk_size)
-                        cur_second = second_frame
-                        for x in audio_chunk:
-                            audio_second_chunk.append(cur_second)
-                            cur_second += len(x) * second_per_audio
-
-                        image_chunks.append(image_chunk)
-                        image_second_chunks.append(image_second_chunk)
-
-                        audio_chunks.append(audio_chunk)
-                        audio_second_chunks.append(audio_second_chunk)
-
-                        image_chunk = []
-                        image_second_chunk = []
-
-                        audio_chunk = []
-                        audio_second_chunk = []
-
-                if len(image_chunk) > 0:
-                    image_chunks.append(image_chunk)
-                    image_second_chunks.append(image_second_chunk)
-
-                    audio_chunk = [torch.cat(audio_chunk, dim=0)]
-                    audio_second_chunk = [audio_second_chunk[0]]
-                    audio_chunks.append(audio_chunk)
-                    audio_second_chunks.append(audio_second_chunk)
-
-            else:
-                image_chunks = [image_frames]
-                image_second_chunks = [second_frames]
-                audio_chunks = [[]]
-                audio_second_chunks = [[]]
-
-            assert len(image_frames) == sum([len(x) for x in image_chunks])
-            # assert len(audio_frames) == sum([len(x) for x in audio_chunks])
-
-            if use_vision_in_video:
-                if self.image_processor.resolution_type == "native":
-                    images.append(
-                        torch.cat(
-                            [
-                                self.image_processor.convert_image_to_patches_with_pixel_shuffle(x)
-                                for x in image_frames
-                            ],
-                            dim=0,
-                        )
-                    )
-
-                else:
-                    images.append(image_frames)
-
-            if use_audio_in_video and audio_frames is not None:
-                # audios.extend(audio_frames)
-                audios.extend([xx for x in audio_chunks for xx in x])
-
-            for (
-                image_chunk_frames,
-                image_second_chunk_frames,
-                audio_chunk_frames,
-                audio_second_chunk_frames,
-            ) in zip(
-                image_chunks,
-                image_second_chunks,
-                audio_chunks,
-                audio_second_chunks,
-            ):
-
-                if not use_vision_in_video:
-                    image_chunk_frames = []
-                    image_second_chunk_frames = []
-                if not use_audio_in_video:
-                    audio_chunk_frames = []
-                    audio_second_chunk_frames = []
-
-                for image_chunk_frame, image_second_chunk_frame in zip(
-                    image_chunk_frames, image_second_chunk_frames
-                ):
-
-                    # add timestamp
-                    timestamp = time.strftime("%H:%M:%S", time.gmtime(round(image_second_chunk_frame)))
-                    _input_id = tokenizer(timestamp, add_special_tokens=False).input_ids
-                    _target = [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
-                    new_input_ids += _input_id
-                    if targets is not None:
-                        new_targets += _target
-
-                    new_input_ids += [VID_START_ID]
-                    if targets is not None:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-                    image_token_length = (
-                        _video_grid_thw[0][0]
-                        * _video_grid_thw[0][1]
-                        * _video_grid_thw[0][2]
-                        // self.spatial_merge_size
-                        // self.spatial_merge_size
-                    )
-                    image_indice_b = torch.zeros(
-                        1, image_token_length, dtype=torch.int64
-                    )  # This will change in collate_fn
-                    image_indice_s = (
-                        torch.arange(len(new_input_ids), len(new_input_ids) + image_token_length)
-                        .unsqueeze(0)
-                        .repeat(1, 1)
-                    )
-                    image_indice_b_s = torch.stack(
-                        [image_indice_b, image_indice_s], dim=0
-                    )  # 2, num_image, image_length
-                    if self.image_processor.resolution_type == "native":
-                        image_indices.append(image_indice_b_s.view(2, -1))
-                    else:
-                        image_indices.append(image_indice_b_s)
-
-                    new_input_ids += [VID_CONTEXT_ID] * image_token_length
-                    if targets is not None:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
-
-                    new_input_ids += [VID_END_ID]
-                    if targets is not None:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-                for audio_chunk_frame, audio_second_chunk_frame in zip(
-                    audio_chunk_frames, audio_second_chunk_frames
-                ):
-
-                    # add timestamp
-                    timestamp = time.strftime("%H:%M:%S", time.gmtime(round(audio_second_chunk_frame)))
-                    _input_id = tokenizer(timestamp, add_special_tokens=False).input_ids
-                    _target = [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
-                    new_input_ids += _input_id
-                    if targets is not None:
-                        new_targets += _target
-
-                    new_input_ids += [AUD_START_ID]
-                    if targets is not None:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-                    # audio_token_length = audio_chunk_frame.size(0)
-                    # audio_token_length = audio_token_length_func(audio_chunk_frame.size(0))
-                    audio_token_length = audio_token_length_func(audio_chunk_frame)
-                    audio_indice_b = torch.zeros(
-                        1, audio_token_length, dtype=torch.int64
-                    )  # This will change in collate_fn
-                    audio_indice_s = (
-                        torch.arange(len(new_input_ids), len(new_input_ids) + audio_token_length)
-                        .unsqueeze(0)
-                        .repeat(1, 1)
-                    )
-                    audio_indice_b_s = torch.stack(
-                        [audio_indice_b, audio_indice_s], dim=0
-                    )  # 2, num_audio, audio_length
-                    audio_indices.append(audio_indice_b_s)
-
-                    new_input_ids += [AUD_CONTEXT_ID] * audio_token_length
-                    if targets is not None:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * audio_token_length
-
-                    new_input_ids += [AUD_END_ID]
-                    if targets is not None:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            video_grid_thw.extend(_video_grid_thw)
-            second_per_grids.extend(_second_per_grids)
-
-            st = vid_pos + 1
-
-        new_input_ids += input_ids[st:]
-        if targets is not None:
-            new_targets += targets[st:]
-
-        input_ids = new_input_ids
-        if targets is not None:
-            targets = new_targets
-
-        video_grid_thw = torch.tensor(video_grid_thw, dtype=torch.long)
-        second_per_grids = torch.tensor(second_per_grids, dtype=torch.long)
-
-        if targets is not None:
-            return (
-                input_ids,
-                images,
-                image_indices,
-                audios,
-                audio_indices,
-                video_grid_thw,
-                second_per_grids,
-                targets,
-            )
-
-        if len(images) == 0:
-            images = None
-            image_indices = None
-
-        else:
-            images = torch.cat(images, dim=0)
-            image_indices = torch.cat(image_indices, dim=1)
-
-            image_indices = image_indices.contiguous().to(torch.cuda.current_device())
-            if True:
-                images = (
-                    torch.tensor(images, dtype=torch.bfloat16)
-                    .contiguous()
-                    .to(torch.cuda.current_device())
-                )
-
-            else:
-                images = (
-                    torch.tensor(images, dtype=torch.float16)
-                    .contiguous()
-                    .to(torch.cuda.current_device())
-                )
-
-        if len(audios) == 0:
-            audios = None
-            audio_indices = None
-
-        return (
-            input_ids,
-            images,
-            image_indices,
-            audios,
-            audio_indices,
-            video_grid_thw,
-            second_per_grids,
-        )
-
-
-    def add_video_input_discrete_and_contiguous(
-        self,
-        input_ids,
-        video_paths,
-        tokenizer,
-        targets=None,
-        is_pretrain=False,
-        image_token_length=256,
-        max_num_frames=4096,
-        max_fps=1,
-        use_audio_in_video=True,
-        video_chunk_size=2,
-        video_audio_chunk_size=None,
-        video_audio_num_subchunk=None,
-        **kwargs,
-    ):
-
-        GLOBAL_TOKEN = get_token()
-
-        IMG_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.IMG_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        IMG_START_ID = tokenizer(GLOBAL_TOKEN.IMG_START_TOKEN, add_special_tokens=False).input_ids
-        IMG_END_ID = tokenizer(GLOBAL_TOKEN.IMG_END_TOKEN, add_special_tokens=False).input_ids
-
-        AUD_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.AUD_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        AUD_START_ID = tokenizer(GLOBAL_TOKEN.AUD_START_TOKEN, add_special_tokens=False).input_ids
-        AUD_END_ID = tokenizer(GLOBAL_TOKEN.AUD_END_TOKEN, add_special_tokens=False).input_ids
-
-        VID_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.VID_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        VID_START_ID = tokenizer(GLOBAL_TOKEN.VID_START_TOKEN, add_special_tokens=False).input_ids
-        VID_END_ID = tokenizer(GLOBAL_TOKEN.VID_END_TOKEN, add_special_tokens=False).input_ids
-
-        PATCH_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.PATCH_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        PATCH_START_ID = tokenizer(
-            GLOBAL_TOKEN.PATCH_START_TOKEN, add_special_tokens=False
-        ).input_ids
-        PATCH_END_ID = tokenizer(GLOBAL_TOKEN.PATCH_END_TOKEN, add_special_tokens=False).input_ids
-
-        IMG_TAG_ID = tokenizer(GLOBAL_TOKEN.IMG_TAG_TOKEN, add_special_tokens=False).input_ids
-        AUD_TAG_ID = tokenizer(GLOBAL_TOKEN.AUD_TAG_TOKEN, add_special_tokens=False).input_ids
-        VID_TAG_ID = tokenizer(GLOBAL_TOKEN.VID_TAG_TOKEN, add_special_tokens=False).input_ids
-
-        assert len(IMG_CONTEXT_ID) == 1
-        assert len(IMG_START_ID) == 1
-        assert len(IMG_END_ID) == 1
-
-        assert len(AUD_CONTEXT_ID) == 1
-        assert len(AUD_START_ID) == 1
-        assert len(AUD_END_ID) == 1
-
-        assert len(VID_CONTEXT_ID) == 1
-        assert len(VID_START_ID) == 1
-        assert len(VID_END_ID) == 1
-
-        assert len(PATCH_CONTEXT_ID) == 1
-        assert len(PATCH_START_ID) == 1
-        assert len(PATCH_END_ID) == 1
-
-        IMG_CONTEXT_ID = IMG_CONTEXT_ID[0]
-        IMG_START_ID = IMG_START_ID[0]
-        IMG_END_ID = IMG_END_ID[0]
-
-        AUD_CONTEXT_ID = AUD_CONTEXT_ID[0]
-        AUD_START_ID = AUD_START_ID[0]
-        AUD_END_ID = AUD_END_ID[0]
-
-        VID_CONTEXT_ID = VID_CONTEXT_ID[0]
-        VID_START_ID = VID_START_ID[0]
-        VID_END_ID = VID_END_ID[0]
-
-        PATCH_CONTEXT_ID = PATCH_CONTEXT_ID[0]
-        PATCH_START_ID = PATCH_START_ID[0]
-        PATCH_END_ID = PATCH_END_ID[0]
-
-        IMG_TAG_ID = IMG_TAG_ID[0]
-        AUD_TAG_ID = AUD_TAG_ID[0]
-        VID_TAG_ID = VID_TAG_ID[0]
-
-        nl_tokens = tokenizer("\n", add_special_tokens=False).input_ids
-
-        vid_positions = [i for i, x in enumerate(input_ids) if x == VID_TAG_ID]
-        assert len(vid_positions) == len(video_paths), video_paths
-
-        images = []
-        image_indices = []
-        audios = []
-        audio_indices = []
-        video_grid_thw = []
-        second_per_grids = []
-
-        new_input_ids = []
-        new_targets = []
-        st = 0
-        for vid_idx, vid_pos in enumerate(vid_positions):
-            (
-                image_frames,
-                audio_frames,
-                _video_grid_thw,
-                _second_per_grids,
-                second_frames,
-            ) = self.process_video_raw(
-                video_paths[vid_idx], max_num_frames, max_fps, use_audio_in_video=use_audio_in_video
-            )
-
-            if audio_frames is not None:
-                # print(f"{len(image_frames)=} {len(audio_frames)=}")
-                # print(f"{[x.size() for x in image_frames]=}")
-                # print(f"{[x.size() for x in audio_frames]=}")
-
-                num_frames = min(len(image_frames), len(audio_frames))
-                image_frames = image_frames[:num_frames]
-                audio_frames = audio_frames[:num_frames]
-
-            new_input_ids += input_ids[st:vid_pos]
-            if targets is not None:
-                new_targets += targets[st:vid_pos]
-
-            second_chunks = [
-                second_frames[i : i + video_chunk_size]
-                for i in range(0, len(second_frames), video_chunk_size)
-            ]
-
-            image_chunks = [
-                image_frames[i : i + video_chunk_size]
-                for i in range(0, len(image_frames), video_chunk_size)
-            ]
-            if audio_frames is not None:
-                audio_chunks = [
-                    audio_frames[i : i + video_chunk_size]
-                    for i in range(0, len(audio_frames), video_chunk_size)
-                ]
-            else:
-                audio_chunks = [[] for i in range(0, len(image_frames), video_chunk_size)]
-
-            # resplit audio frame
-            if audio_frames is not None:
-
-                if video_audio_chunk_size is not None:
-                    audio_chunks = [torch.cat(x, dim=0) for x in audio_chunks]
-                    audio_chunks = [
-                        torch.split(x, video_audio_chunk_size, dim=0) for x in audio_chunks
-                    ]
-
-                if video_audio_num_subchunk is not None:
-                    audio_chunks = [x[:video_audio_num_subchunk] for x in audio_chunks]
-            # print([[xx.size() for xx in x] for x in audio_chunks])
-
-            images.extend(image_frames)
-            if audio_frames is not None:
-                # audios.extend(audio_frames)
-                audios.extend([xx for x in audio_chunks for xx in x])
-
-            new_input_ids += [VID_START_ID]
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            for image_chunk_frames, audio_chunk_frames, second_chunk_frames in zip(
-                image_chunks, audio_chunks, second_chunks
-            ):
-                for image_chunk_frame, second_chunk_frame in zip(
-                    image_chunk_frames, second_chunk_frames
-                ):
-
-                    # add timestamp
-                    timestamp = time.strftime("%H:%M:%S", time.gmtime(round(second_chunk_frame)))
-                    _input_id = tokenizer(timestamp, add_special_tokens=False).input_ids
-                    _target = [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
-                    new_input_ids += _input_id
-                    if targets is not None:
-                        new_targets += _target
-
-                    new_input_ids += [IMG_TAG_ID]
-                    if targets is not None:
-                        new_targets += [IMG_TAG_ID]
-
-                for audio_chunk_frame in audio_chunk_frames:
-
-                    new_input_ids += [AUD_TAG_ID]
-                    if targets is not None:
-                        new_targets += [AUD_TAG_ID]
-
-            new_input_ids += [VID_END_ID]
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            video_grid_thw.extend(_video_grid_thw)
-            second_per_grids.extend(_second_per_grids)
-
-            st = vid_pos + 1
-
-        new_input_ids += input_ids[st:]
-        if targets is not None:
-            new_targets += targets[st:]
-
-        input_ids = new_input_ids
-        if targets is not None:
-            targets = new_targets
-
-        if targets is not None:
-            (
-                input_ids,
-                images,
-                image_indices,
-                image_grid_thw,
-                targets,
-            ) = self.image_processor.add_image_input_discrete_and_contiguous(
-                input_ids,
-                images,
-                tokenizer,
-                image_token_length=image_token_length,
-                use_tile=False,
-                targets=targets,
-                is_pretrain=is_pretrain,
-            )
-        else:
-            (
-                input_ids,
-                images,
-                image_indices,
-                image_grid_thw,
-            ) = self.image_processor.add_image_input_discrete_and_contiguous(
-                input_ids,
-                images,
-                tokenizer,
-                image_token_length=image_token_length,
-                use_tile=False,
-            )
-
-        if audio_frames is not None:
-            if video_audio_chunk_size is None:
-                video_audio_chunk_size = max(max([len(audio) for audio in audios]), 400)
-            audios = [
-                (
-                    audio
-                    if len(audio) == video_audio_chunk_size
-                    else torch.cat(
-                        [audio, torch.zeros(video_audio_chunk_size - len(audio))], dim=0
-                    ),
-                    self.sample_rate,
-                )
-                for audio in audios
-            ]
-            # print(f"{[x[0].size() for x in audios]=}")
-
-            if targets is not None:
-                (
-                    input_ids,
-                    audios,
-                    audio_indices,
-                    targets,
-                ) = self.audio_processor.add_audio_input_discrete_and_contiguous(
-                    input_ids, audios, tokenizer, targets=targets, is_pretrain=is_pretrain
-                )
-            else:
-                (
-                    input_ids,
-                    audios,
-                    audio_indices,
-                ) = self.audio_processor.add_audio_input_discrete_and_contiguous(
-                    input_ids, audios, tokenizer
-                )
-
-        video_grid_thw = torch.tensor(video_grid_thw, dtype=torch.long)
-        second_per_grids = torch.tensor(second_per_grids, dtype=torch.long)
-
-        if targets is not None:
-            return (
-                input_ids,
-                images,
-                image_indices,
-                audios,
-                audio_indices,
-                video_grid_thw,
-                second_per_grids,
-                targets,
-            )
-
-        return (
-            input_ids,
-            images,
-            image_indices,
-            audios,
-            audio_indices,
-            video_grid_thw,
-            second_per_grids,
-        )
-
-        images = torch.cat(images, dim=0)
-        image_indices = torch.cat(image_indices, dim=1)
-
-        image_indices = image_indices.contiguous().to(torch.cuda.current_device())
-        if True:
-            images = (
-                torch.tensor(images, dtype=torch.bfloat16)
-                .contiguous()
-                .to(torch.cuda.current_device())
-            )
-
-        else:
-            images = (
-                torch.tensor(images, dtype=torch.float16)
-                .contiguous()
-                .to(torch.cuda.current_device())
-            )
-
-        if len(audios) == 0:
-            audios = None
-            audio_indices = None
-
-        return (
-            input_ids,
-            images,
-            image_indices,
-            audios,
-            audio_indices,
-            video_grid_thw,
-            second_per_grids,
-        )
-
 
     def add_video_input_discrete_or_contiguous(
         self,
@@ -4479,14 +3557,14 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         discrete_video_idxs=[],
         contiguous_video_idxs=[],
         is_pretrain=False,
-        max_num_frames=4096,
-        max_fps=1,
-        use_audio_in_video=True,
-        use_vision_in_video=True,
-        video_audio_chunk_min_second=2,
-        video_audio_chunk_max_second=30,
         **kwargs,
     ):
+        video_max_num_frames = kwargs.get("video_max_num_frames", self.video_max_num_frames)
+        video_max_fps = kwargs.get("video_max_fps", self.video_max_fps)
+        use_audio_in_video = kwargs.get("use_audio_in_video", self.use_audio_in_video)
+        use_vision_in_video = kwargs.get("use_vision_in_video", self.use_vision_in_video)
+        video_audio_chunk_min_second = kwargs.get("video_audio_chuk_min_second", self.video_audio_chunk_min_second)
+        video_audio_chunk_max_second = kwargs.get("video_audio_chuk_max_second", self.video_audio_chunk_max_second)
 
         GLOBAL_TOKEN = get_token()
 
@@ -4567,7 +3645,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                 _second_per_grids,
                 second_frames,
                 duration_seconds,
-            ) = self.process_video(video_paths[vid_idx], max_num_frames, max_fps)
+            ) = self.process_video(video_paths[vid_idx], video_max_num_frames, video_max_fps)
 
             if audio_frames is not None:
                 # print(f"{len(image_frames)=} {len(audio_frames)=}")
@@ -4672,7 +3750,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             # assert len(audio_frames) == sum([len(x) for x in audio_chunks])
 
             if use_vision_in_video:
-                if self.image_processor.resolution_type == "native":
+                if self.image_processor.vision_resolution_type == "native":
                     images.append(
                         torch.cat(
                             [
@@ -4740,7 +3818,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             else:
                                 new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
 
-                        if self.image_processor.resolution_type == "native":
+                        if self.image_processor.vision_resolution_type == "native":
                             resolution = f"{_video_grid_thw[0][1] * self.patch_size}*{_video_grid_thw[0][2] * self.patch_size}"
                             _input_id = tokenizer(resolution, add_special_tokens=False).input_ids
                             new_input_ids += _input_id
@@ -4966,12 +4044,12 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         self,
         image_size=448,
         image_size_discrete=None,
-        normalize_type="imagenet",
-        resolution_type="dynamic",
+        vision_normalize_type="imagenet",
+        vision_resolution_type="dynamic",
         min_tile_grid=1,
         max_tile_grid=6,
-        min_num_tokens=4,
-        max_num_tokens=256,
+        image_min_num_tokens=4,
+        image_max_num_tokens=256,
         temporal_patch_size=1,
         spatial_merge_size=2,
         patch_size=14,
@@ -4982,26 +4060,26 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         super().__init__(**kwargs)
         self.image_size = image_size
         self.image_size_discrete = image_size_discrete
-        self.resolution_type = resolution_type
+        self.vision_resolution_type = vision_resolution_type
         self.min_tile_grid = min_tile_grid
         self.max_tile_grid = max_tile_grid
         self.tile_image_size = image_size
-        self.max_num_tokens = max_num_tokens
-        self.min_num_tokens = min_num_tokens
+        self.image_max_num_tokens = image_max_num_tokens
+        self.image_min_num_tokens = image_min_num_tokens
 
         GLOBAL_TOKEN = get_token()
-        if normalize_type == "imagenet":
+        if vision_normalize_type == "imagenet":
             MEAN, STD = GLOBAL_TOKEN.IMAGENET_DEFAULT_MEAN, GLOBAL_TOKEN.IMAGENET_DEFAULT_STD
-        elif normalize_type == "clip":
+        elif vision_normalize_type == "clip":
             MEAN, STD = GLOBAL_TOKEN.OPENAI_CLIP_MEAN, GLOBAL_TOKEN.OPENAI_CLIP_STD
-        elif normalize_type == "siglip":
+        elif vision_normalize_type == "siglip":
             MEAN, STD = GLOBAL_TOKEN.IMAGENET_STANDARD_MEAN, GLOBAL_TOKEN.IMAGENET_STANDARD_STD
         else:
-            raise NotImplementedError(normalize_type)
+            raise NotImplementedError(vision_normalize_type)
         self.mean = MEAN
         self.std = STD
 
-        if self.resolution_type == "anyres":
+        if self.vision_resolution_type == "anyres":
             raise NotImplemented
             self.grid_pinpoints = [
                 (i, j)
@@ -5014,7 +4092,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             print(f"{self.grid_pinpoints=}")
             print(f"{self.possible_resolutions=}")
 
-        if self.resolution_type == "dynamic":
+        if self.vision_resolution_type == "dynamic":
             max_num = self.max_tile_grid
             min_num = self.min_tile_grid
             # calculate the existing image aspect ratio
@@ -5032,9 +4110,9 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             print(f"{self.target_ratios=}")
             print(f"{self.possible_resolutions=}")
 
-        if self.resolution_type == "native":
-            self.min_pixels = (patch_size * spatial_merge_size) ** 2 * min_num_tokens
-            self.max_pixels = (patch_size * spatial_merge_size) ** 2 * max_num_tokens
+        if self.vision_resolution_type == "native":
+            self.min_pixels = (patch_size * spatial_merge_size) ** 2 * image_min_num_tokens
+            self.max_pixels = (patch_size * spatial_merge_size) ** 2 * image_max_num_tokens
             print(f"{self.min_pixels=} {self.max_pixels=}")
 
         self.patch_size = patch_size
@@ -5122,11 +4200,11 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         return image
 
     def process_image_to_tiles(self, image_or_path, **kwargs):
-        if self.resolution_type == "anyres":
+        if self.vision_resolution_type == "anyres":
             return self.process_anyres(image_or_path)
-        if self.resolution_type == "dynamic":
+        if self.vision_resolution_type == "dynamic":
             return self.process_dynamic(image_or_path)
-        if self.resolution_type == "native":
+        if self.vision_resolution_type == "native":
             return self.process_native(image_or_path, **kwargs)
 
         if isinstance(image_or_path, str):
@@ -5176,12 +4254,12 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             return image_data
 
         if is_contiguous:
-            resolution_type = kwargs.get("resolution_type", self.resolution_type)
-            if self.resolution_type == "anyres":
+            vision_resolution_type = kwargs.get("vision_resolution_type", self.vision_resolution_type)
+            if self.vision_resolution_type == "anyres":
                 return self.process_anyres(image_or_path)
-            if self.resolution_type == "dynamic":
+            if self.vision_resolution_type == "dynamic":
                 return self.process_dynamic(image_or_path)
-            if self.resolution_type == "native":
+            if self.vision_resolution_type == "native":
                 return self.process_native(image_or_path, **kwargs)
 
             if isinstance(image_or_path, str):
@@ -5302,7 +4380,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         #     height,
         #     width,
         #     patch_size=self.patch_size * self.spatial_merge_size,
-        #     max_num_patches=self.max_num_tokens,
+        #     max_num_patches=self.image_max_num_tokens,
         # )
 
         image = image.resize((resized_width, resized_height), resample=PIL.Image.Resampling.BICUBIC)
@@ -5470,7 +4548,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
 
             _image_grid_thw = self.get_image_grid_thw(image_patches)
 
-            if self.resolution_type == "native":
+            if self.vision_resolution_type == "native":
                 images.append(
                     torch.cat(
                         [
@@ -5509,7 +4587,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             image_indice_b_s = torch.stack(
                 [image_indice_b, image_indice_s], dim=0
             )  # 2, num_image, image_length
-            if self.resolution_type == "native":
+            if self.vision_resolution_type == "native":
                 image_indices.append(image_indice_b_s.view(2, -1))
             else:
                 image_indices.append(image_indice_b_s)
@@ -5673,7 +4751,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
 
             _image_grid_thw = self.get_image_grid_thw(image_patches)
 
-            if self.resolution_type == "native":
+            if self.vision_resolution_type == "native":
                 images.append(
                     torch.cat(
                         [
@@ -5764,7 +4842,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             image_indice_b_s = torch.stack(
                 [image_indice_b, image_indice_s], dim=0
             )  # 2, num_image, image_length
-            if self.resolution_type == "native":
+            if self.vision_resolution_type == "native":
                 image_indices.append(image_indice_b_s.view(2, -1))
             else:
                 image_indices.append(image_indice_b_s)
@@ -5934,7 +5012,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_END_TOKEN)
         IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_TAG_TOKEN)
 
-        if self.resolution_type == "native":
+        if self.vision_resolution_type == "native":
             pass
         else:
             PATCH_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.PATCH_CONTEXT_TOKEN)
@@ -5969,7 +5047,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             # --------------------------------------------------------------------------
             # add discrete
             if img_idx in discrete_image_idxs:
-                assert self.resolution_type == "native"
+                assert self.vision_resolution_type == "native"
                 image_data = self.process_image(
                     image_or_paths[img_idx],
                     is_contiguous=True,
@@ -6028,7 +5106,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                 _image_grid_thw = self.get_image_grid_thw(image_patches)
                 image_grid_thw.extend(_image_grid_thw)
 
-                if self.resolution_type == "native":
+                if self.vision_resolution_type == "native":
                     images.append(
                         torch.cat(
                             [
@@ -6048,7 +5126,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                     else:
                         new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
 
-                if self.resolution_type == "native":
+                if self.vision_resolution_type == "native":
                     resolution = f"{_image_grid_thw[0][1] * self.patch_size}*{_image_grid_thw[0][2] * self.patch_size}"
                     size_input_id = tokenizer(resolution, add_special_tokens=False).input_ids
                     new_input_ids += size_input_id
@@ -6216,7 +5294,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         **kwargs,
     ):
 
-        assert self.resolution_type == "native"
+        assert self.vision_resolution_type == "native"
         GLOBAL_TOKEN = get_token()
 
         IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_CONTEXT_TOKEN)
@@ -6548,7 +5626,7 @@ class YoutuVITAProcessor(ProcessorMixin):
                 **output_kwargs["videos_kwargs"],
             )
             if images is not None:
-                print(f"{len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw=}")
+                print(f"{len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw.size()=}")
             if audios is not None:
                 print(f"{len(input_ids)=} {len(audios)=} {[x.size() for x in audios]=} {len(audio_indices)=}")
 

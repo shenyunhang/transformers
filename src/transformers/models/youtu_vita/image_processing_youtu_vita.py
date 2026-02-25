@@ -121,12 +121,12 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         self,
         image_size=448,
         image_size_discrete=None,
-        normalize_type="imagenet",
-        resolution_type="dynamic",
+        vision_normalize_type="imagenet",
+        vision_resolution_type="dynamic",
         min_tile_grid=1,
         max_tile_grid=6,
-        min_num_tokens=4,
-        max_num_tokens=256,
+        image_min_num_tokens=4,
+        image_max_num_tokens=256,
         temporal_patch_size=1,
         spatial_merge_size=2,
         patch_size=14,
@@ -137,26 +137,26 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         super().__init__(**kwargs)
         self.image_size = image_size
         self.image_size_discrete = image_size_discrete
-        self.resolution_type = resolution_type
+        self.vision_resolution_type = vision_resolution_type
         self.min_tile_grid = min_tile_grid
         self.max_tile_grid = max_tile_grid
         self.tile_image_size = image_size
-        self.max_num_tokens = max_num_tokens
-        self.min_num_tokens = min_num_tokens
+        self.image_max_num_tokens = image_max_num_tokens
+        self.image_min_num_tokens = image_min_num_tokens
 
         GLOBAL_TOKEN = get_token()
-        if normalize_type == "imagenet":
+        if vision_normalize_type == "imagenet":
             MEAN, STD = GLOBAL_TOKEN.IMAGENET_DEFAULT_MEAN, GLOBAL_TOKEN.IMAGENET_DEFAULT_STD
-        elif normalize_type == "clip":
+        elif vision_normalize_type == "clip":
             MEAN, STD = GLOBAL_TOKEN.OPENAI_CLIP_MEAN, GLOBAL_TOKEN.OPENAI_CLIP_STD
-        elif normalize_type == "siglip":
+        elif vision_normalize_type == "siglip":
             MEAN, STD = GLOBAL_TOKEN.IMAGENET_STANDARD_MEAN, GLOBAL_TOKEN.IMAGENET_STANDARD_STD
         else:
-            raise NotImplementedError(normalize_type)
+            raise NotImplementedError(vision_normalize_type)
         self.mean = MEAN
         self.std = STD
 
-        if self.resolution_type == "anyres":
+        if self.vision_resolution_type == "anyres":
             raise NotImplementedError
             self.grid_pinpoints = [
                 (i, j)
@@ -167,7 +167,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             print(f"{self.grid_pinpoints=}")
             print(f"{self.possible_resolutions=}")
 
-        if self.resolution_type == "dynamic":
+        if self.vision_resolution_type == "dynamic":
             max_num = self.max_tile_grid
             min_num = self.min_tile_grid
             # calculate the existing image aspect ratio
@@ -183,9 +183,9 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             print(f"{self.target_ratios=}")
             print(f"{self.possible_resolutions=}")
 
-        if self.resolution_type == "native":
-            self.min_pixels = (patch_size * spatial_merge_size) ** 2 * min_num_tokens
-            self.max_pixels = (patch_size * spatial_merge_size) ** 2 * max_num_tokens
+        if self.vision_resolution_type == "native":
+            self.min_pixels = (patch_size * spatial_merge_size) ** 2 * image_min_num_tokens
+            self.max_pixels = (patch_size * spatial_merge_size) ** 2 * image_max_num_tokens
             print(f"{self.min_pixels=} {self.max_pixels=}")
 
         self.patch_size = patch_size
@@ -269,11 +269,11 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         return image
 
     def process_image_to_tiles(self, image_or_path, **kwargs):
-        if self.resolution_type == "anyres":
+        if self.vision_resolution_type == "anyres":
             return self.process_anyres(image_or_path)
-        if self.resolution_type == "dynamic":
+        if self.vision_resolution_type == "dynamic":
             return self.process_dynamic(image_or_path)
-        if self.resolution_type == "native":
+        if self.vision_resolution_type == "native":
             return self.process_native(image_or_path, **kwargs)
 
         if isinstance(image_or_path, str):
@@ -322,12 +322,12 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             return image_data
 
         if is_contiguous:
-            resolution_type = kwargs.get("resolution_type", self.resolution_type)
-            if self.resolution_type == "anyres":
+            vision_resolution_type = kwargs.get("vision_resolution_type", self.vision_resolution_type)
+            if self.vision_resolution_type == "anyres":
                 return self.process_anyres(image_or_path)
-            if self.resolution_type == "dynamic":
+            if self.vision_resolution_type == "dynamic":
                 return self.process_dynamic(image_or_path)
-            if self.resolution_type == "native":
+            if self.vision_resolution_type == "native":
                 return self.process_native(image_or_path, **kwargs)
 
             if isinstance(image_or_path, str):
@@ -448,7 +448,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         #     height,
         #     width,
         #     patch_size=self.patch_size * self.spatial_merge_size,
-        #     max_num_patches=self.max_num_tokens,
+        #     max_num_patches=self.image_max_num_tokens,
         # )
 
         image = image.resize((resized_width, resized_height), resample=PIL.Image.Resampling.BICUBIC)
@@ -608,7 +608,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
 
             _image_grid_thw = self.get_image_grid_thw(image_patches)
 
-            if self.resolution_type == "native":
+            if self.vision_resolution_type == "native":
                 images.append(
                     torch.cat(
                         [self.convert_image_to_patches_with_pixel_shuffle(x) for x in image_patches],
@@ -638,7 +638,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                 torch.arange(len(new_input_ids), len(new_input_ids) + image_token_length).unsqueeze(0).repeat(1, 1)
             )
             image_indice_b_s = torch.stack([image_indice_b, image_indice_s], dim=0)  # 2, num_image, image_length
-            if self.resolution_type == "native":
+            if self.vision_resolution_type == "native":
                 image_indices.append(image_indice_b_s.view(2, -1))
             else:
                 image_indices.append(image_indice_b_s)
@@ -783,7 +783,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
 
             _image_grid_thw = self.get_image_grid_thw(image_patches)
 
-            if self.resolution_type == "native":
+            if self.vision_resolution_type == "native":
                 images.append(
                     torch.cat(
                         [self.convert_image_to_patches_with_pixel_shuffle(x) for x in image_patches],
@@ -865,7 +865,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                 torch.arange(len(new_input_ids), len(new_input_ids) + image_token_length).unsqueeze(0).repeat(1, 1)
             )
             image_indice_b_s = torch.stack([image_indice_b, image_indice_s], dim=0)  # 2, num_image, image_length
-            if self.resolution_type == "native":
+            if self.vision_resolution_type == "native":
                 image_indices.append(image_indice_b_s.view(2, -1))
             else:
                 image_indices.append(image_indice_b_s)
@@ -1023,7 +1023,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_END_TOKEN)
         IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_TAG_TOKEN)
 
-        if self.resolution_type == "native":
+        if self.vision_resolution_type == "native":
             pass
         else:
             PATCH_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.PATCH_CONTEXT_TOKEN)
@@ -1057,7 +1057,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             # --------------------------------------------------------------------------
             # add discrete
             if img_idx in discrete_image_idxs:
-                assert self.resolution_type == "native"
+                assert self.vision_resolution_type == "native"
                 image_data = self.process_image(
                     image_or_paths[img_idx],
                     is_contiguous=True,
@@ -1115,7 +1115,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                 _image_grid_thw = self.get_image_grid_thw(image_patches)
                 image_grid_thw.extend(_image_grid_thw)
 
-                if self.resolution_type == "native":
+                if self.vision_resolution_type == "native":
                     images.append(
                         torch.cat(
                             [self.convert_image_to_patches_with_pixel_shuffle(x) for x in image_patches],
@@ -1132,7 +1132,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                     else:
                         new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
 
-                if self.resolution_type == "native":
+                if self.vision_resolution_type == "native":
                     resolution = f"{_image_grid_thw[0][1] * self.patch_size}*{_image_grid_thw[0][2] * self.patch_size}"
                     size_input_id = tokenizer(resolution, add_special_tokens=False).input_ids
                     new_input_ids += size_input_id
@@ -1285,7 +1285,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         is_pretrain=False,
         **kwargs,
     ):
-        assert self.resolution_type == "native"
+        assert self.vision_resolution_type == "native"
         GLOBAL_TOKEN = get_token()
 
         IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_CONTEXT_TOKEN)

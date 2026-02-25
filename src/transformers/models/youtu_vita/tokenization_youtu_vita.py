@@ -38,7 +38,7 @@ logger = logging.get_logger(__name__)
 
 
 class GLM4VoiceTokenizer:
-    sample_rate = 16000
+    sampling_rate = 16000
 
     is_discrete = True
     is_contiguous = False
@@ -173,17 +173,17 @@ class GLM4VoiceTokenizer:
             audios, indices = [], []
             for idx, utt in enumerate(utts):
                 if isinstance(utt, tuple):
-                    audio, sample_rate = utt
+                    audio, sampling_rate = utt
                 else:
-                    audio, sample_rate = torchaudio.load(utt)
+                    audio, sampling_rate = torchaudio.load(utt)
                 # audio = audio.to(device)
-                if sample_rate != 16000:
-                    if sample_rate not in self._resample_buffer:
-                        self._resample_buffer[sample_rate] = torchaudio.transforms.Resample(
-                            orig_freq=sample_rate, new_freq=16000
+                if sampling_rate != 16000:
+                    if sampling_rate not in self._resample_buffer:
+                        self._resample_buffer[sampling_rate] = torchaudio.transforms.Resample(
+                            orig_freq=sampling_rate, new_freq=16000
                         )  # .to(device)
-                    # self._resample_buffer[sample_rate].to(device)
-                    audio = self._resample_buffer[sample_rate](audio)
+                    # self._resample_buffer[sampling_rate].to(device)
+                    audio = self._resample_buffer[sampling_rate](audio)
                 # if audio.shape[0] > 1:
                 #     audio = audio[:1]
                 # audio = audio[0]
@@ -232,7 +232,7 @@ class WavFrontendTokenizer:
     def __init__(
         self,
     ):
-        self.sample_rate = 16000
+        self.sampling_rate = 16000
 
         self.is_discrete = True
         self.is_contiguous = True
@@ -266,25 +266,25 @@ class WavFrontendTokenizer:
             self.load_model()
 
         if isinstance(audio_or_path, tuple):
-            audio, sample_rate = audio_or_path
+            audio, sampling_rate = audio_or_path
         else:
-            audio, sample_rate = torchaudio.load(audio_or_path)
-        # print(f"{audio.size()=} {sample_rate=}")
+            audio, sampling_rate = torchaudio.load(audio_or_path)
+        # print(f"{audio.size()=} {sampling_rate=}")
         if audio.dim() == 2:
             audio = audio.mean(0)
 
-        if sample_rate != self.sample_rate:
-            if sample_rate not in self._resample_buffer:
-                # print(f"torchaudio.transforms.Resample {sample_rate=} {self.sample_rate=} {self.device=}", flush=True)
-                self._resample_buffer[sample_rate] = torchaudio.transforms.Resample(
-                    orig_freq=sample_rate, new_freq=self.sample_rate
+        if sampling_rate != self.sampling_rate:
+            if sampling_rate not in self._resample_buffer:
+                # print(f"torchaudio.transforms.Resample {sampling_rate=} {self.sampling_rate=} {self.device=}", flush=True)
+                self._resample_buffer[sampling_rate] = torchaudio.transforms.Resample(
+                    orig_freq=sampling_rate, new_freq=self.sampling_rate
                 ).to(self.device)
             audio = audio.to(self.device)
-            self._resample_buffer[sample_rate].to(self.device)
-            audio = self._resample_buffer[sample_rate](audio[None, :])[0, :]
+            self._resample_buffer[sampling_rate].to(self.device)
+            audio = self._resample_buffer[sampling_rate](audio[None, :])[0, :]
             audio = audio.cpu()
         # resampler = torchaudio.transforms.Resample(
-        #     orig_freq=sample_rate, new_freq=self.sample_rate
+        #     orig_freq=sampling_rate, new_freq=self.sampling_rate
         # )
         # audio = resampler(audio[None, :])[0, :]
         # audio = audio.to(self.device)
@@ -304,7 +304,7 @@ class WavFrontendTokenizer:
         return {
             "audio": speech,
             "audio_token_length_func": len,
-            "duration_seconds": len(audio) / self.sample_rate,
+            "duration_seconds": len(audio) / self.sampling_rate,
         }
 
     @torch.no_grad()

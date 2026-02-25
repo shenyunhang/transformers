@@ -52,6 +52,12 @@ def get_audio_tokenizer(model_name_or_path_list, audio_tokenizer_type_list, flow
         audio_tokenizer_type_list = []
         model_name_or_path_list = []
 
+    if isinstance(model_name_or_path_list, str):
+        model_name_or_path_list = model_name_or_path_list.split()
+
+    if isinstance(audio_tokenizer_type_list, str):
+        audio_tokenizer_type_list = audio_tokenizer_type_list.split()
+
     tokenizer_contiguous = None
     tokenizer_discrete = None
     for audio_tokenizer_type, model_name_or_path in zip(audio_tokenizer_type_list, model_name_or_path_list):
@@ -124,6 +130,7 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         flow_path=None,
         rank=None,
         text_audio_interval_ratio=None,
+        temporal_merge_size=1,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -136,6 +143,7 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         )
 
         self.text_audio_interval_ratio = text_audio_interval_ratio
+        self.temporal_merge_size = temporal_merge_size
 
         # self.load_model()
 
@@ -163,7 +171,10 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                     return audio_data
 
             audio_data = self.audio_tokenizer.encode(
-                audio_or_path, is_discrete=is_discrete, is_contiguous=is_contiguous, **kwargs
+                audio_or_path,
+                is_discrete=is_discrete,
+                is_contiguous=is_contiguous,
+                **kwargs,
             )
             # print(f"{len(audio_data)=}")
 
@@ -174,7 +185,10 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
 
         if is_contiguous:
             audio_dict = self.audio_tokenizer.encode(
-                audio_or_path, is_discrete=is_discrete, is_contiguous=is_contiguous, **kwargs
+                audio_or_path,
+                is_discrete=is_discrete,
+                is_contiguous=is_contiguous,
+                **kwargs,
             )
             return audio_dict
 
@@ -197,205 +211,6 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
             AUD_END_ID,
             self.text_audio_interval_ratio,
         )
-
-    def add_audio_input_contiguous(
-        self,
-        input_ids,
-        audio_or_paths,
-        tokenizer,
-        targets=None,
-        is_pretrain=False,
-        **kwargs,
-    ):
-        GLOBAL_TOKEN = get_token()
-
-        AUD_CONTEXT_ID = tokenizer(GLOBAL_TOKEN.AUD_CONTEXT_TOKEN, add_special_tokens=False).input_ids
-        AUD_TAG_ID = tokenizer(GLOBAL_TOKEN.AUD_TAG_TOKEN, add_special_tokens=False).input_ids
-        AUD_START_ID = tokenizer(GLOBAL_TOKEN.AUD_START_TOKEN, add_special_tokens=False).input_ids
-        AUD_END_ID = tokenizer(GLOBAL_TOKEN.AUD_END_TOKEN, add_special_tokens=False).input_ids
-
-        assert len(AUD_CONTEXT_ID) == 1
-        assert len(AUD_START_ID) == 1
-        assert len(AUD_END_ID) == 1
-
-        AUD_CONTEXT_ID = AUD_CONTEXT_ID[0]
-        AUD_TAG_ID = AUD_TAG_ID[0]
-        AUD_START_ID = AUD_START_ID[0]
-        AUD_END_ID = AUD_END_ID[0]
-
-        aud_positions = [i for i, x in enumerate(input_ids) if x == AUD_TAG_ID]
-        assert len(aud_positions) == len(audio_or_paths), f"{len(aud_positions)=} {len(audio_or_paths)=} {AUD_TAG_ID=}"
-
-        audios = []
-        audio_indices = []
-        new_input_ids = []
-        new_targets = []
-        st = 0
-        for aud_idx, aud_pos in enumerate(aud_positions):
-            # audio = audio_tokenizer.encode(audio_or_paths[aud_idx], is_contiguous=True)
-            audio, audio_token_length_func = self.process_audio(audio_or_paths[aud_idx], is_contiguous=True)
-            audios.append(audio)
-            # audio_token_length = audio.size(0)
-            # audio_token_length = audio_token_length_func(audio.size(0))
-            audio_token_length = audio_token_length_func(audio)
-
-            new_input_ids += input_ids[st:aud_pos]
-            if targets is not None:
-                new_targets += targets[st:aud_pos]
-
-            new_input_ids += [AUD_START_ID]
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            audio_indice_b = torch.zeros(1, audio_token_length, dtype=torch.int64)  # This will change in collate_fn
-            audio_indice_s = (
-                torch.arange(len(new_input_ids), len(new_input_ids) + audio_token_length).unsqueeze(0).repeat(1, 1)
-            )
-            audio_indice_b_s = torch.stack([audio_indice_b, audio_indice_s], dim=0)  # 2, num_audio, audio_length
-            audio_indices.append(audio_indice_b_s)
-
-            new_input_ids += [AUD_CONTEXT_ID] * audio_token_length
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * audio_token_length
-
-            new_input_ids += [AUD_END_ID]
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            st = aud_pos + 1
-
-        new_input_ids += input_ids[st:]
-        if targets is not None:
-            new_targets += targets[st:]
-
-        input_ids = new_input_ids
-        if targets is not None:
-            targets = new_targets
-
-        if targets is not None:
-            return input_ids, audios, audio_indices, targets
-
-        return input_ids, audios, audio_indices
-
-    def add_audio_input_discrete_and_contiguous(
-        self,
-        input_ids,
-        audio_or_paths,
-        tokenizer,
-        targets=None,
-        is_pretrain=False,
-        **kwargs,
-    ):
-        GLOBAL_TOKEN = get_token()
-
-        AUD_CONTEXT_ID = tokenizer(GLOBAL_TOKEN.AUD_CONTEXT_TOKEN, add_special_tokens=False).input_ids
-        AUD_TAG_ID = tokenizer(GLOBAL_TOKEN.AUD_TAG_TOKEN, add_special_tokens=False).input_ids
-        AUD_START_ID = tokenizer(GLOBAL_TOKEN.AUD_START_TOKEN, add_special_tokens=False).input_ids
-        AUD_END_ID = tokenizer(GLOBAL_TOKEN.AUD_END_TOKEN, add_special_tokens=False).input_ids
-
-        AUD_FIRST_ID = tokenizer.convert_tokens_to_ids("<|audio_0|>")
-
-        assert len(AUD_CONTEXT_ID) == 1
-        assert len(AUD_START_ID) == 1
-        assert len(AUD_END_ID) == 1
-
-        AUD_CONTEXT_ID = AUD_CONTEXT_ID[0]
-        AUD_TAG_ID = AUD_TAG_ID[0]
-        AUD_START_ID = AUD_START_ID[0]
-        AUD_END_ID = AUD_END_ID[0]
-
-        aud_positions = [i for i, x in enumerate(input_ids) if x == AUD_TAG_ID]
-        assert len(aud_positions) == len(audio_or_paths), f"{len(aud_positions)=} {len(audio_or_paths)=} {AUD_TAG_ID=}"
-
-        audios = []
-        audio_indices = []
-        new_input_ids = []
-        new_targets = []
-        st = 0
-        for aud_idx, aud_pos in enumerate(aud_positions):
-            new_input_ids += input_ids[st:aud_pos]
-            if targets is not None:
-                new_targets += targets[st:aud_pos]
-
-            # --------------------------------------------------------------------------
-            # add discrete
-
-            audio_tokens = self.process_audio(audio_or_paths[aud_idx], is_discrete=True)
-            audio_tokens = [i + AUD_FIRST_ID for i in audio_tokens]
-
-            new_input_ids += [AUD_START_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [AUD_START_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            new_input_ids += audio_tokens
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += audio_tokens
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(audio_tokens)
-
-            new_input_ids += [AUD_END_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [AUD_END_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            # --------------------------------------------------------------------------
-            # add contiguous
-
-            # audio = audio_tokenizer.encode(audio_or_paths[aud_idx], is_contiguous=True)
-            audio, audio_token_length_func = self.process_audio(audio_or_paths[aud_idx], is_contiguous=True)
-            audios.append(audio)
-            # audio_token_length = audio.size(0)
-            # audio_token_length = audio_token_length_func(audio.size(0))
-            audio_token_length = audio_token_length_func(audio)
-
-            new_input_ids += [AUD_START_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [AUD_START_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            audio_indice_b = torch.zeros(1, audio_token_length, dtype=torch.int64)  # This will change in collate_fn
-            audio_indice_s = (
-                torch.arange(len(new_input_ids), len(new_input_ids) + audio_token_length).unsqueeze(0).repeat(1, 1)
-            )
-            audio_indice_b_s = torch.stack([audio_indice_b, audio_indice_s], dim=0)  # 2, num_audio, audio_length
-            audio_indices.append(audio_indice_b_s)
-
-            new_input_ids += [AUD_CONTEXT_ID] * audio_token_length
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * audio_token_length
-
-            new_input_ids += [AUD_END_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [AUD_END_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            st = aud_pos + 1
-
-            # if max(audio_token_length) > 512:
-            #     raise Exception(f"Audio is to long {speech_lengths}")
-
-        new_input_ids += input_ids[st:]
-        if targets is not None:
-            new_targets += targets[st:]
-
-        input_ids = new_input_ids
-        if targets is not None:
-            targets = new_targets
-
-        if targets is not None:
-            return input_ids, audios, audio_indices, targets
-
-        return input_ids, audios, audio_indices
 
     def add_audio_input_discrete_or_contiguous(
         self,
@@ -582,7 +397,7 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                     if additional_targets_list is not None:
                         additional_targets_list = [x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] for x in additional_targets_list]
 
-                    audio_token_length = audio_token_length_func(audio)
+                    audio_token_length = audio_token_length_func(audio) // self.temporal_merge_size
                     audio_indice_b = torch.zeros(
                         1, audio_token_length, dtype=torch.int64
                     )  # This will change in collate_fn

@@ -39,15 +39,21 @@ class YoutuVITAImagesKwargs(ImagesKwargs, total=False):
     discrete_image_idxs: list
     contiguous_image_idxs: list
 
+    vision_resolution_type: str
+    vision_normalize_type: str
+    image_min_num_tokens: int
+    image_max_num_tokens: int
+
 
 class YoutuVITAVideosKwargs(VideosKwargs, total=False):
     """ """
 
-    resolution_type: str
-    min_num_tokens: int
-    max_num_tokens: int
-    image_min_num_tokens: int
-    image_max_num_tokens: int
+    vision_resolution_type: str
+    video_min_num_tokens: int
+    video_max_num_tokens: int
+    video_image_min_num_tokens: int
+    video_image_max_num_tokens: int
+    video_max_num_frames: int
     temporal_patch_size: int
     spatial_merge_size: int
     patch_size: int
@@ -66,13 +72,17 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
             "padding": False,
             "padding_side": "left",
         },
-        "images_kwargs": {},
+        "images_kwargs": {
+            "vision_resolution_type": "native",
+            "vision_normalize_type": "siglip",
+        },
         "videos_kwargs": {
-            "resolution_type": "native",
-            "min_num_tokens": 64,
-            "max_num_tokens": 8192,
-            "image_min_num_tokens": 4,
-            "image_max_num_tokens": 256,
+            "vision_resolution_type": "native",
+            "video_min_num_tokens": 64,
+            "video_max_num_tokens": 8192,
+            "video_image_min_num_tokens": 4,
+            "video_image_max_num_tokens": 256,
+            "video_max_num_frames": 64,
             "temporal_patch_size": 1,
             "spatial_merge_size": 2,
             "patch_size": 16,
@@ -84,6 +94,7 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
             "sampling_rate": 16000,
             "padding": "max_length",
             "return_attention_mask": True,
+            "temporal_merge_size": 1,
         },
     }
 
@@ -183,7 +194,7 @@ class YoutuVITAProcessor(ProcessorMixin):
                 **output_kwargs["videos_kwargs"],
             )
             if images is not None:
-                print(f"{len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw=}")
+                print(f"{len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw.size()=}")
             if audios is not None:
                 print(f"{len(input_ids)=} {len(audios)=} {[x.size() for x in audios]=} {len(audio_indices)=}")
 

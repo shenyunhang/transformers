@@ -663,7 +663,7 @@ class YoutuVITAAudioSmall(nn.Module):
         # speech = speech.to(device=kwargs["device"])
         # speech_lengths = speech_lengths.to(device=kwargs["device"])
         speech = speech.to(device=self.embed.weight.data.device, dtype=self.embed.weight.data.dtype)
-        speech_lengths = speech_lengths.to(device=self.embed.weight.data.device, dtype=self.embed.weight.data.dtype)
+        speech_lengths = speech_lengths.to(device=self.embed.weight.data.device, dtype=torch.int64)
 
         # language = kwargs.get("language", "auto")
         language_query = self.embed(
@@ -2310,6 +2310,8 @@ class YoutuVITAAudioKwargs(AudioKwargs, total=False):
 
     discrete_audio_idxs: list
     contiguous_audio_idxs: list
+
+    temporal_merge_size: int
 
     # audio_tokenizer_type: str
     # audio_tokenizer_path: str
