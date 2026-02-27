@@ -114,15 +114,16 @@ class YoutuVITAProcessor(ProcessorMixin):
     def __call__(
         self,
         text: TextInput | PreTokenizedInput | list[TextInput] | list[PreTokenizedInput] = None,
-        images_or_paths: ImageInput | None = None,
-        videos_or_paths: VideoInput | None = None,
-        audios_or_paths: AudioInput | None = None,
+        images: ImageInput | None = None,
+        videos: VideoInput | None = None,
+        audio: AudioInput | None = None,
         **kwargs: Unpack[YoutuVITAProcessorKwargs],
     ) -> BatchFeature:
+        audios = audio
         print(f"{text=}")
-        print(f"{images_or_paths=}")
-        print(f"{videos_or_paths=}")
-        print(f"{audios_or_paths=}")
+        print(f"{images=}")
+        print(f"{videos=}")
+        print(f"{audios=}")
         print(f"{kwargs=}")
 
         if text is None:
@@ -143,68 +144,70 @@ class YoutuVITAProcessor(ProcessorMixin):
         videos_inputs = {}
         audio_inputs = {}
 
-        if audios_or_paths:
-            input_ids, audios, audio_indices = self.audio_processor.add_audio_input_discrete_or_contiguous(
+        if audios:
+            input_ids, _audios, audio_indices = self.audio_processor.add_audio_input_discrete_or_contiguous(
                 input_ids,
-                audios_or_paths,
+                audios,
                 self.tokenizer,
                 discrete_audio_idxs=kwargs.get("discrete_audio_idxs", []),
                 **output_kwargs["audio_kwargs"],
             )
 
-            audio_seqlens = [len(x) for x in audios]
+            audio_seqlens = [len(x) for x in _audios]
 
             print(
-                f"{audios_or_paths=} {len(input_ids)=} {len(audios)=} {sum(x.abs().sum() for x in audios)=} {len(audio_indices)=}"
+                f"{audios=} {len(input_ids)=} {len(_audios)=} {sum(x.abs().sum() for x in _audios)=} {len(audio_indices)=}"
             )
 
-            audio_inputs["audios"] = audios
+            audio_inputs["audios"] = _audios
             audio_inputs["audio_indices"] = audio_indices
             # audio_inputs["audio_feature_lengths"] = audio_seqlens
 
-        if images_or_paths:
-            input_ids, images, image_indices, image_grid_thw = (
+        if images:
+            images = [image for _ in images for image in _]
+            input_ids, _images, image_indices, image_grid_thw = (
                 self.image_processor.add_image_input_discrete_or_contiguous(
                     input_ids,
-                    images_or_paths,
+                    images,
                     self.tokenizer,
                     **output_kwargs["images_kwargs"],
                 )
             )
-            print(f"{images_or_paths=} {len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw=}")
+            print(f"{images=} {len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw=}")
 
-            images_inputs["images"] = images
+            images_inputs["images"] = _images
             images_inputs["image_indices"] = image_indices
             images_inputs["image_grid_thw"] = image_grid_thw
 
-        if videos_or_paths:
+        if videos:
+            videos = [video for _ in videos for video in _]
             (
                 input_ids,
-                images,
+                _images,
                 image_indices,
-                audios,
+                _audios,
                 audio_indices,
                 image_grid_thw,
                 second_per_grids,
                 # ) = self.video_processor.add_video_input_contiguous(
             ) = self.video_processor.add_video_input_discrete_or_contiguous(
                 input_ids,
-                videos_or_paths,
+                videos,
                 self.tokenizer,
                 **output_kwargs["videos_kwargs"],
             )
-            if images is not None:
-                print(f"{len(input_ids)=} {images.size()=} {image_indices.size()=} {image_grid_thw.size()=}")
-            if audios is not None:
-                print(f"{len(input_ids)=} {len(audios)=} {[x.size() for x in audios]=} {len(audio_indices)=}")
+            if _images is not None:
+                print(f"{len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw.size()=}")
+            if _audios is not None:
+                print(f"{len(input_ids)=} {len(_audios)=} {[x.size() for x in _audios]=} {len(audio_indices)=}")
 
-            if audios is None:
+            if _audios is None:
                 audio_seqlens = None
             else:
-                audio_seqlens = [len(x) for x in audios]
-            videos_inputs["images"] = images
+                audio_seqlens = [len(x) for x in _audios]
+            videos_inputs["images"] = _images
             videos_inputs["image_indices"] = image_indices
-            videos_inputs["audios"] = audios
+            videos_inputs["audios"] = _audios
             videos_inputs["audio_indices"] = audio_indices
             videos_inputs["image_grid_thw"] = image_grid_thw
             # videos_inputs["second_per_grids"] = second_per_grids

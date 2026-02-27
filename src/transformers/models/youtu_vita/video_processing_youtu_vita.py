@@ -86,6 +86,8 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         video_image_max_num_tokens=256,
         video_audio_chunk_min_second=2,
         video_audio_chunk_max_second=30,
+        use_audio_in_video=True,
+        use_vision_in_video=True,
         temporal_patch_size=1,
         spatial_merge_size=2,
         patch_size=14,
@@ -109,6 +111,8 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         self.video_image_min_num_tokens = video_image_min_num_tokens
         self.video_audio_chunk_min_second = video_audio_chunk_min_second
         self.video_audio_chunk_max_second = video_audio_chunk_max_second
+        self.use_audio_in_video = use_audio_in_video
+        self.use_vision_in_video = use_vision_in_video
 
         self.sampling_rate = 16000
 
