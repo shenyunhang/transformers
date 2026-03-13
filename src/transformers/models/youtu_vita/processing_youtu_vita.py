@@ -22,15 +22,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import torch
 
 from ...feature_extraction_utils import BatchFeature
 from ...image_utils import ImageInput
 from ...processing_utils import ImagesKwargs, ProcessingKwargs, ProcessorMixin, Unpack, VideosKwargs
 from ...tokenization_utils_base import AudioInput, PreTokenizedInput, TextInput
+from ...utils import logging
 from ...video_utils import VideoInput
 from .modeling_youtu_vita import YoutuVITAAudioKwargs
+
+
+logger = logging.get_logger(__name__)
 
 
 class YoutuVITAImagesKwargs(ImagesKwargs, total=False):
@@ -75,6 +78,8 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
         "images_kwargs": {
             "vision_resolution_type": "native",
             "vision_normalize_type": "siglip",
+            "image_min_num_tokens": 4,
+            "image_max_num_tokens": 8192,
         },
         "videos_kwargs": {
             "vision_resolution_type": "native",
@@ -94,7 +99,7 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
             "sampling_rate": 16000,
             "padding": "max_length",
             "return_attention_mask": True,
-            "temporal_merge_size": 1,
+            # "temporal_merge_size": 1,
         },
     }
 
@@ -120,11 +125,11 @@ class YoutuVITAProcessor(ProcessorMixin):
         **kwargs: Unpack[YoutuVITAProcessorKwargs],
     ) -> BatchFeature:
         audios = audio
-        print(f"{text=}")
-        print(f"{images=}")
-        print(f"{videos=}")
-        print(f"{audios=}")
-        print(f"{kwargs=}")
+        logger.debug(f"{text=}")
+        logger.debug(f"{images=}")
+        logger.debug(f"{videos=}")
+        logger.debug(f"{audios=}")
+        logger.debug(f"{kwargs=}")
 
         if text is None:
             raise ValueError("You need to specify either a `text` input to process.")
@@ -134,10 +139,10 @@ class YoutuVITAProcessor(ProcessorMixin):
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
             **kwargs,
         )
-        print(f"{output_kwargs=}")
+        logger.debug(f"{output_kwargs=}")
 
+        output_kwargs["text_kwargs"].pop("return_tensors", None)
         texts_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
-        print(f"{texts_inputs=}")
         input_ids = texts_inputs["input_ids"]
 
         images_inputs = {}
@@ -155,7 +160,7 @@ class YoutuVITAProcessor(ProcessorMixin):
 
             audio_seqlens = [len(x) for x in _audios]
 
-            print(
+            logger.debug(
                 f"{audios=} {len(input_ids)=} {len(_audios)=} {sum(x.abs().sum() for x in _audios)=} {len(audio_indices)=}"
             )
 
@@ -164,7 +169,8 @@ class YoutuVITAProcessor(ProcessorMixin):
             # audio_inputs["audio_feature_lengths"] = audio_seqlens
 
         if images:
-            images = [image for _ in images for image in _]
+            if isinstance(images, (list, tuple)) and all(isinstance(images_i, (list, tuple)) for images_i in images):
+                images = [img for img_list in images for img in img_list]
             input_ids, _images, image_indices, image_grid_thw = (
                 self.image_processor.add_image_input_discrete_or_contiguous(
                     input_ids,
@@ -173,14 +179,15 @@ class YoutuVITAProcessor(ProcessorMixin):
                     **output_kwargs["images_kwargs"],
                 )
             )
-            print(f"{images=} {len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw=}")
+            logger.debug(f"{images=} {len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw=}")
 
             images_inputs["images"] = _images
             images_inputs["image_indices"] = image_indices
             images_inputs["image_grid_thw"] = image_grid_thw
 
         if videos:
-            videos = [video for _ in videos for video in _]
+            if isinstance(videos, (list, tuple)) and all(isinstance(videos_i, (list, tuple)) for videos_i in videos):
+                videos = [vid for vid_list in videos for vid in vid_list]
             (
                 input_ids,
                 _images,
@@ -197,9 +204,9 @@ class YoutuVITAProcessor(ProcessorMixin):
                 **output_kwargs["videos_kwargs"],
             )
             if _images is not None:
-                print(f"{len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw.size()=}")
+                logger.debug(f"{len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw.size()=}")
             if _audios is not None:
-                print(f"{len(input_ids)=} {len(_audios)=} {[x.size() for x in _audios]=} {len(audio_indices)=}")
+                logger.debug(f"{len(input_ids)=} {len(_audios)=} {[x.size() for x in _audios]=} {len(audio_indices)=}")
 
             if _audios is None:
                 audio_seqlens = None

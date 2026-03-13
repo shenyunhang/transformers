@@ -27,15 +27,20 @@ import mimetypes
 import os
 import time
 
-import decord
-import ffmpeg
 import PIL.Image
 import torch
-import torchaudio
 
+from ...utils import is_decord_available, is_torchaudio_available
 from ...video_processing_utils import BaseVideoProcessor
 from .modeling_youtu_vita import Youtu_VITA_TOKEN
 from .processing_youtu_vita import YoutuVITAVideosKwargs
+
+
+if is_decord_available():
+    import decord
+
+if is_torchaudio_available():
+    import torchaudio
 
 
 # _GLOBAL_TOKEN = Qwen3_VITA_TOKEN()
@@ -50,23 +55,6 @@ def get_token():
 def _ensure_var_is_initialized(var, name):
     """Make sure the input variable is not None."""
     assert var is not None, f"{name} is not initialized."
-
-
-def has_audio(video_path):
-    if not isinstance(video_path, str):
-        return False
-
-    if os.path.isdir(video_path):
-        return False
-
-    try:
-        # Probe for audio streams only
-        probe_result = ffmpeg.probe(video_path, select_streams="a")
-        # If 'streams' list is not empty, it indicates an audio stream exists
-        return bool(probe_result["streams"])
-    except ffmpeg.Error as e:
-        print(f"Error probing video: {e.stderr.decode()}", flush=True)
-        return False
 
 
 class YoutuVITAVideoProcessor(BaseVideoProcessor):
@@ -90,6 +78,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         use_vision_in_video=True,
         temporal_patch_size=1,
         spatial_merge_size=2,
+        temporal_merge_size=1,
         patch_size=14,
         video_key_frame=False,
         **kwargs,
@@ -102,7 +91,9 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         self.vision_resolution_type = vision_resolution_type
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
+        self.temporal_merge_size = temporal_merge_size
         self.patch_size = patch_size
+
         self.video_max_num_frames = video_max_num_frames
         self.video_max_fps = video_max_fps
         self.video_max_num_tokens = video_max_num_tokens
@@ -229,8 +220,8 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                 raise NotImplementedError(video_file_or_dir)
 
         audio = None
-        # if has_audio_track(video_file_or_dir):
-        if has_audio(video_file_or_dir):
+        # if has_audio(video_file_or_dir):
+        try:
             audio, sampling_rate = torchaudio.load(video_file_or_dir)
             # print(f"{audio.size()=} {sampling_rate=}")
             if audio.dim() == 2:
@@ -239,6 +230,8 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             if sampling_rate != self.sampling_rate:
                 resampler = torchaudio.transforms.Resample(orig_freq=sampling_rate, new_freq=self.sampling_rate)
                 audio = resampler(audio[None, :])[0, :]
+        except Exception:
+            pass
 
         return img_or_path_list, fps, timestamps, (audio, self.sampling_rate), duration_seconds
 
@@ -328,52 +321,6 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             duration_seconds,
         )
 
-    def process_video_raw(self, video_file_or_dir, video_max_num_frames=8, video_max_fps=1, use_audio_in_video=True):
-        images, fps, timestamps, (audio, sampling_rate) = self.get_image_and_audio(
-            video_file_or_dir,
-            video_max_num_frames=video_max_num_frames,
-            video_max_fps=video_max_fps,
-            use_audio_in_video=use_audio_in_video,
-        )
-
-        image_frames = images
-
-        if audio is not None:
-            total_time = len(audio) / sampling_rate
-
-            # audio_frames = torch.chunk(audio, chunks=len(image_frames), dim=0)
-            full_timestamps = timestamps + [total_time]
-            audio_frames = []
-            for split_idx in range(len(image_frames)):
-                st = full_timestamps[split_idx]
-                ed = full_timestamps[split_idx + 1]
-
-                st = int(st / total_time * len(audio))
-                ed = int(ed / total_time * len(audio))
-
-                audio_frame = audio[st:ed]
-                audio_frames.append(audio_frame)
-
-        else:
-            audio_frames = None
-
-        # grid_t = image_frames.size(1) // self.temporal_patch_size
-        grid_t = 1 // self.temporal_patch_size
-        grid_h = self.image_processor.tile_image_size // self.patch_size
-        grid_w = self.image_processor.tile_image_size // self.patch_size
-
-        video_grid_thw = [[grid_t, grid_h, grid_w]]
-        video_grid_thw = video_grid_thw * len(image_frames)
-
-        if fps is not None:
-            second_per_grids = [1.0 / fps] * len(image_frames)
-        else:
-            second_per_grids = None
-
-        # print(f"{len(image_frames)=} {video_grid_thw=} {video_max_fps=} {video_max_num_frames=} {fps=} {second_per_grids=} ")
-
-        return image_frames, audio_frames, video_grid_thw, second_per_grids, timestamps
-
     def add_video_input_discrete_or_contiguous(
         self,
         input_ids,
@@ -394,49 +341,21 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
         GLOBAL_TOKEN = get_token()
 
-        IMG_CONTEXT_ID = tokenizer(GLOBAL_TOKEN.IMG_CONTEXT_TOKEN, add_special_tokens=False).input_ids
-        IMG_START_ID = tokenizer(GLOBAL_TOKEN.IMG_START_TOKEN, add_special_tokens=False).input_ids
-        IMG_END_ID = tokenizer(GLOBAL_TOKEN.IMG_END_TOKEN, add_special_tokens=False).input_ids
+        IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_CONTEXT_TOKEN)
+        IMG_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_START_TOKEN)
+        IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_END_TOKEN)
 
-        AUD_CONTEXT_ID = tokenizer(GLOBAL_TOKEN.AUD_CONTEXT_TOKEN, add_special_tokens=False).input_ids
-        AUD_START_ID = tokenizer(GLOBAL_TOKEN.AUD_START_TOKEN, add_special_tokens=False).input_ids
-        AUD_END_ID = tokenizer(GLOBAL_TOKEN.AUD_END_TOKEN, add_special_tokens=False).input_ids
+        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_CONTEXT_TOKEN)
+        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_START_TOKEN)
+        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_END_TOKEN)
 
-        VID_CONTEXT_ID = tokenizer(GLOBAL_TOKEN.VID_CONTEXT_TOKEN, add_special_tokens=False).input_ids
-        VID_START_ID = tokenizer(GLOBAL_TOKEN.VID_START_TOKEN, add_special_tokens=False).input_ids
-        VID_END_ID = tokenizer(GLOBAL_TOKEN.VID_END_TOKEN, add_special_tokens=False).input_ids
+        VID_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_CONTEXT_TOKEN)
+        VID_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_START_TOKEN)
+        VID_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_END_TOKEN)
 
-        IMG_TAG_ID = tokenizer(GLOBAL_TOKEN.IMG_TAG_TOKEN, add_special_tokens=False).input_ids
-        AUD_TAG_ID = tokenizer(GLOBAL_TOKEN.AUD_TAG_TOKEN, add_special_tokens=False).input_ids
-        VID_TAG_ID = tokenizer(GLOBAL_TOKEN.VID_TAG_TOKEN, add_special_tokens=False).input_ids
-
-        assert len(IMG_CONTEXT_ID) == 1
-        assert len(IMG_START_ID) == 1
-        assert len(IMG_END_ID) == 1
-
-        assert len(AUD_CONTEXT_ID) == 1
-        assert len(AUD_START_ID) == 1
-        assert len(AUD_END_ID) == 1
-
-        assert len(VID_CONTEXT_ID) == 1
-        assert len(VID_START_ID) == 1
-        assert len(VID_END_ID) == 1
-
-        IMG_CONTEXT_ID = IMG_CONTEXT_ID[0]
-        IMG_START_ID = IMG_START_ID[0]
-        IMG_END_ID = IMG_END_ID[0]
-
-        AUD_CONTEXT_ID = AUD_CONTEXT_ID[0]
-        AUD_START_ID = AUD_START_ID[0]
-        AUD_END_ID = AUD_END_ID[0]
-
-        VID_CONTEXT_ID = VID_CONTEXT_ID[0]
-        VID_START_ID = VID_START_ID[0]
-        VID_END_ID = VID_END_ID[0]
-
-        IMG_TAG_ID = IMG_TAG_ID[0]
-        AUD_TAG_ID = AUD_TAG_ID[0]
-        VID_TAG_ID = VID_TAG_ID[0]
+        IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_TAG_TOKEN)
+        AUD_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_TAG_TOKEN)
+        VID_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_TAG_TOKEN)
 
         nl_tokens = tokenizer("\n", add_special_tokens=False).input_ids
 
@@ -728,9 +647,9 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             else:
                                 new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
 
-                        # audio_token_length = audio_chunk_frame.size(0)
-                        # audio_token_length = audio_token_length_func(audio_chunk_frame.size(0))
-                        audio_token_length = audio_token_length_func(audio_chunk_frame)
+                        audio_token_length = -(
+                            -audio_token_length_func(len(audio_chunk_frame)) // self.temporal_merge_size
+                        )
                         audio_indice_b = torch.zeros(
                             1, audio_token_length, dtype=torch.int64
                         )  # This will change in collate_fn
@@ -803,7 +722,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
             image_indices = image_indices.contiguous().to(torch.cuda.current_device())
             if True:
-                images = torch.tensor(images, dtype=torch.bfloat16).contiguous().to(torch.cuda.current_device())
+                images = torch.tensor(images, dtype=torch.float32).contiguous().to(torch.cuda.current_device())
 
             else:
                 images = torch.tensor(images, dtype=torch.float16).contiguous().to(torch.cuda.current_device())

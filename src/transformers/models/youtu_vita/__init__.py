@@ -19,7 +19,11 @@ from ...utils.import_utils import define_import_structure
 
 if TYPE_CHECKING:
     from .configuration_youtu_vita import *
+    from .feature_extraction_youtu_vita import *
+    from .image_processing_youtu_vita import *
     from .modeling_youtu_vita import *
+    from .processing_youtu_vita import *
+    from .video_processing_youtu_vita import *
 else:
     import sys
 

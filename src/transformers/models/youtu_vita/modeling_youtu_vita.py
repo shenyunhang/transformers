@@ -22,7 +22,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, fields
@@ -30,20 +29,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-
-# if is_flash_attn_2_available():
-#     try:
-#         from aiter import flash_attn_varlen_func
-#         is_aiter_available = True
-#     except ImportError:
-#         from flash_attn import flash_attn_varlen_func
-# else:
-#     flash_attn_varlen_func = None
-from flash_attn import flash_attn_varlen_func
-from flash_attn.layers.rotary import apply_rotary_emb
 from torch import nn
-
-from transformers.trainer_pt_utils import LabelSmoother
 
 from ... import initialization as init
 from ...activations import ACT2FN
@@ -62,12 +48,133 @@ from ...modeling_outputs import (
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import AudioKwargs, Unpack
-from ...utils import TransformersKwargs, auto_docstring, logging
+from ...trainer_pt_utils import LabelSmoother
+from ...utils import TransformersKwargs, auto_docstring, is_flash_attn_2_available, logging
 from ...utils.generic import check_model_inputs, is_flash_attention_requested, maybe_autocast
 from .configuration_youtu_vita import YoutuVITAAudioConfig, YoutuVITAConfig, YoutuVITATextConfig, YoutuVITAVisionConfig
 
 
+if is_flash_attn_2_available():
+    from flash_attn import flash_attn_varlen_func
+    from flash_attn.layers.rotary import apply_rotary_emb
+
 logger = logging.get_logger(__name__)
+
+
+def _get_feat_extract_output_lengths(input_lengths):
+    """
+    Computes the output length of the convolutional layers and the output length of the audio encoder
+    """
+
+    input_lengths_leave = input_lengths % 100
+    feat_lengths = (input_lengths_leave - 1) // 2 + 1
+    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
+    return output_lengths
+
+
+class YoutuVITACNNAudioEmbeddings(nn.Module):
+    def __init__(self, config: YoutuVITAAudioConfig):
+        super().__init__()
+
+        self.config = config
+
+        self.n_window = config.n_window
+        self.n_window_infer = self.config.n_window_infer
+        self.conv_chunksize = self.config.conv_chunksize
+
+        self.conv2d1 = nn.Conv2d(1, config.downsample_hidden_size, 3, 2, padding=1)
+        self.conv2d2 = nn.Conv2d(config.downsample_hidden_size, config.downsample_hidden_size, 3, 2, padding=1)
+        self.conv2d3 = nn.Conv2d(config.downsample_hidden_size, config.downsample_hidden_size, 3, 2, padding=1)
+
+    def forward(
+        self,
+        input_features,
+        feature_lens=None,
+    ):
+        input_features = input_features.to(self.conv2d1.weight.device)
+        input_features = input_features.to(self.conv2d1.weight.dtype)
+
+        aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
+        chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+
+        chunk_lengths = torch.tensor(
+            [self.n_window * 2] * chunk_num.sum(),
+            dtype=torch.long,
+            device=feature_lens.device,
+        )
+        tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
+        chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
+        chunk_lengths[chunk_lengths == 0] = self.n_window * 2
+
+        chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
+        padded_feature = torch.nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
+        feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
+        padded_mask_after_cnn = torch.nn.utils.rnn.pad_sequence(
+            [torch.ones(length, dtype=torch.bool, device=padded_feature.device) for length in feature_lens_after_cnn],
+            batch_first=True,
+        )
+        padded_feature = padded_feature.unsqueeze(1)
+        # Split to chunk to avoid OOM during convolution
+        padded_embeds = []
+        for chunk in padded_feature.split(self.conv_chunksize, dim=0):
+            padded_embed = F.gelu(self.conv2d1(chunk))
+            padded_embed = F.gelu(self.conv2d2(padded_embed))
+            padded_embed = F.gelu(self.conv2d3(padded_embed))
+            padded_embeds.append(padded_embed)
+        padded_embed = torch.cat(padded_embeds, dim=0)
+        b, c, f, t = padded_embed.size()
+        padded_embed = padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f)
+
+        hidden_states = padded_embed[padded_mask_after_cnn]
+
+        return hidden_states, aftercnn_lens
+
+
+class YoutuVITACNNAudioEncoderLayer(nn.Module):
+    def __init__(self, config: YoutuVITAAudioConfig):
+        super().__init__()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor | None, tuple[torch.FloatTensor] | None]:
+        return hidden_states
+
+
+class YoutuVITACNNAudioEncoder(nn.Module):
+    def __init__(self, config: YoutuVITAAudioConfig):
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList([YoutuVITACNNAudioEncoderLayer(config) for idx in range(config.num_hidden_layers)])
+        self.gradient_checkpointing = True
+
+    def forward(self, x):
+        for idx, encoder_layer in enumerate(self.layers):
+            x = encoder_layer(x)
+        return x
+
+
+class YoutuVITACNNAudio(nn.Module):
+    def __init__(self, config: YoutuVITAAudioConfig):
+        super().__init__()
+        self.config = config
+
+        self.embeddings = YoutuVITACNNAudioEmbeddings(config)
+        self.encoder = YoutuVITACNNAudioEncoder(config)
+
+    def forward(self, audios):
+        audio_lengths = torch.as_tensor([len(x) for x in audios])
+        # audios = torch.nn.utils.rnn.pad_sequence(audios, batch_first=True, padding_value=0.0)
+        audios = torch.cat(audios, dim=0).transpose(1, 0)
+
+        features, feature_lengths = self.embeddings(audios, audio_lengths)
+
+        features = self.encoder(features)
+
+        features = features.split(feature_lengths.tolist(), dim=0)
+        features = torch.nn.utils.rnn.pad_sequence(features, batch_first=True, padding_value=0.0)
+
+        return features, feature_lengths
 
 
 class YoutuVITAAudioSinusoidalPositionEncoder(torch.nn.Module):
@@ -354,6 +461,12 @@ class YoutuVITAAudioEncoderLayerSANM(nn.Module):
             torch.Tensor: Mask tensor (#batch, time).
 
         """
+
+        param_dtype = next(self.parameters()).dtype
+        param_device = next(self.parameters()).device
+        x = x.to(device=param_device, dtype=param_dtype)
+        mask = mask.to(device=param_device, dtype=param_dtype)
+
         skip_layer = False
         # with stochastic depth, residual connection `x + f(x)` becomes
         # `x <- x + 1 / (1 - p) * f(x)` at training time.
@@ -573,10 +686,7 @@ class YoutuVITAAudioEncoder(nn.Module):
         ilens: torch.Tensor,
     ):
         """Embed positions in tensor."""
-        masks = sequence_mask(ilens, dtype=torch.bfloat16, device=ilens.device)[:, None, :]
-        # print(f"{masks=}")
-        # print(f"{ilens=}")
-        # print(f"{(masks>0.5).squeeze(1).sum(1).int()=}")
+        masks = sequence_mask(ilens, dtype=torch.float32, device=ilens.device)[:, None, :]
 
         xs_pad *= self.output_size() ** 0.5
 
@@ -605,7 +715,7 @@ class YoutuVITAAudioEncoder(nn.Module):
         return xs_pad, olens
 
 
-class YoutuVITAAudioSmall(nn.Module):
+class YoutuVITASANMAudio(nn.Module):
     """ """
 
     def __init__(
@@ -617,7 +727,7 @@ class YoutuVITAAudioSmall(nn.Module):
 
         encoder = YoutuVITAAudioEncoder(
             input_size=config.input_size,
-            output_size=config.output_size,
+            output_size=config.hidden_size,
             attention_heads=config.attention_heads,
             linear_units=config.linear_units,
             num_blocks=config.num_blocks,
@@ -644,26 +754,26 @@ class YoutuVITAAudioSmall(nn.Module):
 
     def forward(
         self,
-        data_in,
-        data_lengths=None,
+        audios,
         key: list = ["wav_file_tmp_name"],
-        # **kwargs,
         language="auto",
         use_itn=False,
         output_timestamp=False,
         textnorm=None,
     ):
+        speech = torch.nn.utils.rnn.pad_sequence(audios, batch_first=True, padding_value=0.0)
+        speech_lengths = torch.as_tensor([len(x) for x in audios])
+
         # fbank
-        speech, speech_lengths = data_in, data_lengths
         if len(speech.shape) < 3:
             speech = speech[None, :, :]
         if speech_lengths is None:
             speech_lengths = speech.shape[1]
 
-        # speech = speech.to(device=kwargs["device"])
-        # speech_lengths = speech_lengths.to(device=kwargs["device"])
-        speech = speech.to(device=self.embed.weight.data.device, dtype=self.embed.weight.data.dtype)
-        speech_lengths = speech_lengths.to(device=self.embed.weight.data.device, dtype=torch.int64)
+        param_dtype = self.embed.weight.data.dtype
+        param_device = self.embed.weight.data.device
+        speech = speech.to(device=param_device, dtype=param_dtype)
+        speech_lengths = speech_lengths.to(device=param_device, dtype=torch.int64)
 
         # language = kwargs.get("language", "auto")
         language_query = self.embed(
@@ -692,19 +802,45 @@ class YoutuVITAAudioSmall(nn.Module):
         if isinstance(encoder_out, tuple):
             encoder_out = encoder_out[0]
 
+        encoder_out = encoder_out[:, 4:, :]
+        encoder_out_lens = encoder_out_lens - 4
+        assert encoder_out.shape[0] == len(audios)
+
         return encoder_out, encoder_out_lens
+
+
+def pad_and_reshape(A, M):
+    B, S, D = A.shape
+
+    # 1. Calculate required padding for the S dimension
+    pad_size = (M - (S % M)) % M
+
+    # 2. Pad (0, 0) for D, and (0, pad_size) for S
+    # F.pad expects padding for dimensions in reverse order:
+    # (last_dim_front, last_dim_back, second_to_last_front, second_to_last_back, ...)
+    if pad_size > 0:
+        A = torch.nn.functional.pad(A, (0, 0, 0, pad_size))
+
+    # Updated sequence length
+    new_S = S + pad_size
+
+    # 3. Reshape to (B, S // M, D * M)
+    return A.view(B, new_S // M, M, D).flatten(2)
 
 
 class YoutuVITAAudioPatchMerger(nn.Module):
     def __init__(self, config: YoutuVITAAudioConfig) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        self.config = config
+        self.hidden_size = config.hidden_size * (config.temporal_merge_size**1)
         self.norm = nn.RMSNorm(self.hidden_size)
-        self.linear_fc1 = nn.Linear(self.hidden_size, config.out_hidden_size, bias=False)
+        self.linear_fc1 = nn.Linear(self.hidden_size, config.merger_hidden_size, bias=False)
         self.act_fn = nn.GELU()
-        self.linear_fc2 = nn.Linear(config.out_hidden_size, config.out_hidden_size, bias=False)
+        self.linear_fc2 = nn.Linear(config.merger_hidden_size, config.out_hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.config.temporal_merge_size > 1:
+            x = pad_and_reshape(x, self.config.temporal_merge_size)
         x = self.norm(x.reshape(x.shape[0], -1, x.shape[-1]))
         x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
         return x
@@ -713,11 +849,12 @@ class YoutuVITAAudioPatchMerger(nn.Module):
 class YoutuVITAVisionPatchMerger(nn.Module):
     def __init__(self, config: YoutuVITAVisionConfig) -> None:
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         self.norm = nn.RMSNorm(self.hidden_size)
-        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.linear_fc1 = nn.Linear(self.hidden_size, config.merger_hidden_size, bias=False)
         self.act_fn = nn.GELU()
-        self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size, bias=False)
+        self.linear_fc2 = nn.Linear(config.merger_hidden_size, config.out_hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.norm(x.reshape(-1, self.hidden_size))
@@ -1147,41 +1284,20 @@ class YoutuVITAAudioModel(YoutuVITAAudioPreTrainedModel):
     ):
         super().__init__(config, *inputs, **kwargs)
 
-        self.model = YoutuVITAAudioSmall(config)
-
+        if config.num_blocks == 0 and config.tp_blocks == 0:
+            self.model = YoutuVITACNNAudio(config)
+        else:
+            self.model = YoutuVITASANMAudio(config)
         self.merger = YoutuVITAAudioPatchMerger(config)
 
     def forward(
         self,
         audios,
-        # **kwargs,
     ):
-        feats_pad = torch.nn.utils.rnn.pad_sequence(audios, batch_first=True, padding_value=0.0)
-        # feats_lens = torch.as_tensor([len(x) + 4 for x in audios])
-        feats_lens = torch.as_tensor([len(x) for x in audios])
-
-        # feats_pad = feats_pad.to(torch.bfloat16)
-
-        encoder_out, encoder_out_lens = self.model(
-            feats_pad,
-            data_lengths=feats_lens,
-            language="auto",  # "zh", "en", "yue", "ja", "ko", "nospeech"
-            use_itn=False,
-            # ban_emo_unk=False,
-            # **self.kwargs,
-        )
-
-        # encoder_out: bs seq hid
-        # print(f"{encoder_out.size()=}")
-        # print(f"{encoder_out_lens=}")
-        encoder_out = encoder_out[:, 4:, :]
-        encoder_out_lens = encoder_out_lens - 4
-        # print(f"{encoder_out.size()=}")
-        # print(f"{encoder_out_lens=}")
-
-        assert encoder_out.shape[0] == len(audios)
-
+        encoder_out, encoder_out_lens = self.model(audios)
         encoder_out = self.merger(encoder_out)
+
+        encoder_out_lens = -(-encoder_out_lens // self.config.temporal_merge_size)
 
         return encoder_out, encoder_out_lens
 
@@ -2055,7 +2171,9 @@ class YoutuVITAForCausalLM(YoutuVITAPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss = self.loss_function(
+                logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
+            )
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -2126,7 +2244,6 @@ class DEFAULT_TOKEN:
     def __init__(self):
         for field in fields(self):
             logger.info(f"♾️ {field.name} {getattr(self, field.name)}")
-            print(f"♾️ {field.name} {getattr(self, field.name)}")
 
 
 class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
@@ -2179,7 +2296,6 @@ class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
 
     def __init__(self):
         logger.info(f"♾️ {self.__class__.__name__=}")
-        print(f"♾️ {self.__class__.__name__=}")
         super().__init__()
 
         for i in range(2048):
@@ -2270,7 +2386,6 @@ class Qwen3_VITA_TOKEN(DEFAULT_TOKEN):
 
     def __init__(self):
         logger.info(f"♾️ {self.__class__.__name__=}")
-        print(f"♾️ {self.__class__.__name__=}")
         super().__init__()
 
     def get_special_tokens(self):
@@ -2311,7 +2426,7 @@ class YoutuVITAAudioKwargs(AudioKwargs, total=False):
     discrete_audio_idxs: list
     contiguous_audio_idxs: list
 
-    temporal_merge_size: int
+    # temporal_merge_size: int
 
     # audio_tokenizer_type: str
     # audio_tokenizer_path: str

@@ -16,61 +16,61 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""PyTorch Youtu-VITA model."""
 
-import torch
-from torch import nn
+import mimetypes
+import os
+import time
+import uuid
 from typing import Any, Callable, Optional, Tuple, Union
+
 import numpy as np
 import PIL.Image
-import decord
-import os
-import mimetypes
-import ffmpeg
-import time
+import torch
+from torch import nn
 
 from ... import initialization as init
-from ...modeling_utils import PreTrainedModel
-from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, BaseModelOutputWithPooling
-from ...generation import GenerationMixin
-from ...processing_utils import ProcessorMixin, Unpack
-from ...image_processing_utils import BaseImageProcessor
-from ...video_processing_utils import BaseVideoProcessor
-from ...feature_extraction_sequence_utils import SequenceFeatureExtractor
 from ...configuration_utils import PreTrainedConfig
-from ...utils import logging
-from ..youtu.configuration_youtu import YoutuConfig
+from ...feature_extraction_sequence_utils import SequenceFeatureExtractor
+from ...feature_extraction_utils import BatchFeature
+from ...generation import GenerationMixin
+from ...image_processing_utils import BaseImageProcessor
+from ...image_utils import ImageInput
+from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPast, BaseModelOutputWithPooling
+from ...modeling_utils import PreTrainedModel
+from ...models.whisper.feature_extraction_whisper import WhisperFeatureExtractor
+from ...processing_utils import ProcessingKwargs, ProcessorMixin, Unpack, VideosKwargs, AudioKwargs, ImagesKwargs
+from ...tokenization_utils_base import AudioInput, PreTokenizedInput, TextInput
+from ...utils import is_decord_available, is_flash_attn_2_available, is_torchaudio_available, logging
+from ...video_processing_utils import BaseVideoProcessor
+from ...video_utils import VideoInput
 from ..siglip2.configuration_siglip2 import Siglip2VisionConfig
-# from ..siglip2.modeling_siglip2 import Siglip2VisionModel, Siglip2VisionTransformer
+from ..youtu.configuration_youtu import YoutuConfig
 from ..youtu.modeling_youtu import (
     YoutuAttention,
-    YoutuMLP,
     YoutuDecoderLayer,
-    YoutuForCausalLM,
+    YoutuMLP,
     YoutuModel,
     YoutuPreTrainedModel,
     YoutuRMSNorm,
     YoutuRotaryEmbedding,
 )
-from ...feature_extraction_utils import BatchFeature
-from ...image_utils import ImageInput
-from ...processing_utils import ProcessingKwargs, ProcessorMixin, Unpack, VideosKwargs, AudioKwargs, ImagesKwargs
-from ...tokenization_utils_base import AudioInput, PreTokenizedInput, TextInput
-from ...utils import is_flash_attn_2_available
-from ...video_utils import VideoInput
+
+if is_flash_attn_2_available():
+    from flash_attn import flash_attn_varlen_func
+    from flash_attn.layers.rotary import apply_rotary_emb
+
+if is_decord_available():
+    import decord
+
+if is_torchaudio_available():
+    import torchaudio
+
+import ffmpeg
+from funasr.frontends.wav_frontend import WavFrontend
+from funasr.utils.load_utils import extract_fbank
 
 is_aiter_available = False
-
-# if is_flash_attn_2_available():
-#     try:
-#         from aiter import flash_attn_varlen_func
-#         is_aiter_available = True
-#     except ImportError:
-#         from flash_attn import flash_attn_varlen_func
-# else:
-#     flash_attn_varlen_func = None
-from flash_attn import flash_attn_varlen_func
-from flash_attn.layers.rotary import apply_rotary_emb
-
 
 logger = logging.get_logger(__name__)
 
@@ -85,7 +85,7 @@ class YoutuVITAAudioConfig(PreTrainedConfig):
 
     def __init__(
         self,
-        output_size=512,
+        hidden_size=512,
         attention_heads=4,
         linear_units=2048,
         num_blocks=50,
@@ -97,14 +97,21 @@ class YoutuVITAAudioConfig(PreTrainedConfig):
         kernel_size=11,
         sanm_shfit=0,
         input_size=560,
-        # vocab_size=25055,
-        spatial_merge_size=1,
+        temporal_merge_size=1,
         out_hidden_size=4608,
+        merger_hidden_size=4608,
+        # CNN
+        num_mel_bins=128,
+        downsample_hidden_size=512,
+        n_window=50,
+        n_window_infer=800,
+        conv_chunksize=500,
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        # SANM
         self.input_size = input_size
-        self.output_size = output_size
         self.attention_heads = attention_heads
         self.linear_units = linear_units
         self.num_blocks = num_blocks
@@ -116,9 +123,18 @@ class YoutuVITAAudioConfig(PreTrainedConfig):
         self.kernel_size = kernel_size
         self.sanm_shfit = sanm_shfit
 
-        self.hidden_size = output_size
-        self.spatial_merge_size = spatial_merge_size
+        self.hidden_size = hidden_size
+        self.temporal_merge_size = temporal_merge_size
         self.out_hidden_size = out_hidden_size
+        self.merger_hidden_size = merger_hidden_size
+
+        # CNN
+        self.downsample_hidden_size = downsample_hidden_size
+        self.num_mel_bins = num_mel_bins
+        self.n_window = n_window
+        self.n_window_infer = n_window_infer
+        self.conv_chunksize = conv_chunksize
+        self.num_hidden_layers = 0
 
 
 class YoutuVITAVisionConfig(PreTrainedConfig):
@@ -142,6 +158,7 @@ class YoutuVITAVisionConfig(PreTrainedConfig):
         attention_dropout=0.0,
         spatial_merge_size=2,
         out_hidden_size=4608,
+        merger_hidden_size=4608,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -158,6 +175,7 @@ class YoutuVITAVisionConfig(PreTrainedConfig):
         self.num_patches = num_patches
         self.spatial_merge_size = spatial_merge_size
         self.out_hidden_size = out_hidden_size
+        self.merger_hidden_size = merger_hidden_size
 
 
 class YoutuVITATextConfig(YoutuConfig):
@@ -183,10 +201,13 @@ class YoutuVITAConfig(PreTrainedConfig):
         audio_config=None,
         text_config=None,
         vision_config=None,
-        image_token_id=151655,
-        video_token_id=151656,
-        vision_start_token_id=151652,
-        vision_end_token_id=151653,
+        # image_token_id=133375,
+        # video_token_id=133379,
+        # audio_token_id=133383,
+        # image_pad_token_id=133376,
+        # audio_pad_token_id=133384,
+        # vision_start_token_id=133377,
+        # vision_end_token_id=133378,
         tie_word_embeddings=False,
         **kwargs,
     ):
@@ -205,12 +226,168 @@ class YoutuVITAConfig(PreTrainedConfig):
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
 
-        self.image_token_id = image_token_id
-        self.video_token_id = video_token_id
-        self.vision_start_token_id = vision_start_token_id
-        self.vision_end_token_id = vision_end_token_id
+        # self.image_token_id = image_token_id
+        # self.video_token_id = video_token_id
+        # self.audio_token_id = audio_token_id
+        # self.image_pad_token_id = image_pad_token_id
+        # self.audio_pad_token_id = audio_pad_token_id
+        # self.vision_start_token_id = vision_start_token_id
+        # self.vision_end_token_id = vision_end_token_id
+
         self.tie_word_embeddings = tie_word_embeddings
         super().__init__(**kwargs)
+
+
+
+
+def _get_feat_extract_output_lengths(input_lengths):
+    """
+    Computes the output length of the convolutional layers and the output length of the audio encoder
+    """
+
+    input_lengths_leave = input_lengths % 100
+    feat_lengths = (input_lengths_leave - 1) // 2 + 1
+    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
+    return output_lengths
+
+
+class YoutuVITACNNAudioEmbeddings(nn.Module):
+    def __init__(self, config: YoutuVITAAudioConfig):
+        super().__init__()
+
+        self.config = config
+
+        self.n_window = config.n_window
+        self.n_window_infer = self.config.n_window_infer
+        self.conv_chunksize = self.config.conv_chunksize
+
+        self.conv2d1 = nn.Conv2d(1, config.downsample_hidden_size, 3, 2, padding=1)
+        self.conv2d2 = nn.Conv2d(config.downsample_hidden_size, config.downsample_hidden_size, 3, 2, padding=1)
+        self.conv2d3 = nn.Conv2d(config.downsample_hidden_size, config.downsample_hidden_size, 3, 2, padding=1)
+
+    def forward(
+        self,
+        input_features,
+        feature_lens=None,
+    ):
+        input_features = input_features.to(self.conv2d1.weight.device)
+        input_features = input_features.to(self.conv2d1.weight.dtype)
+
+        aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
+        chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+
+        chunk_lengths = torch.tensor(
+            [self.n_window * 2] * chunk_num.sum(),
+            dtype=torch.long,
+            device=feature_lens.device,
+        )
+        tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
+        chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
+        chunk_lengths[chunk_lengths == 0] = self.n_window * 2
+
+        chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
+        padded_feature = torch.nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
+        feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
+        padded_mask_after_cnn = torch.nn.utils.rnn.pad_sequence(
+            [torch.ones(length, dtype=torch.bool, device=padded_feature.device) for length in feature_lens_after_cnn],
+            batch_first=True,
+        )
+        padded_feature = padded_feature.unsqueeze(1)
+        # Split to chunk to avoid OOM during convolution
+        padded_embeds = []
+        for chunk in padded_feature.split(self.conv_chunksize, dim=0):
+            padded_embed = F.gelu(self.conv2d1(chunk))
+            padded_embed = F.gelu(self.conv2d2(padded_embed))
+            padded_embed = F.gelu(self.conv2d3(padded_embed))
+            padded_embeds.append(padded_embed)
+        padded_embed = torch.cat(padded_embeds, dim=0)
+        b, c, f, t = padded_embed.size()
+        padded_embed = padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f)
+
+        hidden_states = padded_embed[padded_mask_after_cnn]
+
+        return hidden_states, aftercnn_lens
+
+
+class YoutuVITACNNAudioEncoderLayer(nn.Module):
+
+    def __init__(self, config: YoutuVITAAudioConfig):
+        super().__init__()
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+    ) -> Tuple[torch.FloatTensor, Optional[torch.FloatTensor], Optional[Tuple[torch.FloatTensor]]]:
+        return hidden_states
+
+
+class YoutuVITACNNAudioEncoder(nn.Module):
+
+    def __init__(self, config: YoutuVITAAudioConfig):
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList([
+            YoutuVITACNNAudioEncoderLayer(config) for idx in range(config.num_hidden_layers)])
+        self.gradient_checkpointing = True
+
+    def forward(self, x):
+
+        for idx, encoder_layer in enumerate(self.layers):
+            x = encoder_layer(x)
+        return x
+
+
+class YoutuVITACNNAudio(nn.Module):
+
+    def __init__(self, config: YoutuVITAAudioConfig):
+        super().__init__()
+        self.config = config
+
+        self.embeddings = YoutuVITACNNAudioEmbeddings(config)
+        self.encoder = YoutuVITACNNAudioEncoder(config)
+
+    def forward(self, audios):
+
+        audio_lengths = torch.as_tensor([len(x) for x in audios])
+        # audios = torch.nn.utils.rnn.pad_sequence(audios, batch_first=True, padding_value=0.0)
+        audios = torch.cat(audios, dim=0).transpose(1, 0)
+
+        features, feature_lengths = self.embeddings(audios, audio_lengths)
+
+        features = self.encoder(features)
+
+        features = features.split(feature_lengths.tolist(), dim=0)
+        features = torch.nn.utils.rnn.pad_sequence(features, batch_first=True, padding_value=0.0)
+
+        return features, feature_lengths
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -532,6 +709,12 @@ class YoutuVITAAudioEncoderLayerSANM(nn.Module):
             torch.Tensor: Mask tensor (#batch, time).
 
         """
+
+        param_dtype = next(self.parameters()).dtype
+        param_device = next(self.parameters()).device
+        x = x.to(device=param_device, dtype=param_dtype)
+        mask = mask.to(device=param_device, dtype=param_dtype)
+
         skip_layer = False
         # with stochastic depth, residual connection `x + f(x)` becomes
         # `x <- x + 1 / (1 - p) * f(x)` at training time.
@@ -740,10 +923,7 @@ class YoutuVITAAudioEncoder(nn.Module):
         ilens: torch.Tensor,
     ):
         """Embed positions in tensor."""
-        masks = sequence_mask(ilens, dtype=torch.bfloat16, device=ilens.device)[:, None, :]
-        # print(f"{masks=}")
-        # print(f"{ilens=}")
-        # print(f"{(masks>0.5).squeeze(1).sum(1).int()=}")
+        masks = sequence_mask(ilens, dtype=torch.float32, device=ilens.device)[:, None, :]
 
         xs_pad *= self.output_size() ** 0.5
 
@@ -772,7 +952,7 @@ class YoutuVITAAudioEncoder(nn.Module):
         return xs_pad, olens
 
 
-class YoutuVITAAudioSmall(nn.Module):
+class YoutuVITASANMAudio(nn.Module):
     """
     """
 
@@ -786,7 +966,7 @@ class YoutuVITAAudioSmall(nn.Module):
 
         encoder = YoutuVITAAudioEncoder(
             input_size=config.input_size,
-            output_size=config.output_size,
+            output_size=config.hidden_size,
             attention_heads=config.attention_heads,
             linear_units=config.linear_units,
             num_blocks=config.num_blocks,
@@ -813,27 +993,27 @@ class YoutuVITAAudioSmall(nn.Module):
         
     def forward(
         self,
-        data_in,
-        data_lengths=None,
+        audios,
         key: list = ["wav_file_tmp_name"],
-        # **kwargs,
         language = "auto",
         use_itn = False,
         output_timestamp = False,
         textnorm = None,
     ):
 
+        speech = torch.nn.utils.rnn.pad_sequence(audios, batch_first=True, padding_value=0.0)
+        speech_lengths = torch.as_tensor([len(x) for x in audios])
+
         # fbank
-        speech, speech_lengths = data_in, data_lengths
         if len(speech.shape) < 3:
             speech = speech[None, :, :]
         if speech_lengths is None:
             speech_lengths = speech.shape[1]
 
-        # speech = speech.to(device=kwargs["device"])
-        # speech_lengths = speech_lengths.to(device=kwargs["device"])
-        speech = speech.to(device=self.embed.weight.data.device, dtype=self.embed.weight.data.dtype)
-        speech_lengths = speech_lengths.to(device=self.embed.weight.data.device, dtype=torch.int64)
+        param_dtype = self.embed.weight.data.dtype
+        param_device = self.embed.weight.data.device
+        speech = speech.to(device=param_device, dtype=param_dtype)
+        speech_lengths = speech_lengths.to(device=param_device, dtype=torch.int64)
 
         # language = kwargs.get("language", "auto")
         language_query = self.embed(
@@ -866,31 +1046,59 @@ class YoutuVITAAudioSmall(nn.Module):
         if isinstance(encoder_out, tuple):
             encoder_out = encoder_out[0]
 
+        encoder_out = encoder_out[:, 4:, :]
+        encoder_out_lens = encoder_out_lens - 4
+        assert encoder_out.shape[0] == len(audios)
+
         return encoder_out, encoder_out_lens
+
+
+def pad_and_reshape(A, M):
+    B, S, D = A.shape
+
+    # 1. Calculate required padding for the S dimension
+    pad_size = (M - (S % M)) % M
+
+    # 2. Pad (0, 0) for D, and (0, pad_size) for S
+    # F.pad expects padding for dimensions in reverse order:
+    # (last_dim_front, last_dim_back, second_to_last_front, second_to_last_back, ...)
+    if pad_size > 0:
+        A = torch.nn.functional.pad(A, (0, 0, 0, pad_size))
+
+    # Updated sequence length
+    new_S = S + pad_size
+
+    # 3. Reshape to (B, S // M, D * M)
+    return A.view(B, new_S // M, M, D).flatten(2)
 
 
 class YoutuVITAAudioPatchMerger(nn.Module):
     def __init__(self, config: YoutuVITAAudioConfig) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        self.config = config
+        self.hidden_size = config.hidden_size * (config.temporal_merge_size**1)
         self.norm = nn.RMSNorm(self.hidden_size)
-        self.linear_fc1 = nn.Linear(self.hidden_size, config.out_hidden_size, bias=False)
+        self.linear_fc1 = nn.Linear(self.hidden_size, config.merger_hidden_size, bias=False)
         self.act_fn = nn.GELU()
-        self.linear_fc2 = nn.Linear(config.out_hidden_size, config.out_hidden_size, bias=False)
+        self.linear_fc2 = nn.Linear(config.merger_hidden_size, config.out_hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.config.temporal_merge_size > 1:
+            x = pad_and_reshape(x, self.config.temporal_merge_size)
         x = self.norm(x.reshape(x.shape[0], -1, x.shape[-1]))
         x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
         return x
 
+
 class YoutuVITAVisionPatchMerger(nn.Module):
     def __init__(self, config: YoutuVITAVisionConfig) -> None:
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         self.norm = nn.RMSNorm(self.hidden_size)
-        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.linear_fc1 = nn.Linear(self.hidden_size, config.merger_hidden_size, bias=False)
         self.act_fn = nn.GELU()
-        self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size, bias=False)
+        self.linear_fc2 = nn.Linear(config.merger_hidden_size, config.out_hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.norm(x.reshape(-1, self.hidden_size))
@@ -917,10 +1125,12 @@ class YoutuVITATextAttention(YoutuAttention):
 class YoutuVITATextDecoderLayer(YoutuDecoderLayer):
     pass
 
+
 class YoutuVITAAudioPreTrainedModel(PreTrainedModel):
     _supports_flash_attn_2 = True
     _supports_sdpa = True
     pass
+
 
 class YoutuVITAVisionPreTrainedModel(PreTrainedModel):
     _supports_flash_attn_2 = True
@@ -954,42 +1164,20 @@ class YoutuVITAAudioModel(YoutuVITAAudioPreTrainedModel):
     ):
         super().__init__(config, *inputs, **kwargs)
 
-        self.model = YoutuVITAAudioSmall(config)
-
+        if config.num_blocks == 0 and config.tp_blocks == 0:
+            self.model = YoutuVITACNNAudio(config)
+        else:
+            self.model = YoutuVITASANMAudio(config)
         self.merger = YoutuVITAAudioPatchMerger(config)
     
     def forward(
         self,
         audios,
-        # **kwargs,
     ):
-
-        feats_pad = torch.nn.utils.rnn.pad_sequence(audios, batch_first=True, padding_value=0.0)
-        # feats_lens = torch.as_tensor([len(x) + 4 for x in audios])
-        feats_lens = torch.as_tensor([len(x) for x in audios])
-
-        # feats_pad = feats_pad.to(torch.bfloat16)
-
-        encoder_out, encoder_out_lens = self.model(
-            feats_pad,
-            data_lengths=feats_lens,
-            language="auto", # "zh", "en", "yue", "ja", "ko", "nospeech"
-            use_itn=False,
-            # ban_emo_unk=False,
-            # **self.kwargs,
-        )
-
-        # encoder_out: bs seq hid
-        # print(f"{encoder_out.size()=}")
-        # print(f"{encoder_out_lens=}")
-        encoder_out = encoder_out[:, 4:, :]
-        encoder_out_lens = encoder_out_lens - 4
-        # print(f"{encoder_out.size()=}")
-        # print(f"{encoder_out_lens=}")
-
-        assert encoder_out.shape[0] == len(audios)
-
+        encoder_out, encoder_out_lens = self.model(audios)
         encoder_out = self.merger(encoder_out)
+
+        encoder_out_lens = -(-encoder_out_lens // self.config.temporal_merge_size)
 
         return encoder_out, encoder_out_lens
 
@@ -1767,7 +1955,7 @@ class YoutuVITAForCausalLM(YoutuVITAPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs)
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -1816,8 +2004,9 @@ class YoutuVITAForCausalLM(YoutuVITAPreTrainedModel, GenerationMixin):
         return model_inputs
 
 
-from transformers.trainer_pt_utils import LabelSmoother
 from dataclasses import dataclass, fields
+
+from ...trainer_pt_utils import LabelSmoother
 
 @dataclass
 class DEFAULT_TOKEN:
@@ -1843,7 +2032,6 @@ class DEFAULT_TOKEN:
 
         for field in fields(self):
             logger.info(f"♾️ {field.name} {getattr(self, field.name)}")
-            print(f"♾️ {field.name} {getattr(self, field.name)}")
 
 
 class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
@@ -1897,7 +2085,6 @@ class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
 
     def __init__(self):
         logger.info(f"♾️ {self.__class__.__name__=}")
-        print(f"♾️ {self.__class__.__name__=}")
         super().__init__()
 
         for i in range(2048):
@@ -1986,10 +2173,8 @@ class Qwen3_VITA_TOKEN(DEFAULT_TOKEN):
     BOX_START_TOKEN = "<|begin_of_box|>"
     BOX_END_TOKEN = "<|end_of_box|>"
 
-
     def __init__(self):
         logger.info(f"♾️ {self.__class__.__name__=}")
-        print(f"♾️ {self.__class__.__name__=}")
         super().__init__()
 
     def get_special_tokens(self):
@@ -2038,11 +2223,8 @@ def _ensure_var_is_initialized(var, name):
     assert var is not None, "{} is not initialized.".format(name)
 
 
-import uuid
 
-from ..whisper.feature_extraction_whisper import WhisperFeatureExtractor
 
-import torchaudio
 
 
 def update_tokenizer_for_glm4voice(tokenizer):
@@ -2086,19 +2268,9 @@ class GLM4VoiceTokenizer:
         self.model_name_or_path = model_name_or_path
         self.flow_path = flow_path
 
-        # if rank is None and torch.distributed.is_initialized():
-        #     rank = torch.distributed.get_rank()
-        #     rank = rank % 8
-
-        #     CUDA_VISIBLE_DEVICES = os.environ.get('CUDA_VISIBLE_DEVICES', '0,1,2,3,4,5,6,7,8')
-        #     gpu_list = [int(x) for x in CUDA_VISIBLE_DEVICES.split(',')]
-        #     if rank not in gpu_list:
-        #         rank = None
-
         self.rank = rank
         logger.info(f"{self.rank=}")
 
-    # @torch.compiler.disable
     def load_model(self):
 
         if not hasattr(self, "whisper_model") and self.model_name_or_path:
@@ -2274,9 +2446,6 @@ class GLM4VoiceTokenizer:
 
 
 
-import torchaudio
-from funasr.utils.load_utils import extract_fbank
-from funasr.frontends.wav_frontend import WavFrontend
 
 
 def update_tokenizer_for_wav_frontend(tokenizer):
@@ -2325,8 +2494,11 @@ class WavFrontendTokenizer:
 
         if isinstance(audio_or_path, tuple):
             audio, sampling_rate = audio_or_path
-        else:
+        elif isinstance(audio_or_path, str):
             audio, sampling_rate = torchaudio.load(audio_or_path)
+        else:
+            audio = torch.tensor(audio_or_path)
+            sampling_rate = self.sampling_rate
         # print(f"{audio.size()=} {sampling_rate=}")
         if audio.dim() == 2:
             audio = audio.mean(0)
@@ -2361,7 +2533,111 @@ class WavFrontendTokenizer:
 
         return {
             "audio": speech,
-            "audio_token_length_func": len,
+            "audio_token_length_func": lambda x: x,
+            "duration_seconds": len(audio) / self.sampling_rate,
+        }
+
+    @torch.no_grad()
+    def decode(self, audio_tokens, **kwargs):
+        return None
+
+
+def update_tokenizer_for_melfilterbank(tokenizer):
+    return tokenizer
+
+
+class MelFilterBankTokenizer:
+    def __init__(self, model_name_or_path, rank=None):
+        self.model_name_or_path = model_name_or_path
+
+        self.rank = rank
+        logger.info(f"{self.rank=}")
+
+        self.sampling_rate = 16000
+
+        self.is_discrete = True
+        self.is_contiguous = False
+
+        self._resample_buffer: dict[int, torchaudio.transforms.Resample] = {}
+
+        self.tokenizer_type = "melfilterbank"
+
+    def load_model(self):
+        if hasattr(self, "feature_extractor"):
+            return
+
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            worker_id = worker_info.id
+            # num_workers = worker_info.num_workers
+            self.rank = worker_id % 8
+            logger.info(f"{self.rank=}")
+
+        if self.rank is not None:
+            self.device = f"cuda:{self.rank}"
+            # torch.cuda.set_device(self.rank)
+        else:
+            self.device = "cuda"
+            # self.device = "cpu"
+        self.device = "cpu"
+
+        logger.info(f"{self.device=}")
+
+        assert isinstance(self.model_name_or_path, str)
+
+        logger.info(
+            f"⏳ {self.device=} Loading {self.tokenizer_type} from {self.model_name_or_path}"
+        )
+        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(
+            self.model_name_or_path
+        )
+        logger.info(f"⏳ {self.device=} Loading {self.tokenizer_type} Done")
+
+    @torch.no_grad()
+    def encode(self, audio_or_path, **kwargs):
+        if not hasattr(self, "feature_extractor"):
+            self.load_model()
+
+        if isinstance(audio_or_path, tuple):
+            audio, sampling_rate = audio_or_path
+        else:
+            audio, sampling_rate = torchaudio.load(audio_or_path)
+        # print(f"{audio_or_path=} {audio.size()=} {sampling_rate=}")
+        if audio.dim() == 2:
+            audio = audio.mean(0)
+
+        if sampling_rate != self.sampling_rate:
+            if sampling_rate not in self._resample_buffer:
+                # print(f"torchaudio.transforms.Resample {sampling_rate=} {self.sampling_rate=} {self.device=}", flush=True)
+                self._resample_buffer[sampling_rate] = torchaudio.transforms.Resample(
+                    orig_freq=sampling_rate, new_freq=self.sampling_rate
+                ).to(self.device)
+            audio = audio.to(self.device)
+            self._resample_buffer[sampling_rate].to(self.device)
+            audio = self._resample_buffer[sampling_rate](audio[None, :])[0, :]
+            audio = audio.cpu()
+        # resampler = torchaudio.transforms.Resample(
+        #     orig_freq=sampling_rate, new_freq=self.sampling_rate
+        # )
+        # audio = resampler(audio[None, :])[0, :]
+        # audio = audio.to(self.device)
+
+        # print(f"{audio_or_path=} {audio.size()=} {sampling_rate=}")
+
+        features = self.feature_extractor(
+            audio,
+            sampling_rate=16000,
+            return_attention_mask=True,
+            return_tensors="pt",
+            padding=True,
+            device=self.device,
+        )
+        input_features = features["input_features"]
+        # feature_attention_mask = features["attention_mask"]
+
+        return {
+            "audio": input_features.squeeze(0).permute(1, 0),
+            "audio_token_length_func": _get_feat_extract_output_lengths,
             "duration_seconds": len(audio) / self.sampling_rate,
         }
 
@@ -2584,8 +2860,7 @@ def update_tokenizer(tokenizer, audio_tokenizer_type_list=None, vision_tokenizer
             tokenizer = update_tokenizer_for_xytokenizer(tokenizer)
 
         else:
-            print(f"{audio_tokenizer_type_list=}")
-            raise NotImplementedError
+            raise NotImplementedError(f"Unsupported audio tokenizer types: {audio_tokenizer_type_list}")
 
     for vision_tokenizer_type in vision_tokenizer_type_list:
 
@@ -2609,8 +2884,7 @@ def update_tokenizer(tokenizer, audio_tokenizer_type_list=None, vision_tokenizer
             tokenizer = update_tokenizer_for_emu35(tokenizer)
 
         else:
-            print(f"{vision_tokenizer_type_list=}")
-            raise NotImplementedError
+            raise NotImplementedError(f"Unsupported vision tokenizer types: {vision_tokenizer_type_list}")
 
     logger.info(
         f"🧱 finish update_tokenizer {len(tokenizer)=} {audio_tokenizer_type_list=} {vision_tokenizer_type_list=}"
@@ -2690,8 +2964,7 @@ def get_audio_tokenizer(
             tokenizer_discrete = XYTokenizer(model_name_or_path, rank=rank)
 
         else:
-            print(f"{audio_tokenizer_type_list=}")
-            raise NotImplementedError
+            raise NotImplementedError(f"Unsupported audio tokenizer types: {audio_tokenizer_type_list}")
 
     audio_tokenizer = AudioTokenizer(tokenizer_contiguous, tokenizer_discrete)
 
@@ -2723,8 +2996,7 @@ def get_vision_tokenizer(model_name_or_path_list, vision_tokenizer_type_list, ra
             tokenizer_discrete = Emu35Tokenizer(model_name_or_path, rank=rank)
 
         else:
-            print(f"{vision_tokenizer_type_list=}")
-            raise NotImplementedError
+            raise NotImplementedError(f"Unsupported vision tokenizer types: {vision_tokenizer_type_list}")
 
     vision_tokenizer = VisionTokenizer(tokenizer_contiguous, tokenizer_discrete)
     return vision_tokenizer
@@ -2748,7 +3020,7 @@ class YoutuVITAAudioKwargs(AudioKwargs, total=False):
     discrete_audio_idxs: list
     contiguous_audio_idxs: list
 
-    temporal_merge_size: int
+    # temporal_merge_size: int
 
     # audio_tokenizer_type: str
     # audio_tokenizer_path: str
@@ -2783,6 +3055,8 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
         "images_kwargs": {
             "vision_resolution_type": "native",
             "vision_normalize_type": "siglip",
+            "image_min_num_tokens": 4,
+            "image_max_num_tokens": 8192,
         },
         "videos_kwargs": {
             "vision_resolution_type": "native",
@@ -2802,7 +3076,7 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
             "sampling_rate": 16000,
             "padding": "max_length",
             "return_attention_mask": True,
-            "temporal_merge_size": 1,
+            # "temporal_merge_size": 1,
         },
     }
 
@@ -2920,32 +3194,15 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
     ):
         GLOBAL_TOKEN = get_token()
 
-        AUD_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.AUD_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        AUD_TAG_ID = tokenizer(
-            GLOBAL_TOKEN.AUD_TAG_TOKEN, add_special_tokens=False
-        ).input_ids
-        AUD_START_ID = tokenizer(
-            GLOBAL_TOKEN.AUD_START_TOKEN, add_special_tokens=False
-        ).input_ids
-        AUD_END_ID = tokenizer(
-            GLOBAL_TOKEN.AUD_END_TOKEN, add_special_tokens=False
-        ).input_ids
+        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_CONTEXT_TOKEN)
+        AUD_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_TAG_TOKEN)
+        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_START_TOKEN)
+        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_END_TOKEN)
 
         if self.audio_tokenizer.tokenizer_discrete is not None:
             AUD_FIRST_ID = tokenizer.convert_tokens_to_ids(
                 self.audio_tokenizer.tokenizer_discrete.first_audio_token
             )
-
-        assert len(AUD_CONTEXT_ID) == 1
-        assert len(AUD_START_ID) == 1
-        assert len(AUD_END_ID) == 1
-
-        AUD_CONTEXT_ID = AUD_CONTEXT_ID[0]
-        AUD_TAG_ID = AUD_TAG_ID[0]
-        AUD_START_ID = AUD_START_ID[0]
-        AUD_END_ID = AUD_END_ID[0]
 
         aud_positions = [i for i, x in enumerate(input_ids) if x == AUD_TAG_ID]
         assert len(aud_positions) == len(audio_or_paths), (
@@ -3135,8 +3392,8 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                             for x in additional_targets_list
                         ]
 
-                    audio_token_length = (
-                        audio_token_length_func(audio) // self.temporal_merge_size
+                    audio_token_length = -(
+                        -audio_token_length_func(len(audio)) // self.temporal_merge_size
                     )
                     audio_indice_b = torch.zeros(
                         1, audio_token_length, dtype=torch.int64
@@ -3216,8 +3473,8 @@ def has_audio(video_path):
         probe_result = ffmpeg.probe(video_path, select_streams="a")
         # If 'streams' list is not empty, it indicates an audio stream exists
         return bool(probe_result["streams"])
-    except ffmpeg.Error as e:
-        print(f"Error probing video: {e.stderr.decode()}", flush=True)
+    except Exception as e:
+        logger.error(f"Error probing video: {e}")
         return False
 
 
@@ -3243,6 +3500,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         use_vision_in_video=True,
         temporal_patch_size=1,
         spatial_merge_size=2,
+        temporal_merge_size=1,
         patch_size=14,
         video_key_frame=False,
         **kwargs,
@@ -3255,7 +3513,9 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         self.vision_resolution_type = vision_resolution_type
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
+        self.temporal_merge_size = temporal_merge_size
         self.patch_size = patch_size
+
         self.video_max_num_frames = video_max_num_frames
         self.video_max_fps = video_max_fps
         self.video_max_num_tokens = video_max_num_tokens
@@ -3387,8 +3647,8 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                 raise NotImplementedError(video_file_or_dir)
 
         audio = None
-        # if has_audio_track(video_file_or_dir):
-        if has_audio(video_file_or_dir):
+        # if has_audio(video_file_or_dir):
+        try:
             audio, sampling_rate = torchaudio.load(video_file_or_dir)
             # print(f"{audio.size()=} {sampling_rate=}")
             if audio.dim() == 2:
@@ -3399,6 +3659,8 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                     orig_freq=sampling_rate, new_freq=self.sampling_rate
                 )
                 audio = resampler(audio[None, :])[0, :]
+        except Exception as e:
+            pass
 
         return img_or_path_list, fps, timestamps, (audio, self.sampling_rate), duration_seconds
 
@@ -3503,54 +3765,6 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             duration_seconds,
         )
 
-    def process_video_raw(
-        self, video_file_or_dir, video_max_num_frames=8, video_max_fps=1, use_audio_in_video=True
-    ):
-
-        images, fps, timestamps, (audio, sampling_rate) = self.get_image_and_audio(
-            video_file_or_dir,
-            video_max_num_frames=video_max_num_frames,
-            video_max_fps=video_max_fps,
-            use_audio_in_video=use_audio_in_video,
-        )
-
-        image_frames = images
-
-        if audio is not None:
-            total_time = len(audio) / sampling_rate
-
-            # audio_frames = torch.chunk(audio, chunks=len(image_frames), dim=0)
-            full_timestamps = timestamps + [total_time]
-            audio_frames = []
-            for split_idx in range(len(image_frames)):
-                st = full_timestamps[split_idx]
-                ed = full_timestamps[split_idx + 1]
-
-                st = int(st / total_time * len(audio))
-                ed = int(ed / total_time * len(audio))
-
-                audio_frame = audio[st:ed]
-                audio_frames.append(audio_frame)
-
-        else:
-            audio_frames = None
-
-        # grid_t = image_frames.size(1) // self.temporal_patch_size
-        grid_t = 1 // self.temporal_patch_size
-        grid_h = self.image_processor.tile_image_size // self.patch_size
-        grid_w = self.image_processor.tile_image_size // self.patch_size
-
-        video_grid_thw = [[grid_t, grid_h, grid_w]]
-        video_grid_thw = video_grid_thw * len(image_frames)
-
-        if fps is not None:
-            second_per_grids = [1.0 / fps] * len(image_frames)
-        else:
-            second_per_grids = None
-
-        # print(f"{len(image_frames)=} {video_grid_thw=} {video_max_fps=} {video_max_num_frames=} {fps=} {second_per_grids=} ")
-
-        return image_frames, audio_frames, video_grid_thw, second_per_grids, timestamps
 
     def add_video_input_discrete_or_contiguous(
         self,
@@ -3572,55 +3786,21 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
         GLOBAL_TOKEN = get_token()
 
-        IMG_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.IMG_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        IMG_START_ID = tokenizer(GLOBAL_TOKEN.IMG_START_TOKEN, add_special_tokens=False).input_ids
-        IMG_END_ID = tokenizer(GLOBAL_TOKEN.IMG_END_TOKEN, add_special_tokens=False).input_ids
+        IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_CONTEXT_TOKEN)
+        IMG_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_START_TOKEN)
+        IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_END_TOKEN)
 
-        AUD_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.AUD_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        AUD_START_ID = tokenizer(GLOBAL_TOKEN.AUD_START_TOKEN, add_special_tokens=False).input_ids
-        AUD_END_ID = tokenizer(GLOBAL_TOKEN.AUD_END_TOKEN, add_special_tokens=False).input_ids
+        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_CONTEXT_TOKEN)
+        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_START_TOKEN)
+        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_END_TOKEN)
 
-        VID_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.VID_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        VID_START_ID = tokenizer(GLOBAL_TOKEN.VID_START_TOKEN, add_special_tokens=False).input_ids
-        VID_END_ID = tokenizer(GLOBAL_TOKEN.VID_END_TOKEN, add_special_tokens=False).input_ids
+        VID_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_CONTEXT_TOKEN)
+        VID_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_START_TOKEN)
+        VID_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_END_TOKEN)
 
-        IMG_TAG_ID = tokenizer(GLOBAL_TOKEN.IMG_TAG_TOKEN, add_special_tokens=False).input_ids
-        AUD_TAG_ID = tokenizer(GLOBAL_TOKEN.AUD_TAG_TOKEN, add_special_tokens=False).input_ids
-        VID_TAG_ID = tokenizer(GLOBAL_TOKEN.VID_TAG_TOKEN, add_special_tokens=False).input_ids
-
-        assert len(IMG_CONTEXT_ID) == 1
-        assert len(IMG_START_ID) == 1
-        assert len(IMG_END_ID) == 1
-
-        assert len(AUD_CONTEXT_ID) == 1
-        assert len(AUD_START_ID) == 1
-        assert len(AUD_END_ID) == 1
-
-        assert len(VID_CONTEXT_ID) == 1
-        assert len(VID_START_ID) == 1
-        assert len(VID_END_ID) == 1
-
-        IMG_CONTEXT_ID = IMG_CONTEXT_ID[0]
-        IMG_START_ID = IMG_START_ID[0]
-        IMG_END_ID = IMG_END_ID[0]
-
-        AUD_CONTEXT_ID = AUD_CONTEXT_ID[0]
-        AUD_START_ID = AUD_START_ID[0]
-        AUD_END_ID = AUD_END_ID[0]
-
-        VID_CONTEXT_ID = VID_CONTEXT_ID[0]
-        VID_START_ID = VID_START_ID[0]
-        VID_END_ID = VID_END_ID[0]
-
-        IMG_TAG_ID = IMG_TAG_ID[0]
-        AUD_TAG_ID = AUD_TAG_ID[0]
-        VID_TAG_ID = VID_TAG_ID[0]
+        IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_TAG_TOKEN)
+        AUD_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_TAG_TOKEN)
+        VID_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_TAG_TOKEN)
 
         nl_tokens = tokenizer("\n", add_special_tokens=False).input_ids
 
@@ -3933,9 +4113,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             else:
                                 new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
 
-                        # audio_token_length = audio_chunk_frame.size(0)
-                        # audio_token_length = audio_token_length_func(audio_chunk_frame.size(0))
-                        audio_token_length = audio_token_length_func(audio_chunk_frame)
+                        audio_token_length = -(-audio_token_length_func(len(audio_chunk_frame)) // self.temporal_merge_size)
                         audio_indice_b = torch.zeros(
                             1, audio_token_length, dtype=torch.int64
                         )  # This will change in collate_fn
@@ -4011,7 +4189,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             image_indices = image_indices.contiguous().to(torch.cuda.current_device())
             if True:
                 images = (
-                    torch.tensor(images, dtype=torch.bfloat16)
+                    torch.tensor(images, dtype=torch.float32)
                     .contiguous()
                     .to(torch.cuda.current_device())
                 )
@@ -4093,8 +4271,8 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             self.possible_resolutions = [
                 [dim * self.tile_image_size for dim in pair] for pair in self.grid_pinpoints
             ]
-            print(f"{self.grid_pinpoints=}")
-            print(f"{self.possible_resolutions=}")
+            logger.info(f"{self.grid_pinpoints=}")
+            logger.info(f"{self.possible_resolutions=}")
 
         if self.vision_resolution_type == "dynamic":
             max_num = self.max_tile_grid
@@ -4111,13 +4289,13 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             self.possible_resolutions = [
                 [dim * self.tile_image_size for dim in pair] for pair in self.target_ratios
             ]
-            print(f"{self.target_ratios=}")
-            print(f"{self.possible_resolutions=}")
+            logger.info(f"{self.target_ratios=}")
+            logger.info(f"{self.possible_resolutions=}")
 
         if self.vision_resolution_type == "native":
             self.min_pixels = (patch_size * spatial_merge_size) ** 2 * image_min_num_tokens
             self.max_pixels = (patch_size * spatial_merge_size) ** 2 * image_max_num_tokens
-            print(f"{self.min_pixels=} {self.max_pixels=}")
+            logger.info(f"{self.min_pixels=} {self.max_pixels=}")
 
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
@@ -4485,516 +4663,6 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
 
         return scale_x, scale_y
 
-    def add_image_input_contiguous(
-        self,
-        input_ids,
-        image_or_paths,
-        tokenizer,
-        # image_token_length=256,
-        targets=None,
-        is_pretrain=False,
-        **kwargs,
-    ):
-        GLOBAL_TOKEN = get_token()
-
-        IMG_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.IMG_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        IMG_START_ID = tokenizer(GLOBAL_TOKEN.IMG_START_TOKEN, add_special_tokens=False).input_ids
-        IMG_END_ID = tokenizer(GLOBAL_TOKEN.IMG_END_TOKEN, add_special_tokens=False).input_ids
-
-        PATCH_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.PATCH_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        PATCH_START_ID = tokenizer(
-            GLOBAL_TOKEN.PATCH_START_TOKEN, add_special_tokens=False
-        ).input_ids
-        PATCH_END_ID = tokenizer(GLOBAL_TOKEN.PATCH_END_TOKEN, add_special_tokens=False).input_ids
-
-        IMG_TAG_ID = tokenizer(GLOBAL_TOKEN.IMG_TAG_TOKEN, add_special_tokens=False).input_ids
-
-        assert len(IMG_CONTEXT_ID) == 1
-        assert len(IMG_START_ID) == 1
-        assert len(IMG_END_ID) == 1
-
-        assert len(PATCH_CONTEXT_ID) == 1
-        assert len(PATCH_START_ID) == 1
-        assert len(PATCH_END_ID) == 1
-
-        IMG_CONTEXT_ID = IMG_CONTEXT_ID[0]
-        IMG_START_ID = IMG_START_ID[0]
-        IMG_END_ID = IMG_END_ID[0]
-
-        PATCH_CONTEXT_ID = PATCH_CONTEXT_ID[0]
-        PATCH_START_ID = PATCH_START_ID[0]
-        PATCH_END_ID = PATCH_END_ID[0]
-
-        IMG_TAG_ID = IMG_TAG_ID[0]
-
-        nl_tokens = tokenizer("\n", add_special_tokens=False).input_ids
-
-        img_positions = [i for i, x in enumerate(input_ids) if x == IMG_TAG_ID]
-
-        images = []
-        image_indices = []
-        image_grid_thw = []
-
-        new_input_ids = []
-        new_targets = []
-
-        st = 0
-        for img_idx, img_pos in enumerate(img_positions):
-            (
-                image_patches,
-                (best_width, best_height),
-            ) = self.process_image_to_tiles(image_or_paths[img_idx])
-            # image_patches, _ = self.process_images_to_tensor([image_or_paths[img_idx]])
-
-            _image_grid_thw = self.get_image_grid_thw(image_patches)
-
-            if self.vision_resolution_type == "native":
-                images.append(
-                    torch.cat(
-                        [
-                            self.convert_image_to_patches_with_pixel_shuffle(x)
-                            for x in image_patches
-                        ],
-                        dim=0,
-                    )
-                )
-            else:
-                images.append(image_patches)
-
-            new_input_ids += input_ids[st:img_pos]
-            if targets is not None:
-                new_targets += targets[st:img_pos]
-
-            new_input_ids += [IMG_START_ID]
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            image_token_length = (
-                _image_grid_thw[0][0]
-                * _image_grid_thw[0][1]
-                * _image_grid_thw[0][2]
-                // self.spatial_merge_size
-                // self.spatial_merge_size
-            )
-            image_indice_b = torch.zeros(
-                1, image_token_length, dtype=torch.int64
-            )  # This will change in collate_fn
-            image_indice_s = (
-                torch.arange(len(new_input_ids), len(new_input_ids) + image_token_length)
-                .unsqueeze(0)
-                .repeat(1, 1)
-            )
-            image_indice_b_s = torch.stack(
-                [image_indice_b, image_indice_s], dim=0
-            )  # 2, num_image, image_length
-            if self.vision_resolution_type == "native":
-                image_indices.append(image_indice_b_s.view(2, -1))
-            else:
-                image_indices.append(image_indice_b_s)
-
-            new_input_ids += [IMG_CONTEXT_ID] * image_token_length
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
-
-            new_input_ids += [IMG_END_ID]
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            if len(image_patches) > 1:
-                for _ in range(0, best_height, self.tile_image_size):
-                    new_input_ids += nl_tokens
-                    if targets is not None:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(nl_tokens)
-
-                    for _ in range(0, best_width, self.tile_image_size):
-                        new_input_ids += [PATCH_START_ID]
-                        if targets is not None:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-                        image_indice_b = torch.zeros(
-                            1, image_token_length, dtype=torch.int64
-                        )  # This will change in collate_fn
-                        image_indice_s = (
-                            torch.arange(
-                                len(new_input_ids), len(new_input_ids) + image_token_length
-                            )
-                            .unsqueeze(0)
-                            .repeat(1, 1)
-                        )
-                        image_indice_b_s = torch.stack(
-                            [image_indice_b, image_indice_s], dim=0
-                        )  # 2, num_image, image_length
-                        image_indices.append(image_indice_b_s)
-
-                        new_input_ids += [PATCH_CONTEXT_ID] * image_token_length
-                        if targets is not None:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
-
-                        new_input_ids += [PATCH_END_ID]
-                        if targets is not None:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            image_grid_thw.extend(_image_grid_thw)
-            st = img_pos + 1
-
-        new_input_ids += input_ids[st:]
-        if targets is not None:
-            new_targets += targets[st:]
-
-        input_ids = new_input_ids
-        if targets is not None:
-            targets = new_targets
-
-        image_grid_thw = torch.tensor(image_grid_thw, dtype=torch.long)
-
-        if targets is not None:
-            return input_ids, images, image_indices, image_grid_thw, targets
-
-        images = torch.cat(images, dim=0)
-        image_indices = torch.cat(image_indices, dim=1)
-
-        image_indices = image_indices.contiguous().to(torch.cuda.current_device())
-        if True:
-            images = (
-                torch.tensor(images, dtype=torch.bfloat16)
-                .contiguous()
-                .to(torch.cuda.current_device())
-            )
-
-        else:
-            images = (
-                torch.tensor(images, dtype=torch.float16)
-                .contiguous()
-                .to(torch.cuda.current_device())
-            )
-
-        return input_ids, images, image_indices, image_grid_thw
-
-    def add_image_input_discrete_and_contiguous(
-        self,
-        input_ids,
-        image_or_paths,
-        tokenizer,
-        # image_token_length=256,
-        use_tile=True,
-        targets=None,
-        is_pretrain=False,
-        **kwargs,
-    ):
-
-        GLOBAL_TOKEN = get_token()
-
-        IMG_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.IMG_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        IMG_START_ID = tokenizer(GLOBAL_TOKEN.IMG_START_TOKEN, add_special_tokens=False).input_ids
-        IMG_END_ID = tokenizer(GLOBAL_TOKEN.IMG_END_TOKEN, add_special_tokens=False).input_ids
-
-        PATCH_CONTEXT_ID = tokenizer(
-            GLOBAL_TOKEN.PATCH_CONTEXT_TOKEN, add_special_tokens=False
-        ).input_ids
-        PATCH_START_ID = tokenizer(
-            GLOBAL_TOKEN.PATCH_START_TOKEN, add_special_tokens=False
-        ).input_ids
-        PATCH_END_ID = tokenizer(GLOBAL_TOKEN.PATCH_END_TOKEN, add_special_tokens=False).input_ids
-
-        IMG_TAG_ID = tokenizer(GLOBAL_TOKEN.IMG_TAG_TOKEN, add_special_tokens=False).input_ids
-
-        IMG_FIRST_ID = tokenizer.convert_tokens_to_ids("<|vision_0|>")
-        IMG_EOL_ID = tokenizer.convert_tokens_to_ids("<|vision_eol|>")
-
-        assert len(IMG_CONTEXT_ID) == 1
-        assert len(IMG_START_ID) == 1
-        assert len(IMG_END_ID) == 1
-
-        assert len(PATCH_CONTEXT_ID) == 1
-        assert len(PATCH_START_ID) == 1
-        assert len(PATCH_END_ID) == 1
-
-        IMG_CONTEXT_ID = IMG_CONTEXT_ID[0]
-        IMG_START_ID = IMG_START_ID[0]
-        IMG_END_ID = IMG_END_ID[0]
-
-        PATCH_CONTEXT_ID = PATCH_CONTEXT_ID[0]
-        PATCH_START_ID = PATCH_START_ID[0]
-        PATCH_END_ID = PATCH_END_ID[0]
-
-        IMG_TAG_ID = IMG_TAG_ID[0]
-
-        nl_tokens = tokenizer("\n", add_special_tokens=False).input_ids
-
-        img_positions = [i for i, x in enumerate(input_ids) if x == IMG_TAG_ID]
-
-        images = []
-        image_indices = []
-        image_grid_thw = []
-
-        new_input_ids = []
-        new_targets = []
-
-        st = 0
-        for img_idx, img_pos in enumerate(img_positions):
-
-            new_input_ids += input_ids[st:img_pos]
-            if targets is not None:
-                new_targets += targets[st:img_pos]
-
-            if use_tile:
-
-                (
-                    image_patches,
-                    (best_width, best_height),
-                ) = self.process_image_to_tiles(image_or_paths[img_idx])
-                patch_idx = 0
-            else:
-                image_patches, _ = self.process_images_to_tensor([image_or_paths[img_idx]])
-
-            _image_grid_thw = self.get_image_grid_thw(image_patches)
-
-            if self.vision_resolution_type == "native":
-                images.append(
-                    torch.cat(
-                        [
-                            self.convert_image_to_patches_with_pixel_shuffle(x)
-                            for x in image_patches
-                        ],
-                        dim=0,
-                    )
-                )
-            else:
-                images.append(image_patches)
-
-            # --------------------------------------------------------------------------
-            # add discrete
-
-            if use_tile:
-                image_patch = self.process_tensor_to_image(image_patches[patch_idx])
-                patch_idx += 1
-            else:
-                image_patch = image_or_paths[img_idx]
-            image_data = self.process_image(image_patch, is_discrete=True)
-            image_tokens = image_data["image_tokens"]
-            # h, w = image_tokens.shape
-            h, w = len(image_token), len(image_token[0])
-            # image_tokens = image_tokens.tolist()
-            image_input_ids = []
-            for _h in range(h):
-                for _w in range(w):
-                    image_input_ids.append(image_tokens[_h][_w] + IMG_FIRST_ID)
-                if _h < h - 1:
-                    image_input_ids += [IMG_EOL_ID]
-
-            size_input_ids = tokenizer(f"{h}*{w}", add_special_tokens=False).input_ids
-
-            new_input_ids += [IMG_START_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [IMG_START_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            new_input_ids += size_input_ids
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += size_input_ids
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(size_input_ids)
-
-            new_input_ids += image_input_ids
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += image_input_ids
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(image_input_ids)
-
-            new_input_ids += [IMG_END_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [IMG_END_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            # --------------------------------------------------------------------------
-            # add contiguous
-
-            new_input_ids += [IMG_START_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [IMG_START_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            image_token_length = (
-                _image_grid_thw[0][0]
-                * _image_grid_thw[0][1]
-                * _image_grid_thw[0][2]
-                // self.spatial_merge_size
-                // self.spatial_merge_size
-            )
-            image_indice_b = torch.zeros(
-                1, image_token_length, dtype=torch.int64
-            )  # This will change in collate_fn
-            image_indice_s = (
-                torch.arange(len(new_input_ids), len(new_input_ids) + image_token_length)
-                .unsqueeze(0)
-                .repeat(1, 1)
-            )
-            image_indice_b_s = torch.stack(
-                [image_indice_b, image_indice_s], dim=0
-            )  # 2, num_image, image_length
-            if self.vision_resolution_type == "native":
-                image_indices.append(image_indice_b_s.view(2, -1))
-            else:
-                image_indices.append(image_indice_b_s)
-
-            new_input_ids += [IMG_CONTEXT_ID] * image_token_length
-            if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
-
-            new_input_ids += [IMG_END_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [IMG_END_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            if len(image_patches) > 1:
-                for _ in range(0, best_height, self.tile_image_size):
-                    new_input_ids += nl_tokens
-                    if targets is not None:
-                        if is_pretrain:
-                            new_targets += nl_tokens
-                        else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(nl_tokens)
-
-                    for _ in range(0, best_width, self.tile_image_size):
-
-                        # --------------------------------------------------------------------------
-                        # add discrete
-
-                        image_patch = self.process_tensor_to_image(image_patches[patch_idx])
-                        patch_idx += 1
-                        image_data = self.process_image(image_patch, is_discrete=True)
-                        image_tokens = image_data["image_tokens"]
-                        # h, w = image_tokens.shape
-                        h, w = len(image_token), len(image_token[0])
-                        # image_tokens = image_tokens.tolist()
-                        image_input_ids = []
-                        for _h in range(h):
-                            for _w in range(w):
-                                image_input_ids.append(image_tokens[_h][_w] + IMG_FIRST_ID)
-                            if _h < h - 1:
-                                image_input_ids += [IMG_EOL_ID]
-
-                        size_input_ids = tokenizer(f"{h}*{w}", add_special_tokens=False).input_ids
-
-                        new_input_ids += [PATCH_START_ID]
-                        if targets is not None:
-                            if is_pretrain:
-                                new_targets += [PATCH_START_ID]
-                            else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-                        new_input_ids += size_input_ids
-                        if targets is not None:
-                            if is_pretrain:
-                                new_targets += size_input_ids
-                            else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(size_input_ids)
-
-                        new_input_ids += image_input_ids
-                        if targets is not None:
-                            if is_pretrain:
-                                new_targets += image_input_ids
-                            else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(image_input_ids)
-
-                        new_input_ids += [PATCH_END_ID]
-                        if targets is not None:
-                            if is_pretrain:
-                                new_targets += [PATCH_END_ID]
-                            else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-                        # --------------------------------------------------------------------------
-                        # add contiguous
-
-                        new_input_ids += [PATCH_START_ID]
-                        if targets is not None:
-                            if is_pretrain:
-                                new_targets += [PATCH_START_ID]
-                            else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-                        image_indice_b = torch.zeros(
-                            1, image_token_length, dtype=torch.int64
-                        )  # This will change in collate_fn
-                        image_indice_s = (
-                            torch.arange(
-                                len(new_input_ids), len(new_input_ids) + image_token_length
-                            )
-                            .unsqueeze(0)
-                            .repeat(1, 1)
-                        )
-                        image_indice_b_s = torch.stack(
-                            [image_indice_b, image_indice_s], dim=0
-                        )  # 2, num_image, image_length
-                        image_indices.append(image_indice_b_s)
-
-                        new_input_ids += [PATCH_CONTEXT_ID] * image_token_length
-                        if targets is not None:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
-
-                        new_input_ids += [PATCH_END_ID]
-                        if targets is not None:
-                            if is_pretrain:
-                                new_targets += [PATCH_END_ID]
-                            else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            image_grid_thw.extend(_image_grid_thw)
-
-            # --------------------------------------------------------------------------
-
-            st = img_pos + 1
-
-        new_input_ids += input_ids[st:]
-        if targets is not None:
-            new_targets += targets[st:]
-
-        input_ids = new_input_ids
-        if targets is not None:
-            targets = new_targets
-
-        image_grid_thw = torch.tensor(image_grid_thw, dtype=torch.long)
-
-        if targets is not None:
-            return input_ids, images, image_indices, image_grid_thw, targets
-
-        images = torch.cat(images, dim=0)
-        image_indices = torch.cat(image_indices, dim=1)
-
-        image_indices = image_indices.contiguous().to(torch.cuda.current_device())
-        if True:
-            images = (
-                torch.tensor(images, dtype=torch.bfloat16)
-                .contiguous()
-                .to(torch.cuda.current_device())
-            )
-
-        else:
-            images = (
-                torch.tensor(images, dtype=torch.float16)
-                .contiguous()
-                .to(torch.cuda.current_device())
-            )
-
-        return input_ids, images, image_indices, image_grid_thw
-
     def add_image_input_discrete_or_contiguous(
         self,
         input_ids,
@@ -5274,7 +4942,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         image_indices = image_indices.contiguous().to(torch.cuda.current_device())
         if True:
             images = (
-                torch.tensor(images, dtype=torch.bfloat16)
+                torch.tensor(images, dtype=torch.float32)
                 .contiguous()
                 .to(torch.cuda.current_device())
             )
@@ -5287,171 +4955,6 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             )
 
         return input_ids, images, image_indices, image_grid_thw
-
-    def add_image_input_contiguous_to_discrete(
-        self,
-        input_ids,
-        image_or_paths,
-        tokenizer,
-        targets=None,
-        is_pretrain=False,
-        **kwargs,
-    ):
-
-        assert self.vision_resolution_type == "native"
-        GLOBAL_TOKEN = get_token()
-
-        IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_CONTEXT_TOKEN)
-        IMG_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_START_TOKEN)
-        IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_END_TOKEN)
-        IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_TAG_TOKEN)
-
-        if targets is not None:
-            IMG_FIRST_ID = tokenizer.convert_tokens_to_ids(self.vision_tokenizer.first_vision_token)
-            IMG_EOL_ID = tokenizer.convert_tokens_to_ids("<|vision_eol|>")
-
-        nl_tokens = tokenizer("\n", add_special_tokens=False).input_ids
-
-        img_positions = [i for i, x in enumerate(input_ids) if x == IMG_TAG_ID]
-
-        images = []
-        image_indices = []
-        image_grid_thw = []
-
-        new_input_ids = []
-        new_targets = []
-
-        st = 0
-        for img_idx, img_pos in enumerate(img_positions):
-
-            new_input_ids += input_ids[st:img_pos]
-            if targets is not None:
-                new_targets += targets[st:img_pos]
-
-            image_data = self.process_image(image_or_paths[img_idx], is_contiguous=True)
-            image_patches = image_data["images"]
-            best_width = image_data["image_width"]
-            best_height = image_data["image_height"]
-
-            _image_grid_thw = self.get_image_grid_thw(image_patches)
-            image_grid_thw.extend(_image_grid_thw)
-
-            images.append(
-                torch.cat(
-                    [self.convert_image_to_patches_with_pixel_shuffle(x) for x in image_patches],
-                    dim=0,
-                )
-            )
-
-            if targets is not None:
-                image_data = self.process_image(
-                    image_or_paths[img_idx],
-                    is_discrete=True,
-                    image_height=best_height // self.spatial_merge_size,
-                    image_width=best_width // self.spatial_merge_size,
-                )
-                image_tokens = image_data["image_tokens"]
-                assert (
-                    len(image_tokens) == _image_grid_thw[0][1] // self.spatial_merge_size
-                ), f"{len(image_tokens)=} {_image_grid_thw=} {best_width=} {best_height}"
-                assert (
-                    len(image_tokens[0]) == _image_grid_thw[0][2] // self.spatial_merge_size
-                ), f"{len(image_tokens[0])=} {_image_grid_thw=} {best_width=} {best_height}"
-
-            resolution = f"{_image_grid_thw[0][1] * self.patch_size}*{_image_grid_thw[0][2] * self.patch_size}"
-            size_input_ids = tokenizer(resolution, add_special_tokens=False).input_ids
-
-            new_input_ids += [IMG_START_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [IMG_START_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            new_input_ids += size_input_ids
-            if targets is not None:
-                if is_pretrain:
-                    # new_targets += size_input_ids
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(size_input_ids)
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(size_input_ids)
-
-            new_input_ids += nl_tokens
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [IMG_EOL_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(nl_tokens)
-
-            for image_token in image_tokens:
-                image_token_length = _image_grid_thw[0][2] // self.spatial_merge_size
-                image_indice_b = torch.zeros(
-                    1, image_token_length, dtype=torch.int64
-                )  # This will change in collate_fn
-                image_indice_s = (
-                    torch.arange(len(new_input_ids), len(new_input_ids) + image_token_length)
-                    .unsqueeze(0)
-                    .repeat(1, 1)
-                )
-                image_indice_b_s = torch.stack(
-                    [image_indice_b, image_indice_s], dim=0
-                )  # 2, num_image, image_length
-                image_indices.append(image_indice_b_s.view(2, -1))
-
-                new_input_ids += [IMG_CONTEXT_ID] * image_token_length
-                if targets is not None:
-                    new_targets += [_ + IMG_FIRST_ID for _ in image_token]
-
-                new_input_ids += nl_tokens
-                if targets is not None:
-                    if is_pretrain:
-                        new_targets += [IMG_EOL_ID]
-                    else:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(nl_tokens)
-
-            new_input_ids += [IMG_END_ID]
-            if targets is not None:
-                if is_pretrain:
-                    new_targets += [IMG_END_ID]
-                else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
-
-            st = img_pos + 1
-
-        new_input_ids += input_ids[st:]
-        if targets is not None:
-            new_targets += targets[st:]
-
-        input_ids = new_input_ids
-        if targets is not None:
-            targets = new_targets
-
-        image_grid_thw = torch.tensor(image_grid_thw, dtype=torch.long)
-
-        if targets is not None:
-            return input_ids, images, image_indices, image_grid_thw, targets
-
-        images = torch.cat(images, dim=0)
-        image_indices = torch.cat(image_indices, dim=1)
-
-        image_indices = image_indices.contiguous().to(torch.cuda.current_device())
-        if True:
-            images = (
-                torch.tensor(images, dtype=torch.bfloat16)
-                .contiguous()
-                .to(torch.cuda.current_device())
-            )
-
-        else:
-            images = (
-                torch.tensor(images, dtype=torch.float16)
-                .contiguous()
-                .to(torch.cuda.current_device())
-            )
-
-        return input_ids, images, image_indices, image_grid_thw
-
-
 
 
 # https://github.com/QwenLM/Qwen3-VL/blob/main/qwen-vl-utils/src/qwen_vl_utils/vision_process.py
@@ -5560,11 +5063,11 @@ class YoutuVITAProcessor(ProcessorMixin):
         **kwargs: Unpack[YoutuVITAProcessorKwargs],
     ) -> BatchFeature:
         audios = audio
-        print(f"{text=}")
-        print(f"{images=}")
-        print(f"{videos=}")
-        print(f"{audios=}")
-        print(f"{kwargs=}")
+        logger.debug(f"{text=}")
+        logger.debug(f"{images=}")
+        logger.debug(f"{videos=}")
+        logger.debug(f"{audios=}")
+        logger.debug(f"{kwargs=}")
 
         if text is None:
             raise ValueError("You need to specify either a `text` input to process.")
@@ -5574,10 +5077,10 @@ class YoutuVITAProcessor(ProcessorMixin):
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
             **kwargs,
         )
-        print(f"{output_kwargs=}")
+        logger.debug(f"{output_kwargs=}")
 
+        output_kwargs["text_kwargs"].pop("return_tensors", None)
         texts_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
-        print(f"{texts_inputs=}")
         input_ids = texts_inputs["input_ids"]
 
         images_inputs = {}
@@ -5595,28 +5098,30 @@ class YoutuVITAProcessor(ProcessorMixin):
 
             audio_seqlens = [len(x) for x in _audios]
 
-            print(f"{audios=} {len(input_ids)=} {len(_audios)=} {sum(x.abs().sum() for x in _audios)=} {len(audio_indices)=}")
+            logger.debug(f"{audios=} {len(input_ids)=} {len(_audios)=} {sum(x.abs().sum() for x in _audios)=} {len(audio_indices)=}")
 
             audio_inputs["audios"] = _audios
             audio_inputs["audio_indices"] = audio_indices
             # audio_inputs["audio_feature_lengths"] = audio_seqlens
 
         if images:
-            images = [image for _ in images for image in _]
+            if (isinstance(images, (list, tuple)) and all(isinstance(images_i, (list, tuple)) for images_i in images)):
+                images = [img for img_list in images for img in img_list]
             input_ids, _images, image_indices, image_grid_thw = self.image_processor.add_image_input_discrete_or_contiguous(
                 input_ids,
                 images,
                 self.tokenizer,
                 **output_kwargs["images_kwargs"],
             )
-            print(f"{images=} {len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw=}")
+            logger.debug(f"{images=} {len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw=}")
 
             images_inputs["images"] = _images
             images_inputs["image_indices"] = image_indices
             images_inputs["image_grid_thw"] = image_grid_thw
 
         if videos:
-            videos = [video for _ in videos for video in _]
+            if (isinstance(videos, (list, tuple)) and all(isinstance(videos_i, (list, tuple)) for videos_i in videos)):
+                videos = [vid for vid_list in videos for vid in vid_list]
             (
                 input_ids,
                 _images,
@@ -5633,9 +5138,9 @@ class YoutuVITAProcessor(ProcessorMixin):
                 **output_kwargs["videos_kwargs"],
             )
             if _images is not None:
-                print(f"{len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw.size()=}")
+                logger.debug(f"{len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw.size()=}")
             if _audios is not None:
-                print(f"{len(input_ids)=} {len(_audios)=} {[x.size() for x in _audios]=} {len(audio_indices)=}")
+                logger.debug(f"{len(input_ids)=} {len(_audios)=} {[x.size() for x in _audios]=} {len(audio_indices)=}")
 
             if _audios is None:
                 audio_seqlens = None
@@ -5696,3 +5201,4 @@ __all__ = [
     "YoutuVITAVideoProcessor",
     "YoutuVITAFeatureExtractor",
 ]
+

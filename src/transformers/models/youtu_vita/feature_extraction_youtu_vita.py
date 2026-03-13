@@ -22,7 +22,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import os
 import time
 
@@ -30,7 +29,7 @@ import torch
 
 from ...feature_extraction_sequence_utils import SequenceFeatureExtractor
 from .modeling_youtu_vita import Youtu_VITA_TOKEN, YoutuVITAAudioKwargs
-from .tokenization_youtu_vita import AudioTokenizer, GLM4VoiceTokenizer, WavFrontendTokenizer
+from .tokenization_youtu_vita import AudioTokenizer, GLM4VoiceTokenizer, MelFilterBankTokenizer, WavFrontendTokenizer
 
 
 # _GLOBAL_TOKEN = Qwen3_VITA_TOKEN()
@@ -111,8 +110,7 @@ def get_audio_tokenizer(model_name_or_path_list, audio_tokenizer_type_list, flow
             tokenizer_discrete = XYTokenizer(model_name_or_path, rank=rank)
 
         else:
-            print(f"{audio_tokenizer_type_list=}")
-            raise NotImplementedError
+            raise NotImplementedError(f"Unsupported audio tokenizer types: {audio_tokenizer_type_list}")
 
     audio_tokenizer = AudioTokenizer(tokenizer_contiguous, tokenizer_discrete)
 
@@ -227,22 +225,13 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
     ):
         GLOBAL_TOKEN = get_token()
 
-        AUD_CONTEXT_ID = tokenizer(GLOBAL_TOKEN.AUD_CONTEXT_TOKEN, add_special_tokens=False).input_ids
-        AUD_TAG_ID = tokenizer(GLOBAL_TOKEN.AUD_TAG_TOKEN, add_special_tokens=False).input_ids
-        AUD_START_ID = tokenizer(GLOBAL_TOKEN.AUD_START_TOKEN, add_special_tokens=False).input_ids
-        AUD_END_ID = tokenizer(GLOBAL_TOKEN.AUD_END_TOKEN, add_special_tokens=False).input_ids
+        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_CONTEXT_TOKEN)
+        AUD_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_TAG_TOKEN)
+        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_START_TOKEN)
+        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_END_TOKEN)
 
         if self.audio_tokenizer.tokenizer_discrete is not None:
             AUD_FIRST_ID = tokenizer.convert_tokens_to_ids(self.audio_tokenizer.tokenizer_discrete.first_audio_token)
-
-        assert len(AUD_CONTEXT_ID) == 1
-        assert len(AUD_START_ID) == 1
-        assert len(AUD_END_ID) == 1
-
-        AUD_CONTEXT_ID = AUD_CONTEXT_ID[0]
-        AUD_TAG_ID = AUD_TAG_ID[0]
-        AUD_START_ID = AUD_START_ID[0]
-        AUD_END_ID = AUD_END_ID[0]
 
         aud_positions = [i for i, x in enumerate(input_ids) if x == AUD_TAG_ID]
         assert len(aud_positions) == len(audio_or_paths), f"{len(aud_positions)=} {len(audio_or_paths)=} {AUD_TAG_ID=}"
@@ -397,7 +386,7 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                     if additional_targets_list is not None:
                         additional_targets_list = [x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] for x in additional_targets_list]
 
-                    audio_token_length = audio_token_length_func(audio) // self.temporal_merge_size
+                    audio_token_length = -(-audio_token_length_func(len(audio)) // self.temporal_merge_size)
                     audio_indice_b = torch.zeros(
                         1, audio_token_length, dtype=torch.int64
                     )  # This will change in collate_fn

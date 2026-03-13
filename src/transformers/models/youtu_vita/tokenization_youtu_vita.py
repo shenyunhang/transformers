@@ -22,17 +22,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import os
 import uuid
 
 import torch
-import torchaudio
 from funasr.frontends.wav_frontend import WavFrontend
 from funasr.utils.load_utils import extract_fbank
 
-from ...utils import logging
+from ...models.whisper.feature_extraction_whisper import WhisperFeatureExtractor
+from ...utils import is_torchaudio_available, logging
 
+
+if is_torchaudio_available():
+    import torchaudio
 
 logger = logging.get_logger(__name__)
 
@@ -56,19 +58,9 @@ class GLM4VoiceTokenizer:
         self.model_name_or_path = model_name_or_path
         self.flow_path = flow_path
 
-        # if rank is None and torch.distributed.is_initialized():
-        #     rank = torch.distributed.get_rank()
-        #     rank = rank % 8
-
-        #     CUDA_VISIBLE_DEVICES = os.environ.get('CUDA_VISIBLE_DEVICES', '0,1,2,3,4,5,6,7,8')
-        #     gpu_list = [int(x) for x in CUDA_VISIBLE_DEVICES.split(',')]
-        #     if rank not in gpu_list:
-        #         rank = None
-
         self.rank = rank
         logger.info(f"{self.rank=}")
 
-    # @torch.compiler.disable
     def load_model(self):
         if not hasattr(self, "whisper_model") and self.model_name_or_path:
             pass
@@ -267,8 +259,11 @@ class WavFrontendTokenizer:
 
         if isinstance(audio_or_path, tuple):
             audio, sampling_rate = audio_or_path
-        else:
+        elif isinstance(audio_or_path, str):
             audio, sampling_rate = torchaudio.load(audio_or_path)
+        else:
+            audio = torch.tensor(audio_or_path)
+            sampling_rate = self.sampling_rate
         # print(f"{audio.size()=} {sampling_rate=}")
         if audio.dim() == 2:
             audio = audio.mean(0)
@@ -303,7 +298,114 @@ class WavFrontendTokenizer:
 
         return {
             "audio": speech,
-            "audio_token_length_func": len,
+            "audio_token_length_func": lambda x: x,
+            "duration_seconds": len(audio) / self.sampling_rate,
+        }
+
+    @torch.no_grad()
+    def decode(self, audio_tokens, **kwargs):
+        return None
+
+
+def _get_feat_extract_output_lengths(input_lengths):
+    """
+    Computes the output length of the convolutional layers and the output length of the audio encoder
+    """
+
+    input_lengths_leave = input_lengths % 100
+    feat_lengths = (input_lengths_leave - 1) // 2 + 1
+    output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
+    return output_lengths
+
+
+class MelFilterBankTokenizer:
+    def __init__(self, model_name_or_path, rank=None):
+        self.model_name_or_path = model_name_or_path
+
+        self.rank = rank
+        logger.info(f"{self.rank=}")
+
+        self.sampling_rate = 16000
+
+        self.is_discrete = True
+        self.is_contiguous = False
+
+        self._resample_buffer: dict[int, torchaudio.transforms.Resample] = {}
+
+        self.tokenizer_type = "melfilterbank"
+
+    def load_model(self):
+        if hasattr(self, "feature_extractor"):
+            return
+
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            worker_id = worker_info.id
+            # num_workers = worker_info.num_workers
+            self.rank = worker_id % 8
+            logger.info(f"{self.rank=}")
+
+        if self.rank is not None:
+            self.device = f"cuda:{self.rank}"
+            # torch.cuda.set_device(self.rank)
+        else:
+            self.device = "cuda"
+            # self.device = "cpu"
+        self.device = "cpu"
+
+        logger.info(f"{self.device=}")
+
+        assert isinstance(self.model_name_or_path, str)
+
+        logger.info(f"⏳ {self.device=} Loading {self.tokenizer_type} from {self.model_name_or_path}")
+        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(self.model_name_or_path)
+        logger.info(f"⏳ {self.device=} Loading {self.tokenizer_type} Done")
+
+    @torch.no_grad()
+    def encode(self, audio_or_path, **kwargs):
+        if not hasattr(self, "feature_extractor"):
+            self.load_model()
+
+        if isinstance(audio_or_path, tuple):
+            audio, sampling_rate = audio_or_path
+        else:
+            audio, sampling_rate = torchaudio.load(audio_or_path)
+        # print(f"{audio_or_path=} {audio.size()=} {sampling_rate=}")
+        if audio.dim() == 2:
+            audio = audio.mean(0)
+
+        if sampling_rate != self.sampling_rate:
+            if sampling_rate not in self._resample_buffer:
+                # print(f"torchaudio.transforms.Resample {sampling_rate=} {self.sampling_rate=} {self.device=}", flush=True)
+                self._resample_buffer[sampling_rate] = torchaudio.transforms.Resample(
+                    orig_freq=sampling_rate, new_freq=self.sampling_rate
+                ).to(self.device)
+            audio = audio.to(self.device)
+            self._resample_buffer[sampling_rate].to(self.device)
+            audio = self._resample_buffer[sampling_rate](audio[None, :])[0, :]
+            audio = audio.cpu()
+        # resampler = torchaudio.transforms.Resample(
+        #     orig_freq=sampling_rate, new_freq=self.sampling_rate
+        # )
+        # audio = resampler(audio[None, :])[0, :]
+        # audio = audio.to(self.device)
+
+        # print(f"{audio_or_path=} {audio.size()=} {sampling_rate=}")
+
+        features = self.feature_extractor(
+            audio,
+            sampling_rate=16000,
+            return_attention_mask=True,
+            return_tensors="pt",
+            padding=True,
+            device=self.device,
+        )
+        input_features = features["input_features"]
+        # feature_attention_mask = features["attention_mask"]
+
+        return {
+            "audio": input_features.squeeze(0).permute(1, 0),
+            "audio_token_length_func": _get_feat_extract_output_lengths,
             "duration_seconds": len(audio) / self.sampling_rate,
         }
 

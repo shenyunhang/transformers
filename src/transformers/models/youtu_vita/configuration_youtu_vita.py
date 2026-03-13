@@ -22,7 +22,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from ...configuration_utils import PreTrainedConfig
 from ...modeling_rope_utils import RopeParameters
 
@@ -37,7 +36,7 @@ class YoutuVITAAudioConfig(PreTrainedConfig):
 
     def __init__(
         self,
-        output_size=512,
+        hidden_size=512,
         attention_heads=4,
         linear_units=2048,
         num_blocks=50,
@@ -49,14 +48,21 @@ class YoutuVITAAudioConfig(PreTrainedConfig):
         kernel_size=11,
         sanm_shfit=0,
         input_size=560,
-        # vocab_size=25055,
-        spatial_merge_size=1,
+        temporal_merge_size=1,
         out_hidden_size=4608,
+        merger_hidden_size=4608,
+        # CNN
+        num_mel_bins=128,
+        downsample_hidden_size=512,
+        n_window=50,
+        n_window_infer=800,
+        conv_chunksize=500,
         **kwargs,
     ):
         super().__init__(**kwargs)
+
+        # SANM
         self.input_size = input_size
-        self.output_size = output_size
         self.attention_heads = attention_heads
         self.linear_units = linear_units
         self.num_blocks = num_blocks
@@ -68,9 +74,18 @@ class YoutuVITAAudioConfig(PreTrainedConfig):
         self.kernel_size = kernel_size
         self.sanm_shfit = sanm_shfit
 
-        self.hidden_size = output_size
-        self.spatial_merge_size = spatial_merge_size
+        self.hidden_size = hidden_size
+        self.temporal_merge_size = temporal_merge_size
         self.out_hidden_size = out_hidden_size
+        self.merger_hidden_size = merger_hidden_size
+
+        # CNN
+        self.downsample_hidden_size = downsample_hidden_size
+        self.num_mel_bins = num_mel_bins
+        self.n_window = n_window
+        self.n_window_infer = n_window_infer
+        self.conv_chunksize = conv_chunksize
+        self.num_hidden_layers = 0
 
 
 class YoutuVITAVisionConfig(PreTrainedConfig):
@@ -95,6 +110,7 @@ class YoutuVITAVisionConfig(PreTrainedConfig):
         attention_dropout=0.0,
         spatial_merge_size=2,
         out_hidden_size=4608,
+        merger_hidden_size=4608,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -111,6 +127,7 @@ class YoutuVITAVisionConfig(PreTrainedConfig):
         self.num_patches = num_patches
         self.spatial_merge_size = spatial_merge_size
         self.out_hidden_size = out_hidden_size
+        self.merger_hidden_size = merger_hidden_size
 
 
 class YoutuVITATextConfig(PreTrainedConfig):
@@ -228,10 +245,13 @@ class YoutuVITAConfig(PreTrainedConfig):
         audio_config=None,
         text_config=None,
         vision_config=None,
-        image_token_id=151655,
-        video_token_id=151656,
-        vision_start_token_id=151652,
-        vision_end_token_id=151653,
+        # image_token_id=133375,
+        # video_token_id=133379,
+        # audio_token_id=133383,
+        # image_pad_token_id=133376,
+        # audio_pad_token_id=133384,
+        # vision_start_token_id=133377,
+        # vision_end_token_id=133378,
         tie_word_embeddings=False,
         **kwargs,
     ):
@@ -250,10 +270,14 @@ class YoutuVITAConfig(PreTrainedConfig):
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
 
-        self.image_token_id = image_token_id
-        self.video_token_id = video_token_id
-        self.vision_start_token_id = vision_start_token_id
-        self.vision_end_token_id = vision_end_token_id
+        # self.image_token_id = image_token_id
+        # self.video_token_id = video_token_id
+        # self.audio_token_id = audio_token_id
+        # self.image_pad_token_id = image_pad_token_id
+        # self.audio_pad_token_id = audio_pad_token_id
+        # self.vision_start_token_id = vision_start_token_id
+        # self.vision_end_token_id = vision_end_token_id
+
         self.tie_word_embeddings = tie_word_embeddings
         super().__init__(**kwargs)
 
