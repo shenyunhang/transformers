@@ -462,6 +462,7 @@ MODEL_MAPPING_NAMES = OrderedDict(
         ("yoso", "YosoModel"),
         ("youtu", "YoutuModel"),
         ("youtu_vita", "YoutuVITAModel"),
+        ("qwen3_vita", "Qwen3VITAModel"),
         ("zamba", "ZambaModel"),
         ("zamba2", "Zamba2Model"),
     ]
@@ -706,6 +707,7 @@ MODEL_FOR_CAUSAL_LM_MAPPING_NAMES = OrderedDict(
         ("xmod", "XmodForCausalLM"),
         ("youtu", "YoutuForCausalLM"),
         ("youtu_vita", "YoutuVITAForCausalLM"),
+        ("qwen3_vita", "Qwen3VITAForCausalLM"),
         ("zamba", "ZambaForCausalLM"),
         ("zamba2", "Zamba2ForCausalLM"),
     ]

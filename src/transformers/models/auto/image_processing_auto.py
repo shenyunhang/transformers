@@ -225,6 +225,7 @@ else:
             ("xclip", ("CLIPImageProcessor", "CLIPImageProcessorFast")),
             ("yolos", ("YolosImageProcessor", "YolosImageProcessorFast")),
             ("youtu_vita", ("YoutuVITAImageProcessor", None)),
+            ("qwen3_vita", ("Qwen3VITAImageProcessor", None)),
             ("zoedepth", ("ZoeDepthImageProcessor", "ZoeDepthImageProcessorFast")),
         ]
     )

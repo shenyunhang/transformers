@@ -432,6 +432,7 @@ if TYPE_CHECKING:
     from .yoso import *
     from .youtu import *
     from .youtu_vita import *
+    from .qwen3_vita import *
     from .zamba import *
     from .zamba2 import *
     from .zoedepth import *

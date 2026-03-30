@@ -83,6 +83,7 @@ FEATURE_EXTRACTOR_MAPPING_NAMES = OrderedDict(
         ("whisper", "WhisperFeatureExtractor"),
         ("xcodec", "DacFeatureExtractor"),
         ("youtu_vita", "YoutuVITAFeatureExtractor"),
+        ("qwen3_vita", "Qwen3VITAFeatureExtractor"),
     ]
 )
 
