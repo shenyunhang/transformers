@@ -39,7 +39,7 @@ from .tokenization_youtu_vita import VisionTokenizer
 logger = logging.get_logger(__name__)
 
 
-# _GLOBAL_TOKEN = Qwen3_VITA_TOKEN()
+# _GLOBAL_TOKEN = Youtu_VITA_TOKEN_bus1()
 _GLOBAL_TOKEN = Youtu_VITA_TOKEN()
 
 
@@ -54,6 +54,7 @@ def _ensure_var_is_initialized(var, name):
 
 
 def get_vision_tokenizer(model_name_or_path_list, vision_tokenizer_type_list, rank=None):
+
     if vision_tokenizer_type_list is None:
         vision_tokenizer_type_list = []
         model_name_or_path_list = []
@@ -211,6 +212,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         self.vision_tokenizer.load_model()
 
     def process_images_to_tensor(self, image_or_path_list):
+
         if isinstance(image_or_path_list[0], str):
             images = [PIL.Image.open(x).convert("RGB") for x in image_or_path_list]
         elif isinstance(image_or_path_list[0], PIL.Image.Image):
@@ -258,6 +260,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         return image_tensor, (self.image_size, self.image_size)
 
     def process_tensor_to_image(self, image_tensor):
+
         image_tensor = image_tensor.permute(1, 2, 0)
         image = image_tensor.numpy()
 
@@ -288,6 +291,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         return self.process_images_to_tensor([image])
 
     def process_image(self, image_or_path, is_discrete=False, is_contiguous=False, **kwargs):
+
         assert not (is_discrete and is_contiguous)
         assert is_discrete or is_contiguous
 
@@ -509,6 +513,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         return flatten_patches
 
     def get_image_grid_thw(self, images):
+
         image_grid_thw = []
         for image in images:
             assert isinstance(images, torch.Tensor)
@@ -532,6 +537,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         return self.vision_tokenizer.is_contiguous
 
     def get_resize_factor(self, image_or_path):
+
         if isinstance(image_or_path, str):
             image = PIL.Image.open(image_or_path).convert("RGB")
         elif isinstance(image_or_path, PIL.Image.Image):
@@ -562,6 +568,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         is_pretrain=False,
         **kwargs,
     ):
+
         GLOBAL_TOKEN = get_token()
 
         IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_CONTEXT_TOKEN)

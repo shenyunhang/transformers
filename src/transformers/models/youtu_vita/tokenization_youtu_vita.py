@@ -62,6 +62,7 @@ class GLM4VoiceTokenizer:
         logger.info(f"{self.rank=}")
 
     def load_model(self):
+
         if not hasattr(self, "whisper_model") and self.model_name_or_path:
             pass
         elif not hasattr(self, "audio_decoder") and self.flow_path:
@@ -120,6 +121,7 @@ class GLM4VoiceTokenizer:
     @torch.no_grad()
     # @torch.compiler.disable
     def encode(self, audio_or_path, **kwargs):
+
         if not hasattr(self, "whisper_model"):
             self.load_model()
 
@@ -224,6 +226,7 @@ class WavFrontendTokenizer:
     def __init__(
         self,
     ):
+
         self.sampling_rate = 16000
 
         self.is_discrete = True
@@ -254,6 +257,7 @@ class WavFrontendTokenizer:
 
     @torch.no_grad()
     def encode(self, audio_or_path, **kwargs):
+
         if not hasattr(self, "frontend"):
             self.load_model()
 
@@ -416,6 +420,7 @@ class MelFilterBankTokenizer:
 
 class VisionTokenizer:
     def __init__(self, tokenizer_contiguous=None, tokenizer_discrete=None):
+
         self.tokenizer_contiguous = tokenizer_contiguous
         self.tokenizer_discrete = tokenizer_discrete
 
@@ -468,6 +473,7 @@ class VisionTokenizer:
 
     @torch.no_grad()
     def decode(self, audio_tokens, **kwargs):
+
         if self.tokenizer_discrete is not None:
             return self.tokenizer_discrete.decode(audio_tokens, **kwargs)
 
@@ -476,6 +482,7 @@ class VisionTokenizer:
 
 class AudioTokenizer:
     def __init__(self, tokenizer_contiguous=None, tokenizer_discrete=None):
+
         self.tokenizer_contiguous = tokenizer_contiguous
         self.tokenizer_discrete = tokenizer_discrete
 
@@ -534,6 +541,7 @@ class AudioTokenizer:
 
     @torch.no_grad()
     def decode(self, audio_tokens, **kwargs):
+
         if self.tokenizer_discrete is not None:
             return self.tokenizer_discrete.decode(audio_tokens, **kwargs)
 

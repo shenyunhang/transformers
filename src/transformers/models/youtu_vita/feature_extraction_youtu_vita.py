@@ -32,7 +32,7 @@ from .modeling_youtu_vita import Youtu_VITA_TOKEN, YoutuVITAAudioKwargs
 from .tokenization_youtu_vita import AudioTokenizer, GLM4VoiceTokenizer, MelFilterBankTokenizer, WavFrontendTokenizer
 
 
-# _GLOBAL_TOKEN = Qwen3_VITA_TOKEN()
+# _GLOBAL_TOKEN = Youtu_VITA_TOKEN_bus1()
 _GLOBAL_TOKEN = Youtu_VITA_TOKEN()
 
 
@@ -47,6 +47,7 @@ def _ensure_var_is_initialized(var, name):
 
 
 def get_audio_tokenizer(model_name_or_path_list, audio_tokenizer_type_list, flow_path=None, rank=None):
+
     if audio_tokenizer_type_list is None:
         audio_tokenizer_type_list = []
         model_name_or_path_list = []

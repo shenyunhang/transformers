@@ -23,6 +23,7 @@ import os
 import time
 import uuid
 from typing import Any, Callable, Optional, Tuple, Union
+import math
 
 import numpy as np
 import PIL.Image
@@ -281,7 +282,7 @@ class YoutuVITACNNAudioEmbeddings(nn.Module):
             dtype=torch.long,
             device=feature_lens.device,
         )
-        tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
+        tail_chunk_index = torch.nn.functional.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
         chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
         chunk_lengths[chunk_lengths == 0] = self.n_window * 2
 
@@ -296,9 +297,9 @@ class YoutuVITACNNAudioEmbeddings(nn.Module):
         # Split to chunk to avoid OOM during convolution
         padded_embeds = []
         for chunk in padded_feature.split(self.conv_chunksize, dim=0):
-            padded_embed = F.gelu(self.conv2d1(chunk))
-            padded_embed = F.gelu(self.conv2d2(padded_embed))
-            padded_embed = F.gelu(self.conv2d3(padded_embed))
+            padded_embed = torch.nn.functional.gelu(self.conv2d1(chunk))
+            padded_embed = torch.nn.functional.gelu(self.conv2d2(padded_embed))
+            padded_embed = torch.nn.functional.gelu(self.conv2d3(padded_embed))
             padded_embeds.append(padded_embed)
         padded_embed = torch.cat(padded_embeds, dim=0)
         b, c, f, t = padded_embed.size()
@@ -646,7 +647,7 @@ class YoutuVITAAudioLayerNorm(nn.LayerNorm):
         super().__init__(*args, **kwargs)
 
     def forward(self, input):
-        output = F.layer_norm(
+        output = torch.nn.functional.layer_norm(
             input.float(),
             self.normalized_shape,
             self.weight.float() if self.weight is not None else None,
@@ -1060,7 +1061,7 @@ def pad_and_reshape(A, M):
     pad_size = (M - (S % M)) % M
 
     # 2. Pad (0, 0) for D, and (0, pad_size) for S
-    # F.pad expects padding for dimensions in reverse order:
+    # torch.nn.functional.pad expects padding for dimensions in reverse order:
     # (last_dim_front, last_dim_back, second_to_last_front, second_to_last_back, ...)
     if pad_size > 0:
         A = torch.nn.functional.pad(A, (0, 0, 0, pad_size))
@@ -1600,7 +1601,7 @@ class YoutuVITAVisionEncoder(nn.Module):
             dim=0,
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0), value=0)
 
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
@@ -2032,9 +2033,10 @@ class DEFAULT_TOKEN:
 
         for field in fields(self):
             logger.info(f"♾️ {field.name} {getattr(self, field.name)}")
+            print(f"♾️ {field.name} {getattr(self, field.name)}")
 
 
-class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
+class Youtu_VITA_TOKEN_bus1(DEFAULT_TOKEN):
 
     IM_START = "<|begin_of_text|>"
     IM_END = "<|end_of_text|>"
@@ -2085,6 +2087,7 @@ class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
 
     def __init__(self):
         logger.info(f"♾️ {self.__class__.__name__=}")
+        print(f"♾️ {self.__class__.__name__=}")
         super().__init__()
 
         for i in range(2048):
@@ -2140,76 +2143,145 @@ class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
         )
 
 
-class Qwen3_VITA_TOKEN(DEFAULT_TOKEN):
-    IM_START = "<|im_start|>"
-    IM_END = "<|im_end|>"
+
+class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
+
+    IM_START = "<|begin_of_text|>"
+    IM_END = "<|end_of_text|>"
     USER = "user"
     ASSISTANT = "assistant"
     SYSTEM = "system"
 
     IMG_TAG_TOKEN = "<|image|>"
-    IMG_CONTEXT_TOKEN = "<|context_of_image|>"
-    IMG_START_TOKEN = "<|begin_of_image|>"
-    IMG_END_TOKEN = "<|end_of_image|>"
+    IMG_CONTEXT_TOKEN = "<|image_pad|>"
+    IMG_START_TOKEN = "<|vision_start|>"
+    IMG_END_TOKEN = "<|vision_end|>"
 
     VID_TAG_TOKEN = "<|video|>"
-    VID_CONTEXT_TOKEN = "<|context_of_video|>"
-    VID_START_TOKEN = "<|begin_of_video|>"
-    VID_END_TOKEN = "<|end_of_video|>"
-
-    PATCH_CONTEXT_TOKEN = "<|context_of_patch|>"
-    PATCH_START_TOKEN = "<|begin_of_patch|>"
-    PATCH_END_TOKEN = "<|end_of_patch|>"
+    VID_CONTEXT_TOKEN = "<|video_pad|>"
+    VID_START_TOKEN = "<|video_start|>"
+    VID_END_TOKEN = "<|video_end|>"
 
     AUD_TAG_TOKEN = "<|audio|>"
-    AUD_CONTEXT_TOKEN = "<|context_of_audio|>"
-    AUD_START_TOKEN = "<|begin_of_audio|>"
-    AUD_END_TOKEN = "<|end_of_audio|>"
+    AUD_CONTEXT_TOKEN = "<|audio_pad|>"
+    AUD_START_TOKEN = "<|audio_start|>"
+    AUD_END_TOKEN = "<|audio_end|>"
 
-    QUAD_START_TOKEN = "<|begin_of_quad|>"
-    QUAD_END_TOKEN = "<|end_of_quad|>"
-    REF_START_TOKEN = "<|begin_of_ref|>"
-    REF_END_TOKEN = "<|end_of_ref|>"
-    BOX_START_TOKEN = "<|begin_of_box|>"
-    BOX_END_TOKEN = "<|end_of_box|>"
+    THINK_START_TOKEN = "<think>"
+    THINK_END_TOKEN = "</think>"
+    CODE_START_TOKEN = "<code>"
+    CODE_END_TOKEN = "</code>"
+    ANSWER_START_TOKEN = "<answer>"
+    ANSWER_END_TOKEN = "</answer>"
+
+    TOOL_CALL_START_TOKEN = "<tool_call>"
+    TOOL_CALL_END_TOKEN = "</tool_call>"
+    TOOL_RESPONSE_START_TOKEN = "<tool_response>"
+    TOOL_RESPONSE_END_TOKEN = "</tool_response>"
+    
+    ACTION_START_TOKEN = "<action>"
+    ACTION_END_TOKEN = "</action>"
+    OPERATION_START_TOKEN = "<operation>"
+    OPERATION_END_TOKEN = "</operation>"
+    CLICK_TOKEN = "<click>"
+    MOVETO_TOKEN = "<moveTo>"
+    SCROLL_TOKEN = "<scroll>"
+    WRITE_TOKEN = "<write>"
+    DRAGTO_TOKEN = "<dragTo>"
+    KEYDOWN_TOKEN = "<keyDown>"
+    KEYUP_TOKEN = "<keyUp>"
+
+    POLY_START_TOKEN = "<poly>"
+    POLY_END_TOKEN = "</poly>"
+    INS_START_TOKEN = "<ins>"
+    INS_END_TOKEN = "</ins>"
+    CKPT_START_TOKEN = "<kpt>"
+    CKPT_END_TOKEN = "</kpt>"
+    BOX_START_TOKEN = "<box>"
+    BOX_END_TOKEN = "</box>"
+    REF_START_TOKEN = "<ref>"
+    REF_END_TOKEN = "</ref>"
+    FG_TOKEN = "<FG>"
+    BG_TOKEN = "<BG>"
+    OTHERS_TOKEN = "<OTHERS>"
 
     def __init__(self):
         logger.info(f"♾️ {self.__class__.__name__=}")
+        print(f"♾️ {self.__class__.__name__=}")
         super().__init__()
 
+        for i in range(2048):
+            for axis in ["x", "y"]:
+                setattr(self, f"{axis}_{i}_TOKEN", f"<{axis}_{i}>")
+
+        for i in range(1, 1001):
+            setattr(self, f"custom_{i}_TOKEN", f"<custom_{i}>")
+
     def get_special_tokens(self):
-        return [
-            self.IM_START,
-            self.IM_END,
-            # self.THINK_START_TOKEN,
-            # self.THINK_END_TOKEN,
-            # self.ANSWER_START_TOKEN,
-            # self.ANSWER_END_TOKEN,
-            self.IMG_START_TOKEN,
-            self.IMG_END_TOKEN,
-            self.IMG_CONTEXT_TOKEN,
-            self.VID_START_TOKEN,
-            self.VID_END_TOKEN,
-            self.VID_CONTEXT_TOKEN,
-            self.PATCH_START_TOKEN,
-            self.PATCH_END_TOKEN,
-            self.PATCH_CONTEXT_TOKEN,
-            self.AUD_START_TOKEN,
-            self.AUD_END_TOKEN,
-            self.AUD_CONTEXT_TOKEN,
-            self.QUAD_START_TOKEN,
-            self.QUAD_END_TOKEN,
-            self.REF_START_TOKEN,
-            self.REF_END_TOKEN,
-            self.BOX_START_TOKEN,
-            self.BOX_END_TOKEN,
-            self.IMG_TAG_TOKEN,
-            self.VID_TAG_TOKEN,
-            self.AUD_TAG_TOKEN,
-        ]
+        return (
+            [
+                self.IM_START,
+                self.IM_END,
+                
+                self.IMG_TAG_TOKEN,
+                self.IMG_CONTEXT_TOKEN,
+                self.IMG_START_TOKEN,
+                self.IMG_END_TOKEN,
+
+                self.VID_TAG_TOKEN,
+                self.VID_CONTEXT_TOKEN,
+                self.VID_START_TOKEN,
+                self.VID_END_TOKEN,
+                
+                self.AUD_TAG_TOKEN,
+                self.AUD_CONTEXT_TOKEN,
+                self.AUD_START_TOKEN,
+                self.AUD_END_TOKEN,
+
+                self.THINK_START_TOKEN,
+                self.THINK_END_TOKEN,
+                self.CODE_START_TOKEN,
+                self.CODE_END_TOKEN,
+                self.ANSWER_START_TOKEN,
+                self.ANSWER_END_TOKEN,
+                self.TOOL_CALL_START_TOKEN,
+                self.TOOL_CALL_END_TOKEN,
+                self.TOOL_RESPONSE_START_TOKEN,
+                self.TOOL_RESPONSE_END_TOKEN,
+            
+                self.ACTION_START_TOKEN,
+                self.ACTION_END_TOKEN,
+                self.OPERATION_START_TOKEN,
+                self.OPERATION_END_TOKEN,
+                self.CLICK_TOKEN,
+                self.MOVETO_TOKEN,
+                self.SCROLL_TOKEN,
+                self.WRITE_TOKEN,
+                self.DRAGTO_TOKEN,
+                self.KEYDOWN_TOKEN,
+                self.KEYUP_TOKEN,
+
+                self.POLY_START_TOKEN,
+                self.POLY_END_TOKEN,
+                self.INS_START_TOKEN,
+                self.INS_END_TOKEN,
+                self.CKPT_START_TOKEN,
+                self.CKPT_END_TOKEN,
+                self.BOX_START_TOKEN,
+                self.BOX_END_TOKEN,
+                self.REF_START_TOKEN,
+                self.REF_END_TOKEN,
+                self.FG_TOKEN,
+                self.BG_TOKEN,
+                self.OTHERS_TOKEN,     
+                
+            ]
+            + [getattr(self, f"{axis}_{i}_TOKEN") for i in range(2048) for axis in ["x", "y"]]
+            + [getattr(self, f"custom_{i}_TOKEN") for i in range(1, 1001)]
+        )
 
 
-# _GLOBAL_TOKEN = Qwen3_VITA_TOKEN()
+# _GLOBAL_TOKEN = Youtu_VITA_TOKEN_bus1()
 _GLOBAL_TOKEN = Youtu_VITA_TOKEN()
 
 

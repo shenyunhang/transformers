@@ -43,7 +43,7 @@ if is_torchaudio_available():
     import torchaudio
 
 
-# _GLOBAL_TOKEN = Qwen3_VITA_TOKEN()
+# _GLOBAL_TOKEN = Youtu_VITA_TOKEN_bus1()
 _GLOBAL_TOKEN = Youtu_VITA_TOKEN()
 
 
@@ -154,6 +154,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         return images, sample_fps, timestamps, duration_seconds
 
     def get_image_and_audio(self, video_file_or_dir, video_max_num_frames=8, video_max_fps=1):
+
         if isinstance(video_file_or_dir, str) and os.path.isfile(video_file_or_dir):
             mime_type, _ = mimetypes.guess_type(video_file_or_dir)
         else:
@@ -236,6 +237,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         return img_or_path_list, fps, timestamps, (audio, self.sampling_rate), duration_seconds
 
     def process_video(self, video_file_or_dir, video_max_num_frames=8, video_max_fps=1):
+
         images, fps, timestamps, (audio, sampling_rate), duration_seconds = self.get_image_and_audio(
             video_file_or_dir,
             video_max_num_frames=video_max_num_frames,
