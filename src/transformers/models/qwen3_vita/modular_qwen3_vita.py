@@ -2365,7 +2365,7 @@ class GLM4VoiceTokenizer:
         else:
             self.device = "cuda"
             # self.device = "cpu"
-        # self.device = "cpu"
+        self.device = "cpu"
 
         logger.info(f"{self.device=}")
 
@@ -2422,7 +2422,7 @@ class GLM4VoiceTokenizer:
     @torch.no_grad()
     # @torch.compiler.disable
     def decode(self, audio_tokens, option_steps=10, **kwargs):
-        if not hasattr(self, "whisper_model"):
+        if not hasattr(self, "audio_decoder"):
             self.load_model()
 
         this_uuid = str(uuid.uuid4())

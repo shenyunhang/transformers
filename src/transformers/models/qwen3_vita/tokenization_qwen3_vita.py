@@ -83,7 +83,7 @@ class GLM4VoiceTokenizer:
         else:
             self.device = "cuda"
             # self.device = "cpu"
-        # self.device = "cpu"
+        self.device = "cpu"
 
         logger.info(f"{self.device=}")
 
