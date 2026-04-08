@@ -78,6 +78,8 @@ else:
             ("vjepa2", "VJEPA2VideoProcessor"),
             ("youtu_vita", "YoutuVITAVideoProcessor"),
             ("qwen3_vita", "Qwen3VITAVideoProcessor"),
+            ("mamba3_vita", "Mamba3VITAVideoProcessor"),
+            ("mamba3_qwen3_vita", "Mamba3Qwen3VITAVideoProcessor"),
         ]
     )
 

@@ -708,6 +708,8 @@ MODEL_FOR_CAUSAL_LM_MAPPING_NAMES = OrderedDict(
         ("youtu", "YoutuForCausalLM"),
         ("youtu_vita", "YoutuVITAForCausalLM"),
         ("qwen3_vita", "Qwen3VITAForCausalLM"),
+        ("mamba3_vita", "Mamba3VITAForCausalLM"),
+        ("mamba3_qwen3_vita", "Mamba3Qwen3VITAForCausalLM"),
         ("zamba", "ZambaForCausalLM"),
         ("zamba2", "Zamba2ForCausalLM"),
     ]

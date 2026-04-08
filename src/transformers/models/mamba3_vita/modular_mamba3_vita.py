@@ -1,5 +1,5 @@
 
-"""PyTorch Qwen3-VITA model."""
+"""PyTorch Mamba3-VITA model."""
 
 import mimetypes
 import os
@@ -25,7 +25,7 @@ from ...modeling_utils import PreTrainedModel
 from ...models.whisper.feature_extraction_whisper import WhisperFeatureExtractor
 from ...processing_utils import ProcessingKwargs, ProcessorMixin, Unpack, VideosKwargs, AudioKwargs, ImagesKwargs
 from ...tokenization_utils_base import AudioInput, PreTokenizedInput, TextInput
-from ...utils import is_decord_available, is_flash_attn_2_available, is_torchaudio_available, logging
+from ...utils import TransformersKwargs, is_decord_available, is_flash_attn_2_available, is_torchaudio_available, logging
 from ...video_processing_utils import BaseVideoProcessor
 from ...video_utils import VideoInput
 from ..siglip2.configuration_siglip2 import Siglip2VisionConfig
@@ -40,6 +40,8 @@ from ..qwen3.modeling_qwen3 import (
     Qwen3RotaryEmbedding,
 )
 
+from ...utils.import_utils import is_mamba_ssm_available
+
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
     from flash_attn.layers.rotary import apply_rotary_emb
@@ -49,6 +51,10 @@ if is_decord_available():
 
 if is_torchaudio_available():
     import torchaudio
+
+if is_mamba_ssm_available():
+    from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as mamba3_mimo_combined
+    from mamba_ssm import Mamba3
 
 import ffmpeg
 from funasr.frontends.wav_frontend import WavFrontend
@@ -60,59 +66,32 @@ logger = logging.get_logger(__name__)
 
 
 
-class Qwen3VITAAudioConfig(PreTrainedConfig):
+class Mamba3VITAAudioConfig(PreTrainedConfig):
     r"""
-    Qwen3VITAAudioConfig
+    Mamba3VITAAudioConfig
     """
-    model_type = "qwen3_vita_audio"
+    model_type = "mamba3_vita_audio"
     base_config_key = "audio_config"
 
     def __init__(
         self,
         hidden_size=512,
-        attention_heads=4,
-        linear_units=2048,
-        num_blocks=50,
-        tp_blocks=20,
-        dropout_rate=0.0,
-        positional_dropout_rate=0.0,
-        attention_dropout_rate=0.0,
-        normalize_before=True,
-        kernel_size=11,
-        sanm_shfit=0,
-        input_size=560,
         temporal_merge_size=1,
         out_hidden_size=4608,
         merger_hidden_size=4608,
-        # CNN
-        num_mel_bins=128,
         downsample_hidden_size=512,
+        num_mel_bins=128,
         n_window=50,
         n_window_infer=800,
         conv_chunksize=500,
         **kwargs,
     ):
         super().__init__(**kwargs)
-
-        # SANM
-        self.input_size = input_size
-        self.attention_heads = attention_heads
-        self.linear_units = linear_units
-        self.num_blocks = num_blocks
-        self.tp_blocks = tp_blocks
-        self.dropout_rate = dropout_rate
-        self.positional_dropout_rate = positional_dropout_rate
-        self.attention_dropout_rate = attention_dropout_rate
-        self.normalize_before = normalize_before
-        self.kernel_size = kernel_size
-        self.sanm_shfit = sanm_shfit
-
         self.hidden_size = hidden_size
         self.temporal_merge_size = temporal_merge_size
         self.out_hidden_size = out_hidden_size
         self.merger_hidden_size = merger_hidden_size
 
-        # CNN
         self.downsample_hidden_size = downsample_hidden_size
         self.num_mel_bins = num_mel_bins
         self.n_window = n_window
@@ -121,19 +100,25 @@ class Qwen3VITAAudioConfig(PreTrainedConfig):
         self.num_hidden_layers = 0
 
 
-class Qwen3VITAVisionConfig(PreTrainedConfig):
+class Mamba3VITAVisionConfig(PreTrainedConfig):
     r"""
-    Qwen3VITAVisionConfig
+    Mamba3VITAVisionConfig
     """
-    model_type = "qwen3_vita_vision"
+    model_type = "mamba3_vita_vision"
     base_config_key = "vision_config"
-
+        
     def __init__(
         self,
-        hidden_size=768,
-        intermediate_size=3072,
+        hidden_size=1024,
+        d_state=128,
+        expand=2,
+        headdim=64,
+        is_mimo=False,
+        mimo_rank=4,
+        chunk_size=64,
+        is_outproj_norm=False,
+        intermediate_size=4096,
         num_hidden_layers=12,
-        num_attention_heads=12,
         num_channels=3,
         num_patches=256,
         patch_size=16,
@@ -143,41 +128,110 @@ class Qwen3VITAVisionConfig(PreTrainedConfig):
         spatial_merge_size=2,
         out_hidden_size=4608,
         merger_hidden_size=4608,
+        layer_type_list=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
         self.hidden_size = hidden_size
+        self.d_model = hidden_size
+        self.d_state = d_state
+        self.expand = expand
+        self.headdim = headdim
+        self.is_mimo = is_mimo
+        self.mimo_rank = mimo_rank
+        self.chunk_size = chunk_size
+        self.is_outproj_norm = is_outproj_norm
+
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
         self.num_channels = num_channels
-        self.patch_size = patch_size
-        self.attention_dropout = attention_dropout
-        self.layer_norm_eps = layer_norm_eps
-        self.hidden_act = hidden_act
         self.num_patches = num_patches
+        self.patch_size = patch_size
+        self.hidden_act = hidden_act
+        self.layer_norm_eps = layer_norm_eps
+        self.attention_dropout = attention_dropout
         self.spatial_merge_size = spatial_merge_size
         self.out_hidden_size = out_hidden_size
         self.merger_hidden_size = merger_hidden_size
 
+        
+        self.layer_type_list = layer_type_list
 
-class Qwen3VITATextConfig(Qwen3Config):
+
+class Mamba3VITATextConfig(PreTrainedConfig):
     r"""
-    Qwen3VITATextConfig
+    Mamba3VITATextConfig
     """
-    model_type = "qwen3_vita_text"
+    model_type = "mamba3_vita_text"
     base_config_key = "text_config"
-    pass
+    keys_to_ignore_at_inference = ["past_key_values"]
+    
+    def __init__(
+        self,
+        vocab_size: int | None = 151936,
+        hidden_size=1024,
+        d_state=128,
+        expand=2,
+        headdim=64,
+        is_mimo=False,
+        mimo_rank=4,
+        chunk_size=64,
+        is_outproj_norm=False,
+        intermediate_size=4096,
+        num_hidden_layers=24,
+        hidden_act: str | None = "silu",
+        max_position_embeddings: int | None = 32768,
+        initializer_range: float | None = 0.02,
+        rms_norm_eps: float | None = 1e-6,
+        use_cache: bool | None = True,
+        tie_word_embeddings: bool | None = False,
+        
+        attention_dropout: float | None = 0.0,
+        
+        pad_token_id: int | None = None,
+        bos_token_id: int | None = None,
+        eos_token_id: int | None = None,
 
+        layer_type_list=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
 
-class Qwen3VITAConfig(PreTrainedConfig):
+        self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
+
+        self.hidden_size = hidden_size
+        self.d_model = hidden_size
+        self.d_state = d_state
+        self.expand = expand
+        self.headdim = headdim
+        self.is_mimo = is_mimo
+        self.mimo_rank = mimo_rank
+        self.chunk_size = chunk_size
+        self.is_outproj_norm = is_outproj_norm
+
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.hidden_act = hidden_act
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.attention_dropout = attention_dropout
+
+        self.layer_type_list = layer_type_list
+
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.tie_word_embeddings = tie_word_embeddings
+
+class Mamba3VITAConfig(PreTrainedConfig):
     r"""
-    Qwen3VITAConfig
+    Mamba3VITAConfig
     """
 
-    model_type = "qwen3_vita"
-    sub_configs = {"audio_config": Qwen3VITAAudioConfig, "vision_config": Qwen3VITAVisionConfig, "text_config": Qwen3VITATextConfig}
+    model_type = "mamba3_vita"
+    sub_configs = {"audio_config": Mamba3VITAAudioConfig, "vision_config": Mamba3VITAVisionConfig, "text_config": Mamba3VITATextConfig}
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -235,8 +289,8 @@ def _get_feat_extract_output_lengths(input_lengths):
     return output_lengths
 
 
-class Qwen3VITACNNAudioEmbeddings(nn.Module):
-    def __init__(self, config: Qwen3VITAAudioConfig):
+class Mamba3VITACNNAudioEmbeddings(nn.Module):
+    def __init__(self, config: Mamba3VITAAudioConfig):
         super().__init__()
 
         self.config = config
@@ -293,9 +347,9 @@ class Qwen3VITACNNAudioEmbeddings(nn.Module):
         return hidden_states, aftercnn_lens
 
 
-class Qwen3VITACNNAudioEncoderLayer(nn.Module):
+class Mamba3VITACNNAudioEncoderLayer(nn.Module):
 
-    def __init__(self, config: Qwen3VITAAudioConfig):
+    def __init__(self, config: Mamba3VITAAudioConfig):
         super().__init__()
 
     def forward(
@@ -305,30 +359,29 @@ class Qwen3VITACNNAudioEncoderLayer(nn.Module):
         return hidden_states
 
 
-class Qwen3VITACNNAudioEncoder(nn.Module):
+class Mamba3VITACNNAudioEncoder(nn.Module):
 
-    def __init__(self, config: Qwen3VITAAudioConfig):
+    def __init__(self, config: Mamba3VITAAudioConfig):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList([
-            Qwen3VITACNNAudioEncoderLayer(config) for idx in range(config.num_hidden_layers)])
+            Mamba3VITACNNAudioEncoderLayer(config) for idx in range(config.num_hidden_layers)])
         self.gradient_checkpointing = True
 
     def forward(self, x):
-
         for idx, encoder_layer in enumerate(self.layers):
             x = encoder_layer(x)
         return x
 
 
-class Qwen3VITACNNAudio(nn.Module):
+class Mamba3VITACNNAudio(nn.Module):
 
-    def __init__(self, config: Qwen3VITAAudioConfig):
+    def __init__(self, config: Mamba3VITAAudioConfig):
         super().__init__()
         self.config = config
 
-        self.embeddings = Qwen3VITACNNAudioEmbeddings(config)
-        self.encoder = Qwen3VITACNNAudioEncoder(config)
+        self.embeddings = Mamba3VITACNNAudioEmbeddings(config)
+        self.encoder = Mamba3VITACNNAudioEncoder(config)
 
     def forward(self, audios):
 
@@ -344,697 +397,6 @@ class Qwen3VITACNNAudio(nn.Module):
         features = torch.nn.utils.rnn.pad_sequence(features, batch_first=True, padding_value=0.0)
 
         return features, feature_lengths
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-class Qwen3VITAAudioSinusoidalPositionEncoder(torch.nn.Module):
-    """ """
-
-    def __int__(self, d_model=80, dropout_rate=0.1):
-        pass
-
-    def encode(
-        self, positions: torch.Tensor = None, depth: int = None, dtype: torch.dtype = torch.float32
-    ):
-        batch_size = positions.size(0)
-        positions = positions.type(dtype)
-        device = positions.device
-        log_timescale_increment = torch.log(torch.tensor([10000], dtype=dtype, device=device)) / (
-            depth / 2 - 1
-        )
-        inv_timescales = torch.exp(
-            torch.arange(depth / 2, device=device).type(dtype) * (-log_timescale_increment)
-        )
-        inv_timescales = torch.reshape(inv_timescales, [batch_size, -1])
-        scaled_time = torch.reshape(positions, [1, -1, 1]) * torch.reshape(
-            inv_timescales, [1, 1, -1]
-        )
-        encoding = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=2)
-        return encoding.type(dtype)
-
-    def forward(self, x):
-        batch_size, timesteps, input_dim = x.size()
-        positions = torch.arange(1, timesteps + 1, device=x.device)[None, :]
-        position_encoding = self.encode(positions, input_dim, x.dtype).to(x.device)
-
-        return x + position_encoding
-
-
-class Qwen3VITAAudioPositionwiseFeedForward(torch.nn.Module):
-    """Positionwise feed forward layer.
-
-    Args:
-        idim (int): Input dimenstion.
-        hidden_units (int): The number of hidden units.
-        dropout_rate (float): Dropout rate.
-
-    """
-
-    def __init__(self, idim, hidden_units, dropout_rate, activation=torch.nn.ReLU()):
-        """Construct an PositionwiseFeedForward object."""
-        super(Qwen3VITAAudioPositionwiseFeedForward, self).__init__()
-        self.w_1 = torch.nn.Linear(idim, hidden_units)
-        self.w_2 = torch.nn.Linear(hidden_units, idim)
-        self.dropout = torch.nn.Dropout(dropout_rate)
-        self.activation = activation
-
-    def forward(self, x):
-        """Forward function."""
-        return self.w_2(self.dropout(self.activation(self.w_1(x))))
-
-
-class Qwen3VITAAudioMultiHeadedAttentionSANM(nn.Module):
-    """Multi-Head Attention layer.
-
-    Args:
-        n_head (int): The number of heads.
-        n_feat (int): The number of features.
-        dropout_rate (float): Dropout rate.
-
-    """
-
-    def __init__(
-        self,
-        n_head,
-        in_feat,
-        n_feat,
-        dropout_rate,
-        kernel_size,
-        sanm_shfit=0,
-        lora_list=None,
-        lora_rank=8,
-        lora_alpha=16,
-        lora_dropout=0.1,
-    ):
-        """Construct an MultiHeadedAttention object."""
-        super().__init__()
-        assert n_feat % n_head == 0
-        # We assume d_v always equals d_k
-        self.d_k = n_feat // n_head
-        self.h = n_head
-        # self.linear_q = nn.Linear(n_feat, n_feat)
-        # self.linear_k = nn.Linear(n_feat, n_feat)
-        # self.linear_v = nn.Linear(n_feat, n_feat)
-
-        self.linear_out = nn.Linear(n_feat, n_feat)
-        self.linear_q_k_v = nn.Linear(in_feat, n_feat * 3)
-        self.attn = None
-        self.dropout = nn.Dropout(p=dropout_rate)
-
-        self.fsmn_block = nn.Conv1d(
-            n_feat, n_feat, kernel_size, stride=1, padding=0, groups=n_feat, bias=False
-        )
-        # padding
-        left_padding = (kernel_size - 1) // 2
-        if sanm_shfit > 0:
-            left_padding = left_padding + sanm_shfit
-        right_padding = kernel_size - 1 - left_padding
-        self.pad_fn = nn.ConstantPad1d((left_padding, right_padding), 0.0)
-
-    def forward_fsmn(self, inputs, mask, mask_shfit_chunk=None):
-        b, t, d = inputs.size()
-        if mask is not None:
-            mask = torch.reshape(mask, (b, -1, 1))
-            if mask_shfit_chunk is not None:
-                mask = mask * mask_shfit_chunk
-            inputs = inputs * mask
-
-        x = inputs.transpose(1, 2)
-        x = self.pad_fn(x)
-        x = self.fsmn_block(x)
-        x = x.transpose(1, 2)
-        x += inputs
-        x = self.dropout(x)
-        if mask is not None:
-            x = x * mask
-        return x
-
-    def forward_qkv(self, x):
-        """Transform query, key and value.
-
-        Args:
-            query (torch.Tensor): Query tensor (#batch, time1, size).
-            key (torch.Tensor): Key tensor (#batch, time2, size).
-            value (torch.Tensor): Value tensor (#batch, time2, size).
-
-        Returns:
-            torch.Tensor: Transformed query tensor (#batch, n_head, time1, d_k).
-            torch.Tensor: Transformed key tensor (#batch, n_head, time2, d_k).
-            torch.Tensor: Transformed value tensor (#batch, n_head, time2, d_k).
-
-        """
-        b, t, d = x.size()
-        q_k_v = self.linear_q_k_v(x)
-        q, k, v = torch.split(q_k_v, int(self.h * self.d_k), dim=-1)
-        q_h = torch.reshape(q, (b, t, self.h, self.d_k)).transpose(
-            1, 2
-        )  # (batch, head, time1, d_k)
-        k_h = torch.reshape(k, (b, t, self.h, self.d_k)).transpose(
-            1, 2
-        )  # (batch, head, time2, d_k)
-        v_h = torch.reshape(v, (b, t, self.h, self.d_k)).transpose(
-            1, 2
-        )  # (batch, head, time2, d_k)
-
-        return q_h, k_h, v_h, v
-
-    def forward_attention(self, value, scores, mask, mask_att_chunk_encoder=None):
-        """Compute attention context vector.
-
-        Args:
-            value (torch.Tensor): Transformed value (#batch, n_head, time2, d_k).
-            scores (torch.Tensor): Attention score (#batch, n_head, time1, time2).
-            mask (torch.Tensor): Mask (#batch, 1, time2) or (#batch, time1, time2).
-
-        Returns:
-            torch.Tensor: Transformed value (#batch, time1, d_model)
-                weighted by the attention score (#batch, time1, time2).
-
-        """
-        n_batch = value.size(0)
-        if mask is not None:
-            if mask_att_chunk_encoder is not None:
-                mask = mask * mask_att_chunk_encoder
-
-            mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
-
-            min_value = -float(
-                "inf"
-            )  # float(numpy.finfo(torch.tensor(0, dtype=scores.dtype).numpy().dtype).min)
-            scores = scores.masked_fill(mask, min_value)
-            attn = torch.softmax(scores, dim=-1).masked_fill(
-                mask, 0.0
-            )  # (batch, head, time1, time2)
-        else:
-            attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
-
-        p_attn = self.dropout(attn)
-        x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
-        x = (
-            x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)
-        )  # (batch, time1, d_model)
-
-        return self.linear_out(x)  # (batch, time1, d_model)
-
-    def forward(self, x, mask, mask_shfit_chunk=None, mask_att_chunk_encoder=None):
-        """Compute scaled dot product attention.
-
-        Args:
-            query (torch.Tensor): Query tensor (#batch, time1, size).
-            key (torch.Tensor): Key tensor (#batch, time2, size).
-            value (torch.Tensor): Value tensor (#batch, time2, size).
-            mask (torch.Tensor): Mask tensor (#batch, 1, time2) or
-                (#batch, time1, time2).
-
-        Returns:
-            torch.Tensor: Output tensor (#batch, time1, d_model).
-
-        """
-        q_h, k_h, v_h, v = self.forward_qkv(x)
-        fsmn_memory = self.forward_fsmn(v, mask, mask_shfit_chunk)
-        q_h = q_h * self.d_k ** (-0.5)
-        scores = torch.matmul(q_h, k_h.transpose(-2, -1))
-        att_outs = self.forward_attention(v_h, scores, mask, mask_att_chunk_encoder)
-        return att_outs + fsmn_memory
-
-    def forward_chunk(self, x, cache=None, chunk_size=None, look_back=0):
-        """Compute scaled dot product attention.
-
-        Args:
-            query (torch.Tensor): Query tensor (#batch, time1, size).
-            key (torch.Tensor): Key tensor (#batch, time2, size).
-            value (torch.Tensor): Value tensor (#batch, time2, size).
-            mask (torch.Tensor): Mask tensor (#batch, 1, time2) or
-                (#batch, time1, time2).
-
-        Returns:
-            torch.Tensor: Output tensor (#batch, time1, d_model).
-
-        """
-        q_h, k_h, v_h, v = self.forward_qkv(x)
-        if chunk_size is not None and look_back > 0 or look_back == -1:
-            if cache is not None:
-                k_h_stride = k_h[:, :, : -(chunk_size[2]), :]
-                v_h_stride = v_h[:, :, : -(chunk_size[2]), :]
-                k_h = torch.cat((cache["k"], k_h), dim=2)
-                v_h = torch.cat((cache["v"], v_h), dim=2)
-
-                cache["k"] = torch.cat((cache["k"], k_h_stride), dim=2)
-                cache["v"] = torch.cat((cache["v"], v_h_stride), dim=2)
-                if look_back != -1:
-                    cache["k"] = cache["k"][:, :, -(look_back * chunk_size[1]) :, :]
-                    cache["v"] = cache["v"][:, :, -(look_back * chunk_size[1]) :, :]
-            else:
-                cache_tmp = {
-                    "k": k_h[:, :, : -(chunk_size[2]), :],
-                    "v": v_h[:, :, : -(chunk_size[2]), :],
-                }
-                cache = cache_tmp
-        fsmn_memory = self.forward_fsmn(v, None)
-        q_h = q_h * self.d_k ** (-0.5)
-        scores = torch.matmul(q_h, k_h.transpose(-2, -1))
-        att_outs = self.forward_attention(v_h, scores, None)
-        return att_outs + fsmn_memory, cache
-
-
-class Qwen3VITAAudioLayerNorm(nn.LayerNorm):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def forward(self, input):
-        output = torch.nn.functional.layer_norm(
-            input.float(),
-            self.normalized_shape,
-            self.weight.float() if self.weight is not None else None,
-            self.bias.float() if self.bias is not None else None,
-            self.eps,
-        )
-        return output.type_as(input)
-
-
-def sequence_mask(lengths, maxlen=None, dtype=torch.float32, device=None):
-    if maxlen is None:
-        maxlen = lengths.max()
-    row_vector = torch.arange(0, maxlen, 1).to(lengths.device)
-    matrix = torch.unsqueeze(lengths, dim=-1)
-    mask = row_vector < matrix
-    mask = mask.detach()
-
-    return mask.to(dtype).to(device) if device is not None else mask.to(dtype)
-    # return mask.type(dtype).to(device) if device is not None else mask.type(dtype)
-
-
-class Qwen3VITAAudioEncoderLayerSANM(nn.Module):
-    def __init__(
-        self,
-        in_size,
-        size,
-        self_attn,
-        feed_forward,
-        dropout_rate,
-        normalize_before=True,
-        concat_after=False,
-        stochastic_depth_rate=0.0,
-    ):
-        """Construct an EncoderLayer object."""
-        super(Qwen3VITAAudioEncoderLayerSANM, self).__init__()
-        self.self_attn = self_attn
-        self.feed_forward = feed_forward
-        self.norm1 = Qwen3VITAAudioLayerNorm(in_size)
-        self.norm2 = Qwen3VITAAudioLayerNorm(size)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.in_size = in_size
-        self.size = size
-        self.normalize_before = normalize_before
-        self.concat_after = concat_after
-        if self.concat_after:
-            self.concat_linear = nn.Linear(size + size, size)
-        self.stochastic_depth_rate = stochastic_depth_rate
-        self.dropout_rate = dropout_rate
-
-    def forward(self, x, mask, cache=None, mask_shfit_chunk=None, mask_att_chunk_encoder=None):
-        """Compute encoded features.
-
-        Args:
-            x_input (torch.Tensor): Input tensor (#batch, time, size).
-            mask (torch.Tensor): Mask tensor for the input (#batch, time).
-            cache (torch.Tensor): Cache tensor of the input (#batch, time - 1, size).
-
-        Returns:
-            torch.Tensor: Output tensor (#batch, time, size).
-            torch.Tensor: Mask tensor (#batch, time).
-
-        """
-
-        param_dtype = next(self.parameters()).dtype
-        param_device = next(self.parameters()).device
-        x = x.to(device=param_device, dtype=param_dtype)
-        mask = mask.to(device=param_device, dtype=param_dtype)
-
-        skip_layer = False
-        # with stochastic depth, residual connection `x + f(x)` becomes
-        # `x <- x + 1 / (1 - p) * f(x)` at training time.
-        stoch_layer_coeff = 1.0
-        if self.training and self.stochastic_depth_rate > 0:
-            skip_layer = torch.rand(1).item() < self.stochastic_depth_rate
-            stoch_layer_coeff = 1.0 / (1 - self.stochastic_depth_rate)
-
-        if skip_layer:
-            if cache is not None:
-                x = torch.cat([cache, x], dim=1)
-            return x, mask
-
-        residual = x
-        if self.normalize_before:
-            x = self.norm1(x)
-
-        if self.concat_after:
-            x_concat = torch.cat(
-                (
-                    x,
-                    self.self_attn(
-                        x,
-                        mask,
-                        mask_shfit_chunk=mask_shfit_chunk,
-                        mask_att_chunk_encoder=mask_att_chunk_encoder,
-                    ),
-                ),
-                dim=-1,
-            )
-            if self.in_size == self.size:
-                x = residual + stoch_layer_coeff * self.concat_linear(x_concat)
-            else:
-                x = stoch_layer_coeff * self.concat_linear(x_concat)
-        else:
-            if self.in_size == self.size:
-                x = residual + stoch_layer_coeff * self.dropout(
-                    self.self_attn(
-                        x,
-                        mask,
-                        mask_shfit_chunk=mask_shfit_chunk,
-                        mask_att_chunk_encoder=mask_att_chunk_encoder,
-                    )
-                )
-            else:
-                x = stoch_layer_coeff * self.dropout(
-                    self.self_attn(
-                        x,
-                        mask,
-                        mask_shfit_chunk=mask_shfit_chunk,
-                        mask_att_chunk_encoder=mask_att_chunk_encoder,
-                    )
-                )
-        if not self.normalize_before:
-            x = self.norm1(x)
-
-        residual = x
-        if self.normalize_before:
-            x = self.norm2(x)
-        x = residual + stoch_layer_coeff * self.dropout(self.feed_forward(x))
-        if not self.normalize_before:
-            x = self.norm2(x)
-
-        return x, mask, cache, mask_shfit_chunk, mask_att_chunk_encoder
-
-    def forward_chunk(self, x, cache=None, chunk_size=None, look_back=0):
-        """Compute encoded features.
-
-        Args:
-            x_input (torch.Tensor): Input tensor (#batch, time, size).
-            mask (torch.Tensor): Mask tensor for the input (#batch, time).
-            cache (torch.Tensor): Cache tensor of the input (#batch, time - 1, size).
-
-        Returns:
-            torch.Tensor: Output tensor (#batch, time, size).
-            torch.Tensor: Mask tensor (#batch, time).
-
-        """
-
-        residual = x
-        if self.normalize_before:
-            x = self.norm1(x)
-
-        if self.in_size == self.size:
-            attn, cache = self.self_attn.forward_chunk(x, cache, chunk_size, look_back)
-            x = residual + attn
-        else:
-            x, cache = self.self_attn.forward_chunk(x, cache, chunk_size, look_back)
-
-        if not self.normalize_before:
-            x = self.norm1(x)
-
-        residual = x
-        if self.normalize_before:
-            x = self.norm2(x)
-        x = residual + self.feed_forward(x)
-        if not self.normalize_before:
-            x = self.norm2(x)
-
-        return x, cache
-
-
-class Qwen3VITAAudioEncoder(nn.Module):
-    """
-    """
-
-    def __init__(
-        self,
-        input_size: int,
-        output_size: int = 256,
-        attention_heads: int = 4,
-        linear_units: int = 2048,
-        num_blocks: int = 6,
-        tp_blocks: int = 0,
-        dropout_rate: float = 0.1,
-        positional_dropout_rate: float = 0.1,
-        attention_dropout_rate: float = 0.0,
-        stochastic_depth_rate: float = 0.0,
-        normalize_before: bool = True,
-        concat_after: bool = False,
-        positionwise_layer_type: str = "linear",
-        positionwise_conv_kernel_size: int = 1,
-        kernel_size: int = 11,
-        sanm_shfit: int = 0,
-    ):
-        super().__init__()
-        self._output_size = output_size
-
-        self.embed = Qwen3VITAAudioSinusoidalPositionEncoder()
-
-        self.normalize_before = normalize_before
-
-        positionwise_layer = Qwen3VITAAudioPositionwiseFeedForward
-        positionwise_layer_args = (
-            output_size,
-            linear_units,
-            dropout_rate,
-        )
-
-        encoder_selfattn_layer = Qwen3VITAAudioMultiHeadedAttentionSANM
-        encoder_selfattn_layer_args0 = (
-            attention_heads,
-            input_size,
-            output_size,
-            attention_dropout_rate,
-            kernel_size,
-            sanm_shfit,
-        )
-        encoder_selfattn_layer_args = (
-            attention_heads,
-            output_size,
-            output_size,
-            attention_dropout_rate,
-            kernel_size,
-            sanm_shfit,
-        )
-
-        self.encoders0 = nn.ModuleList(
-            [
-                Qwen3VITAAudioEncoderLayerSANM(
-                    input_size,
-                    output_size,
-                    encoder_selfattn_layer(*encoder_selfattn_layer_args0),
-                    positionwise_layer(*positionwise_layer_args),
-                    dropout_rate,
-                )
-                for i in range(1)
-            ]
-        )
-        self.encoders = nn.ModuleList(
-            [
-                Qwen3VITAAudioEncoderLayerSANM(
-                    output_size,
-                    output_size,
-                    encoder_selfattn_layer(*encoder_selfattn_layer_args),
-                    positionwise_layer(*positionwise_layer_args),
-                    dropout_rate,
-                )
-                for i in range(num_blocks - 1)
-            ]
-        )
-
-        self.tp_encoders = nn.ModuleList(
-            [
-                Qwen3VITAAudioEncoderLayerSANM(
-                    output_size,
-                    output_size,
-                    encoder_selfattn_layer(*encoder_selfattn_layer_args),
-                    positionwise_layer(*positionwise_layer_args),
-                    dropout_rate,
-                )
-                for i in range(tp_blocks)
-            ]
-        )
-
-        self.after_norm = Qwen3VITAAudioLayerNorm(output_size)
-
-        self.tp_norm = Qwen3VITAAudioLayerNorm(output_size)
-
-    def output_size(self) -> int:
-        return self._output_size
-
-    def forward(
-        self,
-        xs_pad: torch.Tensor,
-        ilens: torch.Tensor,
-    ):
-        """Embed positions in tensor."""
-        masks = sequence_mask(ilens, dtype=torch.float32, device=ilens.device)[:, None, :]
-
-        xs_pad *= self.output_size() ** 0.5
-
-        xs_pad = self.embed(xs_pad)
-
-        # forward encoder1
-        for layer_idx, encoder_layer in enumerate(self.encoders0):
-            encoder_outs = encoder_layer(xs_pad, masks)
-            xs_pad, masks = encoder_outs[0], encoder_outs[1]
-
-        for layer_idx, encoder_layer in enumerate(self.encoders):
-            encoder_outs = encoder_layer(xs_pad, masks)
-            xs_pad, masks = encoder_outs[0], encoder_outs[1]
-
-        xs_pad = self.after_norm(xs_pad)
-
-        # forward encoder2
-        # olens = masks.squeeze(1).sum(1).int()
-        olens = (masks > 0.5).squeeze(1).sum(1).int()
-
-        for layer_idx, encoder_layer in enumerate(self.tp_encoders):
-            encoder_outs = encoder_layer(xs_pad, masks)
-            xs_pad, masks = encoder_outs[0], encoder_outs[1]
-
-        xs_pad = self.tp_norm(xs_pad)
-        return xs_pad, olens
-
-
-class Qwen3VITASANMAudio(nn.Module):
-    """
-    """
-
-    def __init__(
-        self,
-        config,
-        **kwargs,
-    ):
-
-        super().__init__()
-
-        encoder = Qwen3VITAAudioEncoder(
-            input_size=config.input_size,
-            output_size=config.hidden_size,
-            attention_heads=config.attention_heads,
-            linear_units=config.linear_units,
-            num_blocks=config.num_blocks,
-            tp_blocks=config.tp_blocks,
-            dropout_rate=config.dropout_rate,
-            positional_dropout_rate=config.positional_dropout_rate,
-            attention_dropout_rate=config.attention_dropout_rate,
-            normalize_before=config.normalize_before,
-            kernel_size=config.kernel_size,
-            sanm_shfit=config.sanm_shfit,
-        )
-        encoder_output_size = encoder.output_size()
-
-        self.encoder = encoder
-
-        self.encoder_output_size = encoder_output_size
-
-        self.lid_dict = {"auto": 0, "zh": 3, "en": 4, "yue": 7, "ja": 11, "ko": 12, "nospeech": 13}
-        self.lid_int_dict = {24884: 3, 24885: 4, 24888: 7, 24892: 11, 24896: 12, 24992: 13}
-        self.textnorm_dict = {"withitn": 14, "woitn": 15}
-        self.textnorm_int_dict = {25016: 14, 25017: 15}
-        self.embed = torch.nn.Embedding(7 + len(self.lid_dict) + len(self.textnorm_dict), config.input_size)
-        self.emo_dict = {"unk": 25009, "happy": 25001, "sad": 25002, "angry": 25003, "neutral": 25004}
-        
-    def forward(
-        self,
-        audios,
-        key: list = ["wav_file_tmp_name"],
-        language = "auto",
-        use_itn = False,
-        output_timestamp = False,
-        textnorm = None,
-    ):
-
-        speech = torch.nn.utils.rnn.pad_sequence(audios, batch_first=True, padding_value=0.0)
-        speech_lengths = torch.as_tensor([len(x) for x in audios])
-
-        # fbank
-        if len(speech.shape) < 3:
-            speech = speech[None, :, :]
-        if speech_lengths is None:
-            speech_lengths = speech.shape[1]
-
-        param_dtype = self.embed.weight.data.dtype
-        param_device = self.embed.weight.data.device
-        speech = speech.to(device=param_device, dtype=param_dtype)
-        speech_lengths = speech_lengths.to(device=param_device, dtype=torch.int64)
-
-        # language = kwargs.get("language", "auto")
-        language_query = self.embed(
-            torch.LongTensor(
-                [[self.lid_dict[language] if language in self.lid_dict else 0]]
-            ).to(speech.device)
-        ).repeat(speech.size(0), 1, 1)
-        
-        # use_itn = kwargs.get("use_itn", False)
-        # output_timestamp = kwargs.get("output_timestamp", False)
-
-        # textnorm = kwargs.get("text_norm", None)
-        if textnorm is None:
-            textnorm = "withitn" if use_itn else "woitn"
-        textnorm_query = self.embed(
-            torch.LongTensor([[self.textnorm_dict[textnorm]]]).to(speech.device)
-        ).repeat(speech.size(0), 1, 1)
-        speech = torch.cat((textnorm_query, speech), dim=1)
-        speech_lengths += 1
-
-        event_emo_query = self.embed(torch.LongTensor([[1, 2]]).to(speech.device)).repeat(
-            speech.size(0), 1, 1
-        )
-        input_query = torch.cat((language_query, event_emo_query), dim=1)
-        speech = torch.cat((input_query, speech), dim=1)
-        speech_lengths += 3
-
-        # Encoder
-        encoder_out, encoder_out_lens = self.encoder(speech, speech_lengths)
-        if isinstance(encoder_out, tuple):
-            encoder_out = encoder_out[0]
-
-        encoder_out = encoder_out[:, 4:, :]
-        encoder_out_lens = encoder_out_lens - 4
-        assert encoder_out.shape[0] == len(audios)
-
-        return encoder_out, encoder_out_lens
 
 
 def pad_and_reshape(A, M):
@@ -1056,8 +418,8 @@ def pad_and_reshape(A, M):
     return A.view(B, new_S // M, M, D).flatten(2)
 
 
-class Qwen3VITAAudioPatchMerger(nn.Module):
-    def __init__(self, config: Qwen3VITAAudioConfig) -> None:
+class Mamba3VITAAudioPatchMerger(nn.Module):
+    def __init__(self, config: Mamba3VITAAudioConfig) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size * (config.temporal_merge_size**1)
@@ -1074,8 +436,8 @@ class Qwen3VITAAudioPatchMerger(nn.Module):
         return x
 
 
-class Qwen3VITAVisionPatchMerger(nn.Module):
-    def __init__(self, config: Qwen3VITAVisionConfig) -> None:
+class Mamba3VITAVisionPatchMerger(nn.Module):
+    def __init__(self, config: Mamba3VITAVisionConfig) -> None:
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
@@ -1090,39 +452,159 @@ class Qwen3VITAVisionPatchMerger(nn.Module):
         return x
 
 
-class Qwen3VITATextRMSNorm(Qwen3RMSNorm):
+class Mamba3VITATextRMSNorm(Qwen3RMSNorm):
     pass
 
 
-class Qwen3VITATextRotaryEmbedding(Qwen3RotaryEmbedding):
+class Mamba3VITATextRotaryEmbedding(Qwen3RotaryEmbedding):
     pass
 
 
-class Qwen3VITATextMLP(Qwen3MLP):
+class Mamba3VITATextMLP(Qwen3MLP):
     pass
 
 
-class Qwen3VITATextAttention(Qwen3Attention):
-    pass
+class Mamba3VITATextMixer(nn.Module):
+    
+    def __init__(self, config: Mamba3VITATextConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.is_causal = False
+
+        self.d_model = config.d_model
+        self.d_state = config.d_state
+        self.expand = config.expand
+        self.headdim = config.headdim
+
+        self.is_mimo = config.is_mimo
+        self.mimo_rank = config.mimo_rank
+        self.chunk_size = config.chunk_size
+        self.is_outproj_norm = config.is_outproj_norm
+
+        self.d_inner = int(self.expand * self.d_model)
+
+        self.layer = Mamba3(
+            # This module uses roughly 6 * d_model^2 parameters
+            d_model=self.d_model, # Model dimension d_model
+            d_state=self.d_state,  # SSM state size
+            headdim=self.headdim, # SSM headdim
+            is_mimo=self.is_mimo, # Use MIMO mode
+            mimo_rank=self.mimo_rank, # MIMO rank when is_mimo=True
+            chunk_size=self.chunk_size, # 64/mimo_rank if x is in bf16, else 32/mimo_rank.
+            is_outproj_norm=self.is_outproj_norm, # Additional post SSM norm
+            dtype=torch.bfloat16,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Input shape: Batch x Time x Channel"""
+
+        input_ndim = hidden_states.dim()
+        if input_ndim == 3:
+            pass
+        elif input_ndim == 2:
+            # [seq_len, hidden_size] -> [1, seq_len, hidden_size]
+            hidden_states = hidden_states.unsqueeze(0)
+
+        y = self.layer(hidden_states, cu_seqlens=kwargs.get("cu_seqlens", None))
+
+        if input_ndim == 3:
+            pass
+        elif input_ndim == 2:
+            # [1, seq_len, hidden_size] -> [seq_len, hidden_size]
+            y = y.squeeze(0)
+        
+        attn_weights = None
+
+        return y, attn_weights
 
 
-class Qwen3VITATextDecoderLayer(Qwen3DecoderLayer):
-    pass
+class Mamba3VITATextDecoderLayer(GradientCheckpointingLayer):
+
+    def __init__(self, config: Mamba3VITATextConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        
+        self.layer_idx = layer_idx
+        self.layer_type = config.layer_type_list[layer_idx]
+
+        if self.layer_type == "M":
+            self.input_layernorm =  Mamba3VITATextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.mixer = Mamba3VITATextMixer(config=config, layer_idx=layer_idx)
+        elif self.layer_type == "-":
+            self.post_attention_layernorm = Mamba3VITATextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.mlp = Mamba3VITATextMLP(config)
+        else:
+            raise ValueError(f"Invalid layer type: {self.layer_type}")
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`):
+                Input to the layer of shape `(batch, seq_len, embed_dim)`.
+            attention_mask (`torch.FloatTensor`):
+                Attention mask of shape `(batch, 1, q_len, k_v_seq_len)` where padding elements are indicated by very large negative values.
+            output_attentions (`bool`, *optional*, defaults to `False`):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+        """
+        if self.layer_type == "M":
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, _ = self.mixer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+            hidden_states = residual + hidden_states
+        
+        elif self.layer_type == "-":
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+
+        else:
+            raise ValueError(f"Invalid layer type: {self.layer_type}")
+
+        return hidden_states
 
 
-class Qwen3VITAAudioPreTrainedModel(PreTrainedModel):
+class Mamba3VITAAudioPreTrainedModel(PreTrainedModel):
     _supports_flash_attn_2 = True
     _supports_sdpa = True
     pass
 
 
-class Qwen3VITAVisionPreTrainedModel(PreTrainedModel):
+class Mamba3VITAVisionPreTrainedModel(PreTrainedModel):
     _supports_flash_attn_2 = True
     _supports_sdpa = True
     pass
 
 
-class Qwen3VITAPreTrainedModel(PreTrainedModel):
+class Mamba3VITAPreTrainedModel(PreTrainedModel):
     _supports_flash_attn_2 = True
     _supports_sdpa = True
 
@@ -1137,22 +619,19 @@ class Qwen3VITAPreTrainedModel(PreTrainedModel):
                 init.zeros_(module.weight.data[module.padding_idx])
 
 
-class Qwen3VITAAudioModel(Qwen3VITAAudioPreTrainedModel):
-    config: Qwen3VITAAudioConfig
+class Mamba3VITAAudioModel(Mamba3VITAAudioPreTrainedModel):
+    config: Mamba3VITAAudioConfig
 
     def __init__(
         self,
-        config: Qwen3VITAAudioConfig,
+        config: Mamba3VITAAudioConfig,
         *inputs,
         **kwargs,
     ):
         super().__init__(config, *inputs, **kwargs)
 
-        if config.num_blocks == 0 and config.tp_blocks == 0:
-            self.model = Qwen3VITACNNAudio(config)
-        else:
-            self.model = Qwen3VITASANMAudio(config)
-        self.merger = Qwen3VITAAudioPatchMerger(config)
+        self.model = Mamba3VITACNNAudio(config)
+        self.merger = Mamba3VITAAudioPatchMerger(config)
     
     def forward(
         self,
@@ -1166,7 +645,7 @@ class Qwen3VITAAudioModel(Qwen3VITAAudioPreTrainedModel):
         return encoder_out, encoder_out_lens
 
 
-class Qwen3VITAVisionRotaryEmbedding(nn.Module):
+class Mamba3VITAVisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
         # inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
@@ -1185,8 +664,8 @@ class Qwen3VITAVisionRotaryEmbedding(nn.Module):
         return freqs
 
 
-class Qwen3VITAVisionEmbeddings(nn.Module):
-    def __init__(self, config: Qwen3VITAVisionConfig):
+class Mamba3VITAVisionEmbeddings(nn.Module):
+    def __init__(self, config: Mamba3VITAVisionConfig):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
@@ -1212,172 +691,38 @@ class Qwen3VITAVisionEmbeddings(nn.Module):
         return patch_embeds
 
 
-def vision_eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
+class Mamba3VITAVisionMixer(nn.Module):
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-
-    attn_output = torch.matmul(attn_weights, value)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
-
-
-def vision_apply_rotary_pos_emb_flashatt(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.chunk(2, dim=-1)[0].contiguous()
-    sin = sin.chunk(2, dim=-1)[0].contiguous()
-    q_embed = apply_rotary_emb(q.float(), cos.float(), sin.float()).type_as(q)
-    k_embed = apply_rotary_emb(k.float(), cos.float(), sin.float()).type_as(k)
-    return q_embed, k_embed
-
-
-# Copied from transformers.models.llama.modeling_llama.rotate_half
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def vision_apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
-    return q_embed, k_embed
-
-
-class Qwen3VITAVisionAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config: Qwen3VITAVisionConfig):
+    def __init__(self, config: Mamba3VITAVisionConfig):
         super().__init__()
+        
         self.config = config
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
-        if self.head_dim * self.num_heads != self.embed_dim:
-            raise ValueError(
-                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
-                f" {self.num_heads})."
-            )
-        self.scale = self.head_dim**-0.5
-        self.dropout = config.attention_dropout
         self.is_causal = False
 
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.d_model = config.d_model
+        self.d_state = config.d_state
+        self.expand = config.expand
+        self.headdim = config.headdim
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = False,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Input shape: Batch x Time x Channel"""
+        self.is_mimo = config.is_mimo
+        self.mimo_rank = config.mimo_rank
+        self.chunk_size = config.chunk_size
+        self.is_outproj_norm = config.is_outproj_norm
 
-        seq_length, embed_dim = hidden_states.shape
+        self.d_inner = int(self.expand * self.d_model)
 
-        queries = self.q_proj(hidden_states)
-        keys = self.k_proj(hidden_states)
-        values = self.v_proj(hidden_states)
-
-        queries = queries.view(seq_length, self.num_heads, self.head_dim)
-        keys = keys.view(seq_length, self.num_heads, self.head_dim)
-        values = values.view(seq_length, self.num_heads, self.head_dim)
-
-        cos, sin = position_embeddings
-        # print(f"{queries.size()=} {keys.size()=} {cos.size()=} {sin.size()=}")
-        queries, keys = vision_apply_rotary_pos_emb(queries, keys, cos, sin)
-
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-        assert self.config._attn_implementation == "flash_attention_2"
-        # print(f"{self.config._attn_implementation=}")
-
-        queries = queries.transpose(0, 1).unsqueeze(0)
-        keys = keys.transpose(0, 1).unsqueeze(0)
-        values = values.transpose(0, 1).unsqueeze(0)
-
-        attention_interface: Callable = vision_eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and output_attentions:
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            queries,
-            keys,
-            values,
-            attention_mask,
-            is_causal=self.is_causal,
-            scaling=self.scale,
-            dropout=0.0 if not self.training else self.dropout,
-            cu_seq_lens_q=cu_seqlens,
-            cu_seq_lens_k=cu_seqlens,
-            max_length_q=max_seqlen,
-            max_length_k=max_seqlen,
+        self.layer = Mamba3(
+            # This module uses roughly 6 * d_model^2 parameters
+            d_model=self.d_model, # Model dimension d_model
+            d_state=self.d_state,  # SSM state size
+            headdim=self.headdim, # SSM headdim
+            is_mimo=self.is_mimo, # Use MIMO mode
+            mimo_rank=self.mimo_rank, # MIMO rank when is_mimo=True
+            chunk_size=self.chunk_size, # 64/mimo_rank if x is in bf16, else 32/mimo_rank.
+            is_outproj_norm=self.is_outproj_norm, # Additional post SSM norm
+            dtype=torch.bfloat16,
         )
 
-        attn_output = attn_output.reshape(seq_length, embed_dim).contiguous()
-        attn_output = self.out_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights
-
-class Qwen3VITAVisionFlashAttention2(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
-
-    def __init__(self, config: Qwen3VITAVisionConfig):
-        super().__init__()
-        self.config = config
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads
-        if self.head_dim * self.num_heads != self.embed_dim:
-            raise ValueError(
-                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
-                f" {self.num_heads})."
-            )
-        self.scale = self.head_dim**-0.5
-        self.dropout = config.attention_dropout
-        self.is_causal = False
-
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1388,41 +733,18 @@ class Qwen3VITAVisionFlashAttention2(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Input shape: Batch x Time x Channel"""
 
-        seq_length, embed_dim = hidden_states.shape
+        y = self.layer(hidden_states.unsqueeze(0), cu_seqlens=cu_seqlens).squeeze(0)
+        attn_weights = None
 
-        queries = self.q_proj(hidden_states)
-        keys = self.k_proj(hidden_states)
-        values = self.v_proj(hidden_states)
+        return y, attn_weights
 
-        queries = queries.view(seq_length, self.num_heads, self.head_dim)
-        keys = keys.view(seq_length, self.num_heads, self.head_dim)
-        values = values.view(seq_length, self.num_heads, self.head_dim)
-
-        cos, sin = position_embeddings
-        # print(f"{queries.size()=} {keys.size()=} {cos.size()=} {sin.size()=}")
-        queries, keys = vision_apply_rotary_pos_emb_flashatt(queries.unsqueeze(0), keys.unsqueeze(0), cos, sin)
-        queries = queries.squeeze(0)
-        keys = keys.squeeze(0)
-
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-        if is_aiter_available:
-            attn_output = flash_attn_varlen_func(queries, keys, values, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, return_lse=True)[0].reshape(
-                seq_length, -1
-            )
-        else:
-            attn_output = flash_attn_varlen_func(queries, keys, values, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
-                seq_length, -1
-            )
-        attn_output = self.out_proj(attn_output)
-        return attn_output, None
-
-class Qwen3VITAVisionMLP(nn.Module):
+class Mamba3VITAVisionMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.activation_fn = ACT2FN[config.hidden_act]
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.fc1(hidden_states)
@@ -1431,15 +753,23 @@ class Qwen3VITAVisionMLP(nn.Module):
         return hidden_states
 
 
-class Qwen3VITAVisionEncoderLayer(nn.Module):
-    def __init__(self, config: Qwen3VITAVisionConfig):
+class Mamba3VITAVisionEncoderLayer(nn.Module):
+    def __init__(self, config: Mamba3VITAVisionConfig, layer_idx: int):
         super().__init__()
         self.embed_dim = config.hidden_size
-        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        # self.self_attn = Qwen3VITAVisionAttention(config)
-        self.self_attn = Qwen3VITAVisionFlashAttention2(config)
-        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.mlp = Qwen3VITAVisionMLP(config)
+        
+        self.layer_idx = layer_idx
+        self.layer_type = config.layer_type_list[layer_idx]
+        if self.layer_type == "M":
+            # self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.layer_norm1 = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.mixer = Mamba3VITAVisionMixer(config)
+        elif self.layer_type == "-":
+            # self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.layer_norm2 = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.mlp = Mamba3VITAVisionMLP(config)
+        else:
+            raise ValueError(f"Invalid layer type: {self.layer_type}")
 
     def forward(
         self,
@@ -1459,22 +789,26 @@ class Qwen3VITAVisionEncoderLayer(nn.Module):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
         """
-        residual = hidden_states
+        if self.layer_type == "M":
+            residual = hidden_states
+            hidden_states = self.layer_norm1(hidden_states)
+            hidden_states, attn_weights = self.mixer(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+            )
+            hidden_states = residual + hidden_states
 
-        hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-            cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
-        )
-        hidden_states = residual + hidden_states
+        elif self.layer_type == "-":
+            residual = hidden_states
+            hidden_states = self.layer_norm2(hidden_states)
+            hidden_states = self.mlp(hidden_states)
+            hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        else:
+            raise ValueError(f"Invalid layer type: {self.layer_type}")
 
         outputs = (hidden_states,)
 
@@ -1483,19 +817,19 @@ class Qwen3VITAVisionEncoderLayer(nn.Module):
 
         return outputs
 
-class Qwen3VITAVisionEncoder(nn.Module):
+class Mamba3VITAVisionEncoder(nn.Module):
     """
     Transformer encoder consisting of `config.num_hidden_layers` self attention layers. Each layer is a
-    [`Qwen3VITAVisionEncoderLayer`].
+    [`Mamba3VITAVisionEncoderLayer`].
 
     Args:
-        config: Qwen3VITAVisionConfig
+        config: Mamba3VITAVisionConfig
     """
 
-    def __init__(self, config: Qwen3VITAVisionConfig):
+    def __init__(self, config: Mamba3VITAVisionConfig):
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([Qwen3VITAVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([Mamba3VITAVisionEncoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
         self.spatial_merge_size = 2
@@ -1503,7 +837,7 @@ class Qwen3VITAVisionEncoder(nn.Module):
         self.patch_size = config.patch_size
         # self.window_size = self.patch_size * 2 * 8
 
-        self.rotary_pos_emb = Qwen3VITAVisionRotaryEmbedding(config.hidden_size // config.num_attention_heads // 2)
+        # self.rotary_pos_emb = Mamba3VITAVisionRotaryEmbedding(config.hidden_size // config.num_attention_heads // 2)
 
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
@@ -1575,10 +909,10 @@ class Qwen3VITAVisionEncoder(nn.Module):
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        # rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        # emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        # position_embeddings = (emb.cos(), emb.sin())
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
@@ -1597,7 +931,7 @@ class Qwen3VITAVisionEncoder(nn.Module):
                     attention_mask,
                     output_attentions,
                     cu_seqlens,
-                    position_embeddings,
+                    # position_embeddings,
                 )
             else:
                 layer_outputs = encoder_layer(
@@ -1605,7 +939,7 @@ class Qwen3VITAVisionEncoder(nn.Module):
                     attention_mask,
                     output_attentions=output_attentions,
                     cu_seqlens=cu_seqlens, 
-                    position_embeddings=position_embeddings
+                    # position_embeddings=position_embeddings
                 )
 
             hidden_states = layer_outputs[0]
@@ -1623,19 +957,19 @@ class Qwen3VITAVisionEncoder(nn.Module):
         )
 
 
-class Qwen3VITAVisionModel(Qwen3VITAVisionPreTrainedModel):
+class Mamba3VITAVisionModel(Mamba3VITAVisionPreTrainedModel):
     _input_embed_layer = "patch_embedding"
-    config: Qwen3VITAVisionConfig
+    config: Mamba3VITAVisionConfig
 
     def __init__(self, config, *inputs, **kwargs) -> None:
         super().__init__(config, *inputs, **kwargs)
         self.config = config
         embed_dim = config.hidden_size
 
-        self.embeddings = Qwen3VITAVisionEmbeddings(config)
-        self.encoder = Qwen3VITAVisionEncoder(config)
+        self.embeddings = Mamba3VITAVisionEmbeddings(config)
+        self.encoder = Mamba3VITAVisionEncoder(config)
 
-        self.merger = Qwen3VITAVisionPatchMerger(config)
+        self.merger = Mamba3VITAVisionPatchMerger(config)
 
     def forward(
         self,
@@ -1687,16 +1021,104 @@ class Qwen3VITAVisionModel(Qwen3VITAVisionPreTrainedModel):
         )
 
 
-class Qwen3VITATextModel(Qwen3VITAPreTrainedModel, Qwen3Model):
-    config: Qwen3VITATextConfig
+class Mamba3VITATextModel(Mamba3VITAPreTrainedModel):
+    config: Mamba3VITATextConfig
 
-
-class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
-    def __init__(self, config: Qwen3VITAConfig):
+    def __init__(self, config: Mamba3VITATextConfig):
         super().__init__(config)
-        self.audio_model = Qwen3VITAAudioModel._from_config(config.audio_config)
-        self.vision_model = Qwen3VITAVisionModel._from_config(config.vision_config)
-        self.language_model = Qwen3VITATextModel._from_config(config.text_config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [Mamba3VITATextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = Mamba3VITATextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # self.rotary_emb = Mamba3VITATextRotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
+        # self.has_sliding_layers = "sliding_attention" in self.config.layer_types
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    @check_model_inputs
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPast:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        # # It may already have been prepared by e.g. `generate`
+        # if not isinstance(causal_mask_mapping := attention_mask, dict):
+        #     # Prepare mask arguments
+        #     mask_kwargs = {
+        #         "config": self.config,
+        #         "input_embeds": inputs_embeds,
+        #         "attention_mask": attention_mask,
+        #         "cache_position": cache_position,
+        #         "past_key_values": past_key_values,
+        #         "position_ids": position_ids,
+        #     }
+        #     # Create the masks
+        #     causal_mask_mapping = {
+        #         "full_attention": create_causal_mask(**mask_kwargs),
+        #     }
+        #     # The sliding window alternating layers are not always activated depending on the config
+        #     if self.has_sliding_layers:
+        #         causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+
+        hidden_states = inputs_embeds
+        # position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                # attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                # position_embeddings=position_embeddings,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+        hidden_states = self.norm(hidden_states)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+        )
+
+
+class Mamba3VITAModel(Mamba3VITAPreTrainedModel):
+    def __init__(self, config: Mamba3VITAConfig):
+        super().__init__(config)
+        self.audio_model = Mamba3VITAAudioModel._from_config(config.audio_config)
+        self.vision_model = Mamba3VITAVisionModel._from_config(config.vision_config)
+        self.language_model = Mamba3VITATextModel._from_config(config.text_config)
 
     def get_input_embeddings(self):
         return self.language_model.embed_tokens
@@ -1867,14 +1289,14 @@ class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
 
 
 
-class Qwen3VITAForCausalLM(Qwen3VITAPreTrainedModel, GenerationMixin):
+class Mamba3VITAForCausalLM(Mamba3VITAPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
-    def __init__(self, config: Qwen3VITAConfig):
+    def __init__(self, config: Mamba3VITAConfig):
         super().__init__(config)
-        self.model = Qwen3VITAModel(config)
+        self.model = Mamba3VITAModel(config)
         self.vocab_size = config.text_config.vocab_size
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
 
@@ -2019,115 +1441,8 @@ class DEFAULT_TOKEN:
             print(f"♾️ {field.name} {getattr(self, field.name)}")
 
 
-class Qwen3_VITA_TOKEN_bus1(DEFAULT_TOKEN):
 
-    IM_START = "<|begin_of_text|>"
-    IM_END = "<|end_of_text|>"
-    USER = "user"
-    ASSISTANT = "assistant"
-    SYSTEM = "system"
-
-    THINK_START_TOKEN = "<think>"
-    THINK_END_TOKEN = "</think>"
-    CODE_START_TOKEN = "<code>"
-    CODE_END_TOKEN = "</code>"
-    ANSWER_START_TOKEN = "<answer>"
-    ANSWER_END_TOKEN = "</answer>"
-
-    TOOL_CALL_START_TOKEN = "<tool_call>"
-    TOOL_CALL_END_TOKEN = "</tool_call>"
-    TOOL_RESPONSE_START_TOKEN = "<tool_response>"
-    TOOL_RESPONSE_END_TOKEN = "</tool_response>"
-
-    IMG_TAG_TOKEN = "<|image|>"
-    IMG_CONTEXT_TOKEN = "<|image_pad|>"
-    IMG_START_TOKEN = "<|vision_start|>"
-    IMG_END_TOKEN = "<|vision_end|>"
-
-    VID_TAG_TOKEN = "<|video|>"
-    VID_CONTEXT_TOKEN = "<|video_pad|>"
-    VID_START_TOKEN = "<|video_start|>"
-    VID_END_TOKEN = "<|video_end|>"
-
-    AUD_TAG_TOKEN = "<|audio|>"
-    AUD_CONTEXT_TOKEN = "<|audio_pad|>"
-    AUD_START_TOKEN = "<|audio_start|>"
-    AUD_END_TOKEN = "<|audio_end|>"
-
-    POLY_START_TOKEN = "<poly>"
-    POLY_END_TOKEN = "</poly>"
-    INS_START_TOKEN = "<ins>"
-    INS_END_TOKEN = "</ins>"
-    CKPT_START_TOKEN = "<kpt>"
-    CKPT_END_TOKEN = "</kpt>"
-    BOX_START_TOKEN = "<box>"
-    BOX_END_TOKEN = "</box>"
-    REF_START_TOKEN = "<ref>"
-    REF_END_TOKEN = "</ref>"
-    FG_TOKEN = "<FG>"
-    BG_TOKEN = "<BG>"
-    OTHERS_TOKEN = "<OTHERS>"
-
-    def __init__(self):
-        logger.info(f"♾️ {self.__class__.__name__=}")
-        print(f"♾️ {self.__class__.__name__=}")
-        super().__init__()
-
-        for i in range(2048):
-            for axis in ["x", "y"]:
-                setattr(self, f"{axis}_{i}_TOKEN", f"<{axis}_{i}>")
-
-        for i in range(1, 1001):
-            setattr(self, f"custom_{i}_TOKEN", f"<custom_{i}>")
-
-    def get_special_tokens(self):
-        return (
-            [getattr(self, f"{axis}_{i}_TOKEN") for i in range(2048) for axis in ["x", "y"]]
-            + [getattr(self, f"custom_{i}_TOKEN") for i in range(1, 1001)]
-            + [
-                self.POLY_START_TOKEN,
-                self.POLY_END_TOKEN,
-                self.INS_START_TOKEN,
-                self.INS_END_TOKEN,
-                self.CKPT_START_TOKEN,
-                self.CKPT_END_TOKEN,
-                self.BOX_START_TOKEN,
-                self.BOX_END_TOKEN,
-                self.REF_START_TOKEN,
-                self.REF_END_TOKEN,
-                self.FG_TOKEN,
-                self.BG_TOKEN,
-                self.OTHERS_TOKEN,
-                self.THINK_START_TOKEN,
-                self.THINK_END_TOKEN,
-                self.CODE_START_TOKEN,
-                self.CODE_END_TOKEN,
-                self.ANSWER_START_TOKEN,
-                self.ANSWER_END_TOKEN,
-                self.TOOL_CALL_START_TOKEN,
-                self.TOOL_CALL_END_TOKEN,
-                self.TOOL_RESPONSE_START_TOKEN,
-                self.TOOL_RESPONSE_END_TOKEN,
-                self.IM_START,
-                self.IM_END,
-                self.IMG_TAG_TOKEN,
-                self.IMG_CONTEXT_TOKEN,
-                self.IMG_START_TOKEN,
-                self.IMG_END_TOKEN,
-                self.VID_TAG_TOKEN,
-                self.VID_CONTEXT_TOKEN,
-                self.VID_START_TOKEN,
-                self.VID_END_TOKEN,
-                self.AUD_TAG_TOKEN,
-                self.AUD_CONTEXT_TOKEN,
-                self.AUD_START_TOKEN,
-                self.AUD_END_TOKEN,
-            ]
-        )
-
-
-
-class Qwen3_VITA_TOKEN(DEFAULT_TOKEN):
+class Mamba3_VITA_TOKEN(DEFAULT_TOKEN):
 
     IM_START = "<|begin_of_text|>"
     IM_END = "<|end_of_text|>"
@@ -2264,8 +1579,7 @@ class Qwen3_VITA_TOKEN(DEFAULT_TOKEN):
         )
 
 
-# _GLOBAL_TOKEN = Qwen3_VITA_TOKEN_bus1()
-_GLOBAL_TOKEN = Qwen3_VITA_TOKEN()
+_GLOBAL_TOKEN = Mamba3_VITA_TOKEN()
 
 
 def get_token():
@@ -2276,9 +1590,6 @@ def get_token():
 def _ensure_var_is_initialized(var, name):
     """Make sure the input variable is not None."""
     assert var is not None, "{} is not initialized.".format(name)
-
-
-
 
 
 
@@ -2496,10 +1807,6 @@ class GLM4VoiceTokenizer:
                     all_speech_tokens[idx].extend(speech_token)
 
             return all_speech_tokens
-
-
-
-
 
 
 
@@ -3057,7 +2364,7 @@ def get_vision_tokenizer(model_name_or_path_list, vision_tokenizer_type_list, ra
     return vision_tokenizer
 
 
-class Qwen3VITAImagesKwargs(ImagesKwargs, total=False):
+class Mamba3VITAImagesKwargs(ImagesKwargs, total=False):
     """
     """
     discrete_image_idxs: list
@@ -3069,7 +2376,7 @@ class Qwen3VITAImagesKwargs(ImagesKwargs, total=False):
     image_max_num_tokens: int
 
 
-class Qwen3VITAAudioKwargs(AudioKwargs, total=False):
+class Mamba3VITAAudioKwargs(AudioKwargs, total=False):
     """
     """
     discrete_audio_idxs: list
@@ -3080,7 +2387,7 @@ class Qwen3VITAAudioKwargs(AudioKwargs, total=False):
     # audio_tokenizer_type: str
     # audio_tokenizer_path: str
 
-class Qwen3VITAVideosKwargs(VideosKwargs, total=False):
+class Mamba3VITAVideosKwargs(VideosKwargs, total=False):
     """
     """
     vision_resolution_type: str
@@ -3097,10 +2404,10 @@ class Qwen3VITAVideosKwargs(VideosKwargs, total=False):
     use_vision_in_video: bool
 
 
-class Qwen3VITAProcessorKwargs(ProcessingKwargs, total=False):
-    images_kwargs: Qwen3VITAImagesKwargs
-    videos_kwargs: Qwen3VITAVideosKwargs
-    audio_kwargs: Qwen3VITAAudioKwargs
+class Mamba3VITAProcessorKwargs(ProcessingKwargs, total=False):
+    images_kwargs: Mamba3VITAImagesKwargs
+    videos_kwargs: Mamba3VITAVideosKwargs
+    audio_kwargs: Mamba3VITAAudioKwargs
 
     _defaults = {
         "text_kwargs": {
@@ -3136,9 +2443,9 @@ class Qwen3VITAProcessorKwargs(ProcessingKwargs, total=False):
     }
 
 
-class Qwen3VITAFeatureExtractor(SequenceFeatureExtractor):
+class Mamba3VITAFeatureExtractor(SequenceFeatureExtractor):
     model_input_names = ["pixel_values", "image_grid_thw"]
-    valid_kwargs = Qwen3VITAAudioKwargs
+    valid_kwargs = Mamba3VITAAudioKwargs
 
     def __init__(
         self,
@@ -3533,9 +2840,9 @@ def has_audio(video_path):
         return False
 
 
-class Qwen3VITAVideoProcessor(BaseVideoProcessor):
+class Mamba3VITAVideoProcessor(BaseVideoProcessor):
     model_input_names = ["pixel_values", "image_grid_thw"]
-    valid_kwargs = Qwen3VITAVideosKwargs
+    valid_kwargs = Mamba3VITAVideosKwargs
 
 
     def __init__(
@@ -4273,9 +3580,9 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
 
 
 
-class Qwen3VITAImageProcessor(BaseImageProcessor):
+class Mamba3VITAImageProcessor(BaseImageProcessor):
     model_input_names = ["images", "image_indices", "image_grid_thw"]
-    valid_kwargs = Qwen3VITAImagesKwargs
+    valid_kwargs = Mamba3VITAImagesKwargs
 
     def __init__(
         self,
@@ -5097,7 +4404,7 @@ def get_image_size_for_max_num_patches(
 
 
 
-class Qwen3VITAProcessor(ProcessorMixin):
+class Mamba3VITAProcessor(ProcessorMixin):
     def __init__(
         self, image_processor=None, video_processor=None, feature_extractor=None, tokenizer=None, chat_template=None
     ):
@@ -5115,7 +4422,7 @@ class Qwen3VITAProcessor(ProcessorMixin):
         images: ImageInput | None = None,
         videos: VideoInput | None = None,
         audio: AudioInput | None = None,
-        **kwargs: Unpack[Qwen3VITAProcessorKwargs],
+        **kwargs: Unpack[Mamba3VITAProcessorKwargs],
     ) -> BatchFeature:
         audios = audio
         logger.debug(f"{text=}")
@@ -5128,7 +4435,7 @@ class Qwen3VITAProcessor(ProcessorMixin):
             raise ValueError("You need to specify either a `text` input to process.")
 
         output_kwargs = self._merge_kwargs(
-            Qwen3VITAProcessorKwargs,
+            Mamba3VITAProcessorKwargs,
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
             **kwargs,
         )
@@ -5247,13 +4554,13 @@ class Qwen3VITAProcessor(ProcessorMixin):
 
 
 __all__ = [
-    "Qwen3VITAConfig",
-    "Qwen3VITAPreTrainedModel",
-    "Qwen3VITAModel",
-    "Qwen3VITAForCausalLM",
-    "Qwen3VITAProcessor",
-    "Qwen3VITAImageProcessor",
-    "Qwen3VITAVideoProcessor",
-    "Qwen3VITAFeatureExtractor",
+    "Mamba3VITAConfig",
+    "Mamba3VITAPreTrainedModel",
+    "Mamba3VITAModel",
+    "Mamba3VITAForCausalLM",
+    "Mamba3VITAProcessor",
+    "Mamba3VITAImageProcessor",
+    "Mamba3VITAVideoProcessor",
+    "Mamba3VITAFeatureExtractor",
 ]
 

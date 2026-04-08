@@ -226,6 +226,8 @@ else:
             ("yolos", ("YolosImageProcessor", "YolosImageProcessorFast")),
             ("youtu_vita", ("YoutuVITAImageProcessor", None)),
             ("qwen3_vita", ("Qwen3VITAImageProcessor", None)),
+            ("mamba3_vita", ("Mamba3VITAImageProcessor", None)),
+            ("mamba3_qwen3_vita", ("Mamba3Qwen3VITAImageProcessor", None)),
             ("zoedepth", ("ZoeDepthImageProcessor", "ZoeDepthImageProcessorFast")),
         ]
     )

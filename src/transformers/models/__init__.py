@@ -433,6 +433,8 @@ if TYPE_CHECKING:
     from .youtu import *
     from .youtu_vita import *
     from .qwen3_vita import *
+    from .mamba3_vita import *
+    from .mamba3_qwen3_vita import *
     from .zamba import *
     from .zamba2 import *
     from .zoedepth import *

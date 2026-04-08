@@ -167,6 +167,8 @@ PROCESSOR_MAPPING_NAMES = OrderedDict(
         ("xclip", "XCLIPProcessor"),
         ("youtu_vita", "YoutuVITAProcessor"),
         ("qwen3_vita", "Qwen3VITAProcessor"),
+        ("mamba3_vita", "Mamba3VITAProcessor"),
+        ("mamba3_qwen3_vita", "Mamba3Qwen3VITAProcessor"),
     ]
 )
 
