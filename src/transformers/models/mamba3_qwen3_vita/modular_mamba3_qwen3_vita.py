@@ -137,36 +137,54 @@ class Mamba3Qwen3VITAVisionConfig(PreTrainedConfig):
 
     def __init__(
         self,
-        hidden_size=768,
-        intermediate_size=3072,
+        hidden_size=1024,
+        d_state=128,
+        expand=2,
+        headdim=64,
+        is_mimo=False,
+        mimo_rank=4,
+        chunk_size=64,
+        is_outproj_norm=False,
+        intermediate_size=4096,
         num_hidden_layers=12,
-        num_attention_heads=12,
         num_channels=3,
         num_patches=256,
         patch_size=16,
-        hidden_act="gelu_pytorch_tanh",
+        hidden_act="silu",
         layer_norm_eps=1e-6,
         attention_dropout=0.0,
         spatial_merge_size=2,
         out_hidden_size=4608,
         merger_hidden_size=4608,
+        layer_type_list=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
         self.hidden_size = hidden_size
+        self.d_model = hidden_size
+        self.d_state = d_state
+        self.expand = expand
+        self.headdim = headdim
+        self.is_mimo = is_mimo
+        self.mimo_rank = mimo_rank
+        self.chunk_size = chunk_size
+        self.is_outproj_norm = is_outproj_norm
+
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
         self.num_channels = num_channels
-        self.patch_size = patch_size
-        self.attention_dropout = attention_dropout
-        self.layer_norm_eps = layer_norm_eps
-        self.hidden_act = hidden_act
         self.num_patches = num_patches
+        self.patch_size = patch_size
+        self.hidden_act = hidden_act
+        self.layer_norm_eps = layer_norm_eps
+        self.attention_dropout = attention_dropout
         self.spatial_merge_size = spatial_merge_size
         self.out_hidden_size = out_hidden_size
         self.merger_hidden_size = merger_hidden_size
+
+        
+        self.layer_type_list = layer_type_list
 
 
 class Mamba3Qwen3VITATextConfig(Qwen3Config):
@@ -1278,18 +1296,19 @@ class Mamba3Qwen3VITAVisionMixer(nn.Module):
 
     def __init__(self, config: Mamba3Qwen3VITAVisionConfig):
         super().__init__()
+        
         self.config = config
         self.is_causal = False
 
-        self.d_model = 1024
-        self.d_state = 128
-        self.expand = 2
-        self.headdim = 64
+        self.d_model = config.d_model
+        self.d_state = config.d_state
+        self.expand = config.expand
+        self.headdim = config.headdim
 
-        self.is_mimo = False
-        self.mimo_rank = 4
-        self.chunk_size = 64
-        self.is_outproj_norm = False
+        self.is_mimo = config.is_mimo
+        self.mimo_rank = config.mimo_rank
+        self.chunk_size = config.chunk_size
+        self.is_outproj_norm = config.is_outproj_norm
 
         self.d_inner = int(self.expand * self.d_model)
 
@@ -1320,35 +1339,37 @@ class Mamba3Qwen3VITAVisionMixer(nn.Module):
 
         return y, attn_weights
 
-class Mamba3Qwen3VITAVisionMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.activation_fn = ACT2FN[config.hidden_act]
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+# class Mamba3Qwen3VITAVisionMLP(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.config = config
+#         self.activation_fn = ACT2FN[config.hidden_act]
+#         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+#         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc2(hidden_states)
-        return hidden_states
+#     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+#         hidden_states = self.fc1(hidden_states)
+#         hidden_states = self.activation_fn(hidden_states)
+#         hidden_states = self.fc2(hidden_states)
+#         return hidden_states
 
+class Mamba3Qwen3VITAVisionMLP(Qwen3MLP):
+    pass
+
+class Mamba3Qwen3VITAVisionRMSNorm(Qwen3RMSNorm):
+    pass
 
 class Mamba3Qwen3VITAVisionEncoderLayer(nn.Module):
-    def __init__(self, config: Mamba3Qwen3VITAVisionConfig, layer_number: int):
+    def __init__(self, config: Mamba3Qwen3VITAVisionConfig, layer_idx: int):
         super().__init__()
-        self.embed_dim = config.hidden_size
         
-        self.layer_number = layer_number
-        self.layer_type = config.layer_type_list[layer_number]
+        self.layer_idx = layer_idx
+        self.layer_type = config.layer_type_list[layer_idx]
         if self.layer_type == "M":
-            # self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-            self.layer_norm1 = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.input_layernorm = Mamba3Qwen3VITAVisionRMSNorm(config.hidden_size, eps=config.layer_norm_eps)
             self.mixer = Mamba3Qwen3VITAVisionMixer(config)
         elif self.layer_type == "-":
-            # self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-            self.layer_norm2 = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.post_attention_layernorm = Mamba3Qwen3VITAVisionRMSNorm(config.hidden_size, eps=config.layer_norm_eps)
             self.mlp = Mamba3Qwen3VITAVisionMLP(config)
         else:
             raise ValueError(f"Invalid layer type: {self.layer_type}")
@@ -1371,9 +1392,11 @@ class Mamba3Qwen3VITAVisionEncoderLayer(nn.Module):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
         """
+        print(f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.mean()=}")
         if self.layer_type == "M":
             residual = hidden_states
-            hidden_states = self.layer_norm1(hidden_states)
+            hidden_states = self.input_layernorm(hidden_states)
+            print(f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.mean()=}")
             hidden_states, attn_weights = self.mixer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -1385,13 +1408,15 @@ class Mamba3Qwen3VITAVisionEncoderLayer(nn.Module):
 
         elif self.layer_type == "-":
             residual = hidden_states
-            hidden_states = self.layer_norm2(hidden_states)
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            print(f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.mean()=}")
             hidden_states = self.mlp(hidden_states)
             hidden_states = residual + hidden_states
 
         else:
             raise ValueError(f"Invalid layer type: {self.layer_type}")
 
+        print(f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.mean()=}")
         outputs = (hidden_states,)
 
         if output_attentions:
@@ -1411,7 +1436,7 @@ class Mamba3Qwen3VITAVisionEncoder(nn.Module):
     def __init__(self, config: Mamba3Qwen3VITAVisionConfig):
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([Mamba3Qwen3VITAVisionEncoderLayer(config, layer_number) for layer_number in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([Mamba3Qwen3VITAVisionEncoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
         self.spatial_merge_size = 2

@@ -81,36 +81,53 @@ class Mamba3Qwen3VITAVisionConfig(PreTrainedConfig):
 
     def __init__(
         self,
-        hidden_size=768,
-        intermediate_size=3072,
+        hidden_size=1024,
+        d_state=128,
+        expand=2,
+        headdim=64,
+        is_mimo=False,
+        mimo_rank=4,
+        chunk_size=64,
+        is_outproj_norm=False,
+        intermediate_size=4096,
         num_hidden_layers=12,
-        num_attention_heads=12,
         num_channels=3,
         num_patches=256,
         patch_size=16,
-        hidden_act="gelu_pytorch_tanh",
+        hidden_act="silu",
         layer_norm_eps=1e-6,
         attention_dropout=0.0,
         spatial_merge_size=2,
         out_hidden_size=4608,
         merger_hidden_size=4608,
+        layer_type_list=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
         self.hidden_size = hidden_size
+        self.d_model = hidden_size
+        self.d_state = d_state
+        self.expand = expand
+        self.headdim = headdim
+        self.is_mimo = is_mimo
+        self.mimo_rank = mimo_rank
+        self.chunk_size = chunk_size
+        self.is_outproj_norm = is_outproj_norm
+
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
         self.num_channels = num_channels
-        self.patch_size = patch_size
-        self.attention_dropout = attention_dropout
-        self.layer_norm_eps = layer_norm_eps
-        self.hidden_act = hidden_act
         self.num_patches = num_patches
+        self.patch_size = patch_size
+        self.hidden_act = hidden_act
+        self.layer_norm_eps = layer_norm_eps
+        self.attention_dropout = attention_dropout
         self.spatial_merge_size = spatial_merge_size
         self.out_hidden_size = out_hidden_size
         self.merger_hidden_size = merger_hidden_size
+
+        self.layer_type_list = layer_type_list
 
 
 class Mamba3Qwen3VITATextConfig(PreTrainedConfig):

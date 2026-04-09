@@ -66,7 +66,7 @@ class Mamba3VITAVisionConfig(PreTrainedConfig):
         num_channels=3,
         num_patches=256,
         patch_size=16,
-        hidden_act="gelu_pytorch_tanh",
+        hidden_act="silu",
         layer_norm_eps=1e-6,
         attention_dropout=0.0,
         spatial_merge_size=2,

@@ -1264,18 +1264,19 @@ class Mamba3Qwen3VITAVisionEmbeddings(nn.Module):
 class Mamba3Qwen3VITAVisionMixer(nn.Module):
     def __init__(self, config: Mamba3Qwen3VITAVisionConfig):
         super().__init__()
+
         self.config = config
         self.is_causal = False
 
-        self.d_model = 1024
-        self.d_state = 128
-        self.expand = 2
-        self.headdim = 64
+        self.d_model = config.d_model
+        self.d_state = config.d_state
+        self.expand = config.expand
+        self.headdim = config.headdim
 
-        self.is_mimo = False
-        self.mimo_rank = 4
-        self.chunk_size = 64
-        self.is_outproj_norm = False
+        self.is_mimo = config.is_mimo
+        self.mimo_rank = config.mimo_rank
+        self.chunk_size = config.chunk_size
+        self.is_outproj_norm = config.is_outproj_norm
 
         self.d_inner = int(self.expand * self.d_model)
 
@@ -1311,31 +1312,50 @@ class Mamba3Qwen3VITAVisionMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.activation_fn = ACT2FN[config.hidden_act]
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
+
+@use_kernel_forward_from_hub("RMSNorm")
+class Mamba3Qwen3VITAVisionRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        """
+        Mamba3Qwen3VITAVisionRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc2(hidden_states)
-        return hidden_states
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 class Mamba3Qwen3VITAVisionEncoderLayer(nn.Module):
-    def __init__(self, config: Mamba3Qwen3VITAVisionConfig, layer_number: int):
+    def __init__(self, config: Mamba3Qwen3VITAVisionConfig, layer_idx: int):
         super().__init__()
-        self.embed_dim = config.hidden_size
 
-        self.layer_number = layer_number
-        self.layer_type = config.layer_type_list[layer_number]
+        self.layer_idx = layer_idx
+        self.layer_type = config.layer_type_list[layer_idx]
         if self.layer_type == "M":
-            # self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-            self.layer_norm1 = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.input_layernorm = Mamba3Qwen3VITAVisionRMSNorm(config.hidden_size, eps=config.layer_norm_eps)
             self.mixer = Mamba3Qwen3VITAVisionMixer(config)
         elif self.layer_type == "-":
-            # self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-            self.layer_norm2 = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.post_attention_layernorm = Mamba3Qwen3VITAVisionRMSNorm(config.hidden_size, eps=config.layer_norm_eps)
             self.mlp = Mamba3Qwen3VITAVisionMLP(config)
         else:
             raise ValueError(f"Invalid layer type: {self.layer_type}")
@@ -1358,9 +1378,15 @@ class Mamba3Qwen3VITAVisionEncoderLayer(nn.Module):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
         """
+        print(
+            f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.mean()=}"
+        )
         if self.layer_type == "M":
             residual = hidden_states
-            hidden_states = self.layer_norm1(hidden_states)
+            hidden_states = self.input_layernorm(hidden_states)
+            print(
+                f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.mean()=}"
+            )
             hidden_states, attn_weights = self.mixer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -1372,13 +1398,19 @@ class Mamba3Qwen3VITAVisionEncoderLayer(nn.Module):
 
         elif self.layer_type == "-":
             residual = hidden_states
-            hidden_states = self.layer_norm2(hidden_states)
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            print(
+                f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.mean()=}"
+            )
             hidden_states = self.mlp(hidden_states)
             hidden_states = residual + hidden_states
 
         else:
             raise ValueError(f"Invalid layer type: {self.layer_type}")
 
+        print(
+            f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.mean()=}"
+        )
         outputs = (hidden_states,)
 
         if output_attentions:
@@ -1400,10 +1432,7 @@ class Mamba3Qwen3VITAVisionEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
-            [
-                Mamba3Qwen3VITAVisionEncoderLayer(config, layer_number)
-                for layer_number in range(config.num_hidden_layers)
-            ]
+            [Mamba3Qwen3VITAVisionEncoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.gradient_checkpointing = False
 

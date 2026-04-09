@@ -122,7 +122,7 @@ class Mamba3VITAVisionConfig(PreTrainedConfig):
         num_channels=3,
         num_patches=256,
         patch_size=16,
-        hidden_act="gelu_pytorch_tanh",
+        hidden_act="silu",
         layer_norm_eps=1e-6,
         attention_dropout=0.0,
         spatial_merge_size=2,
@@ -565,6 +565,7 @@ class Mamba3VITATextDecoderLayer(GradientCheckpointingLayer):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
         """
+        print(f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.mean()=}")
         if self.layer_type == "M":
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -588,6 +589,7 @@ class Mamba3VITATextDecoderLayer(GradientCheckpointingLayer):
 
         else:
             raise ValueError(f"Invalid layer type: {self.layer_type}")
+        print(f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.mean()=}")
 
         return hidden_states
 
@@ -761,11 +763,9 @@ class Mamba3VITAVisionEncoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.layer_type = config.layer_type_list[layer_idx]
         if self.layer_type == "M":
-            # self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
             self.layer_norm1 = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
             self.mixer = Mamba3VITAVisionMixer(config)
         elif self.layer_type == "-":
-            # self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
             self.layer_norm2 = nn.RMSNorm(self.embed_dim, eps=config.layer_norm_eps)
             self.mlp = Mamba3VITAVisionMLP(config)
         else:
