@@ -20,49 +20,22 @@ class Mamba3Qwen3VITAAudioConfig(PreTrainedConfig):
     def __init__(
         self,
         hidden_size=512,
-        attention_heads=4,
-        linear_units=2048,
-        num_blocks=50,
-        tp_blocks=20,
-        dropout_rate=0.0,
-        positional_dropout_rate=0.0,
-        attention_dropout_rate=0.0,
-        normalize_before=True,
-        kernel_size=11,
-        sanm_shfit=0,
-        input_size=560,
         temporal_merge_size=1,
         out_hidden_size=4608,
         merger_hidden_size=4608,
-        # CNN
-        num_mel_bins=128,
         downsample_hidden_size=512,
+        num_mel_bins=128,
         n_window=50,
         n_window_infer=800,
         conv_chunksize=500,
         **kwargs,
     ):
         super().__init__(**kwargs)
-
-        # SANM
-        self.input_size = input_size
-        self.attention_heads = attention_heads
-        self.linear_units = linear_units
-        self.num_blocks = num_blocks
-        self.tp_blocks = tp_blocks
-        self.dropout_rate = dropout_rate
-        self.positional_dropout_rate = positional_dropout_rate
-        self.attention_dropout_rate = attention_dropout_rate
-        self.normalize_before = normalize_before
-        self.kernel_size = kernel_size
-        self.sanm_shfit = sanm_shfit
-
         self.hidden_size = hidden_size
         self.temporal_merge_size = temporal_merge_size
         self.out_hidden_size = out_hidden_size
         self.merger_hidden_size = merger_hidden_size
 
-        # CNN
         self.downsample_hidden_size = downsample_hidden_size
         self.num_mel_bins = num_mel_bins
         self.n_window = n_window

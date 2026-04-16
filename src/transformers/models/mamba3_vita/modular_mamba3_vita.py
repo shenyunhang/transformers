@@ -155,7 +155,6 @@ class Mamba3VITAVisionConfig(PreTrainedConfig):
         self.out_hidden_size = out_hidden_size
         self.merger_hidden_size = merger_hidden_size
 
-        
         self.layer_type_list = layer_type_list
 
 
@@ -565,7 +564,7 @@ class Mamba3VITATextDecoderLayer(GradientCheckpointingLayer):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
         """
-        print(f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.mean()=}")
+        # print(f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.abs().mean()=}")
         if self.layer_type == "M":
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -589,7 +588,7 @@ class Mamba3VITATextDecoderLayer(GradientCheckpointingLayer):
 
         else:
             raise ValueError(f"Invalid layer type: {self.layer_type}")
-        print(f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.mean()=}")
+        # print(f"{self.layer_idx=} {self.layer_type=} {hidden_states.shape=} {hidden_states.max()=} {hidden_states.min()=} {hidden_states.abs().mean()=}")
 
         return hidden_states
 

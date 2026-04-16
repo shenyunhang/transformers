@@ -1800,8 +1800,8 @@ class Qwen3VITATextModel(Qwen3VITAPreTrainedModel):
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        # print(f"Qwen3VITATextModel input {hidden_states.shape=} {hidden_states.abs().max()=} {hidden_states.abs().mean()=}")
+        for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -1812,7 +1812,7 @@ class Qwen3VITATextModel(Qwen3VITAPreTrainedModel):
                 cache_position=cache_position,
                 **kwargs,
             )
-
+            # print(f"Qwen3VITATextModel {layer_idx=} {hidden_states.shape=} {hidden_states.abs().max()=} {hidden_states.abs().mean()=}")
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
