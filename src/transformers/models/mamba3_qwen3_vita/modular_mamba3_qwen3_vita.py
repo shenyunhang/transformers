@@ -1769,8 +1769,11 @@ class MelFilterBankTokenizer:
 
         if isinstance(audio_or_path, tuple):
             audio, sampling_rate = audio_or_path
-        else:
+        elif isinstance(audio_or_path, str):
             audio, sampling_rate = torchaudio.load(audio_or_path)
+        else:
+            audio = torch.tensor(audio_or_path)
+            sampling_rate = self.sampling_rate
         # print(f"{audio_or_path=} {audio.size()=} {sampling_rate=}")
         if audio.dim() == 2:
             audio = audio.mean(0)
