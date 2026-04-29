@@ -101,6 +101,7 @@ else:
             ("lighton_ocr", {"torchvision": "PixtralImageProcessor", "pil": "PixtralImageProcessorPil"}),
             ("llava_next_video", {"torchvision": "LlavaNextImageProcessor", "pil": "LlavaNextImageProcessorPil"}),
             ("lw_detr", {"torchvision": "DeformableDetrImageProcessor", "pil": "DeformableDetrImageProcessorPil"}),
+            ("mamba3_vita", {"pil": "Mamba3VITAImageProcessor"}),
             ("metaclip_2", {"torchvision": "CLIPImageProcessor", "pil": "CLIPImageProcessorPil"}),
             ("mgp-str", {"torchvision": "ViTImageProcessor", "pil": "ViTImageProcessorPil"}),
             ("mistral3", {"torchvision": "PixtralImageProcessor", "pil": "PixtralImageProcessorPil"}),
@@ -128,6 +129,7 @@ else:
             ("qwen3_5", {"torchvision": "Qwen2VLImageProcessor", "pil": "Qwen2VLImageProcessorPil"}),
             ("qwen3_5_moe", {"torchvision": "Qwen2VLImageProcessor", "pil": "Qwen2VLImageProcessorPil"}),
             ("qwen3_omni_moe", {"torchvision": "Qwen2VLImageProcessor", "pil": "Qwen2VLImageProcessorPil"}),
+            ("qwen3_vita", {"pil": "Qwen3VITAImageProcessor"}),
             ("qwen3_vl", {"torchvision": "Qwen2VLImageProcessor", "pil": "Qwen2VLImageProcessorPil"}),
             ("regnet", {"torchvision": "ConvNextImageProcessor", "pil": "ConvNextImageProcessorPil"}),
             ("resnet", {"torchvision": "ConvNextImageProcessor", "pil": "ConvNextImageProcessorPil"}),
@@ -156,6 +158,7 @@ else:
             ("vit_msn", {"torchvision": "ViTImageProcessor", "pil": "ViTImageProcessorPil"}),
             ("vivit", {"torchvision": "VivitImageProcessor"}),
             ("xclip", {"torchvision": "CLIPImageProcessor", "pil": "CLIPImageProcessorPil"}),
+            ("youtu_vita", {"pil": "YoutuVITAImageProcessor"}),
         ]
     )
 
