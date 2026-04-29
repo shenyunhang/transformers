@@ -239,6 +239,7 @@ if TYPE_CHECKING:
     from .m2m_100 import *
     from .mamba import *
     from .mamba2 import *
+    from .mamba3_vita import *
     from .marian import *
     from .markuplm import *
     from .mask2former import *
@@ -356,6 +357,7 @@ if TYPE_CHECKING:
     from .qwen3_omni_moe import *
     from .qwen3_vl import *
     from .qwen3_vl_moe import *
+    from .qwen3_vita import *
     from .rag import *
     from .recurrent_gemma import *
     from .reformer import *
@@ -470,6 +472,7 @@ if TYPE_CHECKING:
     from .yolos import *
     from .yoso import *
     from .youtu import *
+    from .youtu_vita import *
     from .zamba import *
     from .zamba2 import *
     from .zoedepth import *

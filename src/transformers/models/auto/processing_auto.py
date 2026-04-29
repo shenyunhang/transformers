@@ -116,6 +116,7 @@ else:
             ("llava_next", "LlavaNextProcessor"),
             ("llava_next_video", "LlavaNextVideoProcessor"),
             ("llava_onevision", "LlavaOnevisionProcessor"),
+            ("mamba3_vita", "Mamba3VITAProcessor"),
             ("markuplm", "MarkupLMProcessor"),
             ("metaclip_2", "CLIPProcessor"),
             ("mgp-str", "MgpstrProcessor"),
@@ -149,6 +150,7 @@ else:
             ("qwen3_5", "Qwen3VLProcessor"),
             ("qwen3_5_moe", "Qwen3VLProcessor"),
             ("qwen3_omni_moe", "Qwen3OmniMoeProcessor"),
+            ("qwen3_vita", "Qwen3VITAProcessor"),
             ("qwen3_vl", "Qwen3VLProcessor"),
             ("qwen3_vl_moe", "Qwen3VLProcessor"),
             ("sam", "SamProcessor"),
@@ -185,6 +187,7 @@ else:
             ("wavlm", "Wav2Vec2Processor"),
             ("whisper", "WhisperProcessor"),
             ("xclip", "XCLIPProcessor"),
+            ("youtu_vita", "YoutuVITAProcessor"),
         ]
     )
 
