@@ -750,6 +750,8 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
         past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.FloatTensor:
+        if self.layer_type == "linear_attention":
+            return hidden_states
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)

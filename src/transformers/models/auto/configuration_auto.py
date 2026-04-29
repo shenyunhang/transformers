@@ -533,6 +533,9 @@ CONFIG_MAPPING_NAMES = OrderedDict[str, str](
         ("zamba", "ZambaConfig"),
         ("zamba2", "Zamba2Config"),
         ("zoedepth", "ZoeDepthConfig"),
+        ("mamba3_vita", "Mamba3VITAConfig"),
+        ("qwen3_vita", "Qwen3VITAConfig"),
+        ("youtu_vita", "YoutuVITAConfig"),
     ]
 )
 
@@ -1072,6 +1075,9 @@ MODEL_NAMES_MAPPING = OrderedDict[str, str](
         ("zamba", "Zamba"),
         ("zamba2", "Zamba2"),
         ("zoedepth", "ZoeDepth"),
+        ("mamba3_vita", "Mamba3VITA"),
+        ("qwen3_vita", "Qwen3VITA"),
+        ("youtu_vita", "YoutuVITA"),
     ]
 )
 
