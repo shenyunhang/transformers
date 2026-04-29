@@ -182,6 +182,9 @@ else:
             ("wavlm", "Wav2Vec2Processor"),
             ("whisper", "WhisperProcessor"),
             ("xclip", "XCLIPProcessor"),
+            ("mamba3_vita", "Mamba3VITAProcessor"),
+            ("qwen3_vita", "Qwen3VITAProcessor"),
+            ("youtu_vita", "YoutuVITAProcessor"),
         ]
     )
 

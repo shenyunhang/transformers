@@ -267,6 +267,9 @@ else:
             ("xclip", {"torchvision": "CLIPImageProcessor", "pil": "CLIPImageProcessorPil"}),
             ("yolos", {"torchvision": "YolosImageProcessor", "pil": "YolosImageProcessorPil"}),
             ("zoedepth", {"torchvision": "ZoeDepthImageProcessor", "pil": "ZoeDepthImageProcessorPil"}),
+            ("mamba3_vita", {"torchvision": "Mamba3VITAImageProcessor", "pil": "Mamba3VITAImageProcessorPil"}),
+            ("qwen3_vita", {"torchvision": "Qwen3VITAImageProcessor", "pil": "Qwen3VITAImageProcessorPil"}),
+            ("youtu_vita", {"torchvision": "YoutuVITAImageProcessor", "pil": "YoutuVITAImageProcessorPil"}),
         ]
     )
 

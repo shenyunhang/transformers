@@ -465,6 +465,7 @@ if TYPE_CHECKING:
     from .zamba import *
     from .zamba2 import *
     from .zoedepth import *
+    from .mamba3_vita import *
 else:
     import sys
 
