@@ -15,13 +15,13 @@ from .modeling_qwen3_vita import Qwen3_VITA_TOKEN, Qwen3VITAAudioKwargs
 from .tokenization_qwen3_vita import AudioTokenizer, GLM4VoiceTokenizer, MelFilterBankTokenizer, WavFrontendTokenizer
 
 
-# _GLOBAL_TOKEN = Qwen3_VITA_TOKEN_bus1()
-_GLOBAL_TOKEN = Qwen3_VITA_TOKEN()
+# _GLOBAL_CONSTANTS = Qwen3_VITA_TOKEN_bus1()
+_GLOBAL_CONSTANTS = Qwen3_VITA_TOKEN()
 
 
 def get_token():
-    _ensure_var_is_initialized(_GLOBAL_TOKEN, "token")
-    return _GLOBAL_TOKEN
+    _ensure_var_is_initialized(_GLOBAL_CONSTANTS, "token")
+    return _GLOBAL_CONSTANTS
 
 
 def _ensure_var_is_initialized(var, name):
@@ -207,12 +207,12 @@ class Qwen3VITAFeatureExtractor(SequenceFeatureExtractor):
         audio_chunk_max_second=30,
         **kwargs,
     ):
-        GLOBAL_TOKEN = get_token()
+        GLOBAL_CONSTANTS = get_token()
 
-        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_CONTEXT_TOKEN)
-        AUD_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_TAG_TOKEN)
-        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_START_TOKEN)
-        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_END_TOKEN)
+        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_CONTEXT_TOKEN)
+        AUD_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_TAG_TOKEN)
+        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_START_TOKEN)
+        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_END_TOKEN)
 
         if self.audio_tokenizer.tokenizer_discrete is not None:
             AUD_FIRST_ID = tokenizer.convert_tokens_to_ids(self.audio_tokenizer.tokenizer_discrete.first_audio_token)
@@ -240,7 +240,7 @@ class Qwen3VITAFeatureExtractor(SequenceFeatureExtractor):
                 new_targets += targets[st:aud_pos]
             if additional_targets_list is not None:
                 additional_targets_list = [
-                    x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * (aud_pos - st) for x in additional_targets_list
+                    x + [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * (aud_pos - st) for x in additional_targets_list
                 ]
 
             # --------------------------------------------------------------------------
@@ -359,16 +359,18 @@ class Qwen3VITAFeatureExtractor(SequenceFeatureExtractor):
                             if is_pretrain:
                                 new_targets += _input_id
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
 
                     new_input_ids += [AUD_START_ID]
                     if targets is not None:
                         if is_pretrain:
                             new_targets += [AUD_START_ID]
                         else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
                     if additional_targets_list is not None:
-                        additional_targets_list = [x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] for x in additional_targets_list]
+                        additional_targets_list = [
+                            x + [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] for x in additional_targets_list
+                        ]
 
                     audio_token_length = -(-audio_token_length_func(len(audio)) // self.temporal_merge_size)
                     audio_indice_b = torch.zeros(
@@ -386,10 +388,11 @@ class Qwen3VITAFeatureExtractor(SequenceFeatureExtractor):
 
                     new_input_ids += [AUD_CONTEXT_ID] * audio_token_length
                     if targets is not None:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * audio_token_length
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * audio_token_length
                     if additional_targets_list is not None:
                         additional_targets_list = [
-                            x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * audio_token_length for x in additional_targets_list
+                            x + [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * audio_token_length
+                            for x in additional_targets_list
                         ]
 
                     new_input_ids += [AUD_END_ID]
@@ -397,9 +400,11 @@ class Qwen3VITAFeatureExtractor(SequenceFeatureExtractor):
                         if is_pretrain:
                             new_targets += [AUD_END_ID]
                         else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
                     if additional_targets_list is not None:
-                        additional_targets_list = [x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] for x in additional_targets_list]
+                        additional_targets_list = [
+                            x + [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] for x in additional_targets_list
+                        ]
 
             st = aud_pos + 1
 
@@ -408,7 +413,7 @@ class Qwen3VITAFeatureExtractor(SequenceFeatureExtractor):
             new_targets += targets[st:]
         if additional_targets_list is not None:
             additional_targets_list = [
-                x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * (len(targets) - st) for x in additional_targets_list
+                x + [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * (len(targets) - st) for x in additional_targets_list
             ]
 
         input_ids = new_input_ids
