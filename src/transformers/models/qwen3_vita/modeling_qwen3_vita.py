@@ -1021,6 +1021,20 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+def vision_apply_rotary_pos_emb(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+    return q_embed, k_embed
+
+
 @use_kernelized_func(apply_rotary_pos_emb)
 class Qwen3VITATextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -1072,7 +1086,16 @@ class Qwen3VITATextAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if getattr(self.config, "use_llm", False):
+            # [B, H, S, D] -> [S, H, D]
+            query_states = query_states.squeeze(0).transpose(0, 1)
+            key_states = key_states.squeeze(0).transpose(0, 1)
+            query_states, key_states = vision_apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            # [S, H, D] -> [B, H, S, D]
+            query_states = query_states.transpose(0, 1).unsqueeze(0)
+            key_states = key_states.transpose(0, 1).unsqueeze(0)
+        else:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
@@ -1271,20 +1294,6 @@ def vision_eager_attention_forward(
     return attn_output, attn_weights
 
 
-def vision_apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
-    return q_embed, k_embed
-
-
 class Qwen3VITAVisionAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -1312,13 +1321,14 @@ class Qwen3VITAVisionAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        output_attentions: bool | None = False,
+        # output_attentions: Optional[bool] = False,
         cu_seqlens: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Input shape: Batch x Time x Channel"""
 
         seq_length, embed_dim = hidden_states.shape
+        # _, seq_length, embed_dim = hidden_states.shape
 
         queries = self.q_proj(hidden_states)
         keys = self.k_proj(hidden_states)
@@ -1368,8 +1378,8 @@ class Qwen3VITAVisionAttention(nn.Module):
         attn_output = attn_output.reshape(seq_length, embed_dim).contiguous()
         attn_output = self.out_proj(attn_output)
 
-        if not output_attentions:
-            attn_weights = None
+        # if not output_attentions:
+        #     attn_weights = None
 
         return attn_output, attn_weights
 
@@ -1421,6 +1431,7 @@ class Qwen3VITAVisionFlashAttention2(nn.Module):
         """Input shape: Batch x Time x Channel"""
 
         seq_length, embed_dim = hidden_states.shape
+        # _, seq_length, embed_dim = hidden_states.shape
 
         queries = self.q_proj(hidden_states)
         keys = self.k_proj(hidden_states)
@@ -1478,7 +1489,7 @@ class Qwen3VITAVisionEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        output_attentions: bool | None = False,
+        # output_attentions: Optional[bool] = False,
         cu_seqlens: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.FloatTensor]:
@@ -1495,10 +1506,10 @@ class Qwen3VITAVisionEncoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
+        hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            output_attentions=output_attentions,
+            # output_attentions=output_attentions,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
         )
@@ -1509,12 +1520,14 @@ class Qwen3VITAVisionEncoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        return hidden_states
 
-        if output_attentions:
-            outputs += (attn_weights,)
+        # outputs = (hidden_states,)
 
-        return outputs
+        # if output_attentions:
+        #     outputs += (attn_weights,)
+
+        # return outputs
 
 
 class Qwen3VITAVisionEncoder(nn.Module):
@@ -1529,7 +1542,12 @@ class Qwen3VITAVisionEncoder(nn.Module):
     def __init__(self, config: Qwen3VITAVisionConfig):
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([Qwen3VITAVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
+        if config.use_llm:
+            self.layers = nn.ModuleList(
+                [Qwen3VITATextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            )
+        else:
+            self.layers = nn.ModuleList([Qwen3VITAVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
         self.spatial_merge_size = 2
@@ -1537,7 +1555,8 @@ class Qwen3VITAVisionEncoder(nn.Module):
         self.patch_size = config.patch_size
         # self.window_size = self.patch_size * 2 * 8
 
-        self.rotary_pos_emb = Qwen3VITAVisionRotaryEmbedding(config.hidden_size // config.num_attention_heads // 2)
+        # self.rotary_emb = Qwen3VITATextRotaryEmbedding(config=config)
+        self.rotary_pos_emb = Qwen3VITAVisionRotaryEmbedding(config.head_dim // 2)
 
     def rot_pos_emb(self, grid_thw):
         pos_ids = []
@@ -1576,8 +1595,8 @@ class Qwen3VITAVisionEncoder(nn.Module):
         inputs_embeds,
         grid_thw,
         attention_mask: torch.Tensor | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
+        # output_attentions: Optional[bool] = None,
+        # output_hidden_states: Optional[bool] = None,
     ) -> BaseModelOutput:
         r"""
         Args:
@@ -1601,18 +1620,27 @@ class Qwen3VITAVisionEncoder(nn.Module):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        # output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        # output_hidden_states = (
+        #     output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        # )
 
-        encoder_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
+        # encoder_states = () if output_hidden_states else None
+        # all_attentions = () if output_attentions else None
 
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        if getattr(self.config, "use_llm", False) and False:
+            # position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+            # position_ids = position_ids.unsqueeze(0)
+            # position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+            rotary_pos_emb = self.rot_pos_emb(grid_thw)
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            position_embeddings = (emb.cos().unsqueeze(0), emb.sin().unsqueeze(0))
+        else:
+            rotary_pos_emb = self.rot_pos_emb(grid_thw)
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            position_embeddings = (emb.cos(), emb.sin())
+        # print(f"{position_embeddings[0].shape=} {position_embeddings[1].shape=} {inputs_embeds.shape=}")
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
@@ -1622,38 +1650,39 @@ class Qwen3VITAVisionEncoder(nn.Module):
 
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            if output_hidden_states:
-                encoder_states = encoder_states + (hidden_states,)
+            encoder_layer.self_attn.is_causal = False
+            # if output_hidden_states:
+            #     encoder_states = encoder_states + (hidden_states,)
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
+                hidden_states = self._gradient_checkpointing_func(
                     encoder_layer.__call__,
                     hidden_states,
                     attention_mask,
-                    output_attentions,
+                    # output_attentions,
                     cu_seqlens,
                     position_embeddings,
                 )
             else:
-                layer_outputs = encoder_layer(
+                hidden_states = encoder_layer(
                     hidden_states,
                     attention_mask,
-                    output_attentions=output_attentions,
+                    # output_attentions=output_attentions,
                     cu_seqlens=cu_seqlens,
                     position_embeddings=position_embeddings,
                 )
 
-            hidden_states = layer_outputs[0]
+            # hidden_states = layer_outputs[0]
 
-            if output_attentions:
-                all_attentions = all_attentions + (layer_outputs[1],)
+            # if output_attentions:
+            #     all_attentions = all_attentions + (layer_outputs[1],)
 
-        if output_hidden_states:
-            encoder_states = encoder_states + (hidden_states,)
+        # if output_hidden_states:
+        #     encoder_states = encoder_states + (hidden_states,)
 
         return BaseModelOutput(
             last_hidden_state=hidden_states,
-            hidden_states=encoder_states,
-            attentions=all_attentions,
+            # hidden_states=encoder_states,
+            # attentions=all_attentions,
         )
 
 
@@ -1676,19 +1705,21 @@ class Qwen3VITAVisionModel(Qwen3VITAVisionPreTrainedModel):
         pixel_values: torch.FloatTensor,
         grid_thw: torch.LongTensor,
         attention_mask: torch.Tensor,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
+        # output_attentions: Optional[bool] = None,
+        # output_hidden_states: Optional[bool] = None,
     ) -> BaseModelOutputWithPooling:
         r"""
         Returns:
 
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        # output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        # output_hidden_states = (
+        #     output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        # )
 
         hidden_states = self.embeddings(pixel_values, grid_thw)
+        if getattr(self.config, "use_llm", False):
+            hidden_states = hidden_states.unsqueeze(0)
 
         if attention_mask is not None and not self._use_flash_attention_2:
             # [batch_size, seq_len] -> [batch_size, 1, tgt_seq_len, src_seq_len]
@@ -1700,24 +1731,27 @@ class Qwen3VITAVisionModel(Qwen3VITAVisionPreTrainedModel):
             inputs_embeds=hidden_states,
             grid_thw=grid_thw,
             attention_mask=encoder_attention_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            # output_attentions=output_attentions,
+            # output_hidden_states=output_hidden_states,
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
         # last_hidden_state = self.post_layernorm(last_hidden_state)
 
         # pooler_output = self.head(last_hidden_state, attention_mask) if self.use_head else None
-        pooler_output = None
+        # pooler_output = None
+
+        if getattr(self.config, "use_llm", False):
+            last_hidden_state = last_hidden_state.squeeze(0)
 
         assert last_hidden_state.shape[0] == len(pixel_values)
         last_hidden_state = self.merger(last_hidden_state)
 
         return BaseModelOutputWithPooling(
             last_hidden_state=last_hidden_state,
-            pooler_output=pooler_output,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
+            # pooler_output=pooler_output,
+            # hidden_states=encoder_outputs.hidden_states,
+            # attentions=encoder_outputs.attentions,
         )
 
 
