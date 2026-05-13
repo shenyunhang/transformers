@@ -59,7 +59,6 @@ is_aiter_available = False
 logger = logging.get_logger(__name__)
 
 
-
 class Qwen3VITAAudioConfig(PreTrainedConfig):
     r"""
     Qwen3VITAAudioConfig
@@ -202,6 +201,7 @@ class Qwen3VITAVisionConfig(PreTrainedConfig):
             ]
         super().__post_init__(**kwargs)
 
+
 class Qwen3VITATextConfig(Qwen3Config):
     r"""
     Qwen3VITATextConfig
@@ -211,13 +211,91 @@ class Qwen3VITATextConfig(Qwen3Config):
     pass
 
 
+class Qwen3VITAOmniConfig(Qwen3Config):
+    r"""
+    Config for the shared Qwen3-style omni encoder that ingests both vision and
+    audio inputs (mirrors the megatron reference implementation at
+    ``vita_megatron/core/models/omni``). The encoder body is a Qwen3-style
+    transformer (qk-norm, GQA, SiLU MLP) consuming already-tokenised features
+    of shape ``[seq_len, hidden_size]`` with packed attention metadata
+    (``cu_seqlens``, 2D/1D rotary positions).
+
+    Inherits [`Qwen3Config`] for the shared transformer-body hyper-parameters
+    (``hidden_size``, ``num_hidden_layers``, ``num_attention_heads``,
+    ``num_key_value_heads``, ``head_dim``, ``hidden_act``, ``rms_norm_eps``,
+    ``attention_dropout``, ...). Adds omni-specific fields for the vision
+    linear patch front-end, the audio Conv2d front-end, and the modality
+    mergers that project to the LM hidden size.
+
+    Args:
+        num_channels (`int`, *optional*, defaults to 3):
+            Number of input channels for the vision patch front-end (RGB = 3).
+        patch_size (`int`, *optional*, defaults to 16):
+            Spatial size of the vision patch, i.e. each patch flattens to
+            ``num_channels * patch_size ** 2`` features.
+        spatial_merge_size (`int`, *optional*, defaults to 2):
+            After the shared transformer the vision tokens are merged by an
+            ``spatial_merge_size x spatial_merge_size`` spatial window (4x
+            token reduction by default) before the projection MLP.
+        num_mel_bins (`int`, *optional*, defaults to 128):
+            Number of mel filterbank bins of the input log-mel spectrogram
+            consumed by the Conv2d audio front-end.
+        downsample_hidden_size (`int`, *optional*, defaults to 512):
+            Channel dimension used by the three stride-2 Conv2d layers of the
+            audio front-end before the projection to ``hidden_size``.
+        n_window (`int`, *optional*, defaults to 50):
+            Training-time chunk size (in frames) used to split the input
+            log-mel spectrogram before convolution.
+        n_window_infer (`int`, *optional*, defaults to 800):
+            Inference-time chunk size (in frames) used to split the input
+            log-mel spectrogram before convolution.
+        conv_chunksize (`int`, *optional*, defaults to 500):
+            Number of chunks processed together in a single conv forward to
+            bound peak activation memory.
+        temporal_merge_size (`int`, *optional*, defaults to 2):
+            After the shared transformer the audio tokens are merged by a
+            factor of ``temporal_merge_size`` along the time axis before the
+            projection MLP.
+        merger_hidden_size (`int`, *optional*, defaults to 4608):
+            Hidden dimension of the merger MLP that projects merged features
+            from the shared encoder to ``out_hidden_size``.
+        out_hidden_size (`int`, *optional*, defaults to 4608):
+            Output dimension of the omni encoder, aligned with the language
+            model embedding dimension.
+    """
+
+    model_type = "qwen3_vita_omni"
+    base_config_key = "omni_config"
+
+    # ---- Omni-specific fields ------------------------------------------------
+    # Vision front-end
+    num_channels: int = 3
+    patch_size: int = 16
+    spatial_merge_size: int = 2
+    # Audio Conv2d front-end (mirrors :class:`Qwen3VITACNNAudioEmbeddings`)
+    num_mel_bins: int = 128
+    downsample_hidden_size: int = 512
+    n_window: int = 50
+    n_window_infer: int = 800
+    conv_chunksize: int = 500
+    temporal_merge_size: int = 2
+    # Projection to LM hidden size
+    merger_hidden_size: int = 4608
+    out_hidden_size: int = 4608
+
+
 class Qwen3VITAConfig(PreTrainedConfig):
     r"""
     Qwen3VITAConfig
     """
 
     model_type = "qwen3_vita"
-    sub_configs = {"audio_config": Qwen3VITAAudioConfig, "vision_config": Qwen3VITAVisionConfig, "text_config": Qwen3VITATextConfig}
+    sub_configs = {
+        "audio_config": Qwen3VITAAudioConfig,
+        "vision_config": Qwen3VITAVisionConfig,
+        "text_config": Qwen3VITATextConfig,
+        "omni_config": Qwen3VITAOmniConfig,
+    }
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -225,6 +303,7 @@ class Qwen3VITAConfig(PreTrainedConfig):
         audio_config=None,
         text_config=None,
         vision_config=None,
+        omni_config=None,
         # image_token_id=133375,
         # video_token_id=133379,
         # audio_token_id=133383,
@@ -235,20 +314,24 @@ class Qwen3VITAConfig(PreTrainedConfig):
         tie_word_embeddings=False,
         **kwargs,
     ):
-        if isinstance(audio_config, dict):
-            self.audio_config = self.sub_configs["audio_config"](**audio_config)
-        elif audio_config is None:
-            self.audio_config = self.sub_configs["audio_config"]()
+        def _build_sub_config(key, value):
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                return self.sub_configs[key](**value)
+            return value
 
-        if isinstance(vision_config, dict):
-            self.vision_config = self.sub_configs["vision_config"](**vision_config)
-        elif vision_config is None:
-            self.vision_config = self.sub_configs["vision_config"]()
+        self.audio_config = _build_sub_config("audio_config", audio_config)
+        self.vision_config = _build_sub_config("vision_config", vision_config)
+        self.omni_config = _build_sub_config("omni_config", omni_config)
 
+        # Text config is mandatory (the language model is always built).
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
+        else:
+            self.text_config = text_config
 
         # self.image_token_id = image_token_id
         # self.video_token_id = video_token_id
@@ -260,8 +343,6 @@ class Qwen3VITAConfig(PreTrainedConfig):
 
         self.tie_word_embeddings = tie_word_embeddings
         super().__init__(**kwargs)
-
-
 
 
 def _get_feat_extract_output_lengths(input_lengths):
@@ -1131,7 +1212,7 @@ class Qwen3VITATextAttention(Qwen3Attention):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        if getattr(self.config, "use_llm", False):
+        if self.config.use_llm:
             # [B, H, S, D] -> [S, H, D]
             query_states = query_states.squeeze(0).transpose(0, 1)
             key_states = key_states.squeeze(0).transpose(0, 1)
@@ -1562,7 +1643,7 @@ class Qwen3VITAVisionEncoder(nn.Module):
     def __init__(self, config: Qwen3VITAVisionConfig):
         super().__init__()
         self.config = config
-        if config.use_llm:
+        if self.config.use_llm:
             self.layers = nn.ModuleList([Qwen3VITATextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         else:
             self.layers = nn.ModuleList([Qwen3VITAVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
@@ -1607,7 +1688,6 @@ class Qwen3VITAVisionEncoder(nn.Module):
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
-    # Ignore copy
     def forward(
         self,
         inputs_embeds,
@@ -1646,7 +1726,7 @@ class Qwen3VITAVisionEncoder(nn.Module):
         # encoder_states = () if output_hidden_states else None
         # all_attentions = () if output_attentions else None
 
-        if getattr(self.config, "use_llm", False) and False:
+        if self.config.use_llm and False:
             # position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
             # position_ids = position_ids.unsqueeze(0)
             # position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
@@ -1736,7 +1816,7 @@ class Qwen3VITAVisionModel(Qwen3VITAVisionPreTrainedModel):
         # )
 
         hidden_states = self.embeddings(pixel_values, grid_thw)
-        if getattr(self.config, "use_llm", False):
+        if self.config.use_llm:
             hidden_states = hidden_states.unsqueeze(0)
 
         if attention_mask is not None and not self._use_flash_attention_2:
@@ -1759,7 +1839,7 @@ class Qwen3VITAVisionModel(Qwen3VITAVisionPreTrainedModel):
         # pooler_output = self.head(last_hidden_state, attention_mask) if self.use_head else None
         # pooler_output = None
 
-        if getattr(self.config, "use_llm", False):
+        if self.config.use_llm:
             last_hidden_state = last_hidden_state.squeeze(0)
         
         assert last_hidden_state.shape[0] == len(pixel_values)
@@ -1777,11 +1857,471 @@ class Qwen3VITATextModel(Qwen3VITAPreTrainedModel, Qwen3Model):
     config: Qwen3VITATextConfig
 
 
+# ---------------------------------------------------------------------------
+# Omni encoder (shared Qwen3 transformer for vision + audio).
+#
+# Mirrors ``vita_megatron/core/models/omni`` (``omni_model.py``,
+# ``qwen3_model.py``): a single Qwen3-style transformer body consumes packed
+# features from both modalities with 2D (vision) / 1D (audio) rotary positions,
+# followed by a modality-specific merger+MLP projector into the LM hidden dim.
+# ---------------------------------------------------------------------------
+
+
+class Qwen3VITAOmniPreTrainedModel(PreTrainedModel):
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    config: Qwen3VITAOmniConfig
+
+
+class Qwen3VITAOmniRMSNorm(Qwen3RMSNorm):
+    pass
+
+
+class Qwen3VITAOmniRotaryEmbedding(nn.Module):
+    """1D rotary building block shared by vision (2D) and audio (1D) RoPE.
+
+    Mirrors ``_RotaryEmbedding`` in ``vita_megatron/core/models/omni/qwen3_model.py``.
+    """
+
+    def __init__(self, dim: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+
+    def forward(self, seqlen) -> torch.Tensor:
+        # ``seqlen`` may be a python int or a 0-D / 1-D tensor.
+        if isinstance(seqlen, torch.Tensor):
+            device = seqlen.device
+            length = int(seqlen.max().item()) if seqlen.dim() > 0 else int(seqlen.item())
+        else:
+            device = torch.device("cpu")
+            length = int(seqlen)
+        inv_freq = 1.0 / (
+            self.theta
+            ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
+        )
+        seq = torch.arange(length, device=device, dtype=inv_freq.dtype)
+        return torch.outer(seq, inv_freq)
+
+
+class Qwen3VITAOmniVisionEmbeddings(Qwen3VITAVisionEmbeddings):
+    """Linear patch embedding for already-patchified vision pixel values.
+
+    Identical to :class:`Qwen3VITAVisionEmbeddings`; only the config type
+    differs (omni reuses ``hidden_size``/``patch_size``/``num_channels`` from
+    :class:`Qwen3VITAOmniConfig`). Mirrors ``LinearVisionEncoder`` in
+    ``vita_megatron/core/models/vision/linear_model.py``.
+    """
+
+    def __init__(self, config: Qwen3VITAOmniConfig):
+        super().__init__(config)
+
+
+class Qwen3VITAOmniAudioEmbeddings(Qwen3VITACNNAudioEmbeddings):
+    """Conv2d audio front-end producing 8x temporally down-sampled features.
+
+    Inherits the three Conv2d stack from :class:`Qwen3VITACNNAudioEmbeddings`
+    and adds a final linear projection so the CNN output is aligned with the
+    shared omni transformer ``hidden_size`` (mirrors
+    ``Conv2dAudioEncoderWithProj`` in
+    ``vita_megatron/core/models/audio/cnn_model.py``).
+    """
+
+    def __init__(self, config: Qwen3VITAOmniConfig):
+        super().__init__(config)
+        # After three stride-2, padding=1 convolutions the feature axis is
+        # reduced as ``ceil(n / 2)`` at each step.
+        mel_after_cnn = (config.num_mel_bins + 1) // 2
+        mel_after_cnn = (mel_after_cnn + 1) // 2
+        mel_after_cnn = (mel_after_cnn + 1) // 2
+        self.proj_in_features = config.downsample_hidden_size * mel_after_cnn
+        self.linear_proj = nn.Linear(self.proj_in_features, config.hidden_size, bias=False)
+
+    def forward(self, input_features, feature_lens=None):
+        hidden_states, aftercnn_lens = super().forward(input_features, feature_lens)
+        hidden_states = self.linear_proj(hidden_states)
+        return hidden_states, aftercnn_lens
+
+
+class Qwen3VITAOmniMLP(Qwen3MLP):
+    """SwiGLU MLP (Qwen3 style). Inherits :class:`Qwen3MLP` directly."""
+
+    pass
+
+
+class Qwen3VITAOmniFlashAttention2(Qwen3Attention):
+    """Packed ``thd``-layout Qwen3-style attention (qk-norm, GQA) that takes
+    ``cu_seqlens`` and per-token ``(cos, sin)`` rotary positions.
+
+    Inherits :class:`Qwen3Attention` for the projection layers / qk-norm /
+    GQA wiring; only the forward path differs (varlen flash attention with
+    packed sequences instead of the standard causal LM attention).
+    """
+
+    def __init__(self, config: Qwen3VITAOmniConfig, layer_idx: int = 0):
+        super().__init__(config, layer_idx=layer_idx)
+        # Encoder use-case: bidirectional attention.
+        self.is_causal = False
+        # Mirror naming used by :class:`Qwen3VITAVisionFlashAttention2`.
+        self.dropout = config.attention_dropout
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        # ``hidden_states``: [seq_len, hidden] (packed ``thd``).
+        seq_length = hidden_states.shape[0]
+        num_heads = self.config.num_attention_heads
+        num_key_value_heads = self.config.num_key_value_heads
+
+        queries = self.q_proj(hidden_states).view(seq_length, num_heads, self.head_dim)
+        keys = self.k_proj(hidden_states).view(seq_length, num_key_value_heads, self.head_dim)
+        values = self.v_proj(hidden_states).view(seq_length, num_key_value_heads, self.head_dim)
+
+        queries = self.q_norm(queries)
+        keys = self.k_norm(keys)
+
+        cos, sin = position_embeddings
+        queries, keys = vision_apply_rotary_pos_emb_flashatt(
+            queries.unsqueeze(0), keys.unsqueeze(0), cos, sin
+        )
+        queries = queries.squeeze(0)
+        keys = keys.squeeze(0)
+
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        if is_aiter_available:
+            attn_output = flash_attn_varlen_func(
+                queries, keys, values,
+                cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                return_lse=True,
+            )[0].reshape(seq_length, -1)
+        else:
+            attn_output = flash_attn_varlen_func(
+                queries, keys, values,
+                cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+            ).reshape(seq_length, -1)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+
+class Qwen3VITAOmniEncoderLayer(nn.Module):
+    """Qwen3-style transformer block (pre-norm, SwiGLU, qk-norm)."""
+
+    def __init__(self, config: Qwen3VITAOmniConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.input_layernorm = Qwen3VITAOmniRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = Qwen3VITAOmniFlashAttention2(config)
+        self.post_attention_layernorm = Qwen3VITAOmniRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = Qwen3VITAOmniMLP(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+class Qwen3VITAOmniEncoder(Qwen3VITAOmniPreTrainedModel):
+    """Shared Qwen3 transformer body used by both vision and audio inputs.
+
+    Equivalent of ``Qwen3Model`` in
+    ``vita_megatron/core/models/omni/qwen3_model.py``. Consumes already-projected
+    features of shape ``[seq_len, hidden]`` together with packed-sequence
+    metadata (``cu_seqlens``, per-token ``(cos, sin)`` rotary positions).
+    """
+
+    config: Qwen3VITAOmniConfig
+    _no_split_modules = ["Qwen3VITAOmniEncoderLayer"]
+
+    def __init__(self, config: Qwen3VITAOmniConfig):
+        super().__init__(config)
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.spatial_merge_size = int(config.spatial_merge_size)
+        self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
+
+        # Rotary building block. ``head_dim // 2`` matches the megatron reference
+        # (``kv_channels // 2``) — vision concatenates ``(h, w)`` pos so the
+        # final freqs dim equals ``head_dim``, audio duplicates to match.
+        self.rotary_pos_emb = Qwen3VITAOmniRotaryEmbedding(config.head_dim // 2)
+
+        self.layers = nn.ModuleList(
+            [Qwen3VITAOmniEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+        self.gradient_checkpointing = False
+
+        self.post_init()
+
+    # ------------------------------------------------------------------ RoPE
+    def vision_rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        """2D rotary positions for Qwen-VL ``grid_thw``."""
+        pos_ids = []
+        for t, h, w in grid_thw:
+            t, h, w = int(t), int(h), int(w)
+            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            hpos_ids = hpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            hpos_ids = hpos_ids.permute(0, 2, 1, 3).flatten()
+
+            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            wpos_ids = wpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            wpos_ids = wpos_ids.permute(0, 2, 1, 3).flatten()
+            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+        pos_ids = torch.cat(pos_ids, dim=0)
+        max_grid_size = grid_thw[:, 1:].max()
+        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+        return rotary_pos_emb
+
+    def audio_rot_pos_emb(self, lens: torch.Tensor) -> torch.Tensor:
+        """1D rotary positions for packed audio sequences."""
+        max_len = int(lens.max().item())
+        rotary_pos_emb_full = self.rotary_pos_emb(max_len)  # [max_len, dim/2]
+        out = []
+        for length in lens.tolist():
+            out.append(rotary_pos_emb_full[: int(length)])
+        rotary_pos_emb = torch.cat(out, dim=0)
+        # Duplicate along feature axis so we can reuse the same (cos, sin)
+        # application as the 2D vision path.
+        rotary_pos_emb = torch.cat([rotary_pos_emb, rotary_pos_emb], dim=-1)
+        return rotary_pos_emb
+
+    # ---------------------------------------------------------------- forward
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+    ) -> BaseModelOutput:
+        """Run the transformer body on packed features.
+
+        Args:
+            hidden_states: ``[seq_len, hidden]`` already-projected features.
+            cu_seqlens: cumulative sequence lengths (``thd`` varlen format).
+            rotary_pos_emb: ``[seq_len, head_dim]`` rotary positions (already
+                concatenated for both ``h`` and ``w`` / duplicated for audio).
+        """
+        hidden_states = hidden_states.contiguous()
+
+        # Per-token (cos, sin) used by ``vision_apply_rotary_pos_emb_flashatt``.
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+
+        for layer in self.layers:
+            if self.gradient_checkpointing and self.training:
+                hidden_states = self._gradient_checkpointing_func(
+                    layer.__call__,
+                    hidden_states,
+                    cu_seqlens,
+                    position_embeddings,
+                )
+            else:
+                hidden_states = layer(
+                    hidden_states=hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    position_embeddings=position_embeddings,
+                )
+
+        return BaseModelOutput(last_hidden_state=hidden_states)
+
+
+class Qwen3VITAOmniVisionPatchMerger(Qwen3VITAVisionPatchMerger):
+    """2x2 spatial merge (4x token reduction) + MLP projection to
+    ``out_hidden_size``. Inherits :class:`Qwen3VITAVisionPatchMerger`; only the
+    config type differs (omni reuses ``hidden_size`` / ``spatial_merge_size``
+    / ``merger_hidden_size`` / ``out_hidden_size`` from
+    :class:`Qwen3VITAOmniConfig`).
+    """
+
+    def __init__(self, config: Qwen3VITAOmniConfig) -> None:
+        super().__init__(config)
+
+
+class Qwen3VITAOmniAudioPatchMerger(Qwen3VITAAudioPatchMerger):
+    """2x temporal merge + MLP projection to ``out_hidden_size``. Inherits
+    :class:`Qwen3VITAAudioPatchMerger`; only the config type differs.
+    """
+
+    def __init__(self, config: Qwen3VITAOmniConfig) -> None:
+        super().__init__(config)
+
+
+class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
+    """Top-level omni encoder: shared Qwen3 transformer + modality-specific
+    front-ends and mergers. Mirrors :class:`MegatronOmniModel`.
+
+    Forward dispatch by modality:
+
+    * ``modality == "vision"`` or only vision inputs given → returns
+      ``image_embeddings`` of shape ``[N, out_hidden_size]``.
+    * ``modality == "audio"`` or only audio inputs given → returns
+      ``(audio_embeddings, audio_lengths)``.
+    * Both given → returns ``{"vision": ..., "audio": (..., ...)}``.
+    """
+
+    config: Qwen3VITAOmniConfig
+    _input_embed_layer = "patch_embedding"
+
+    def __init__(self, config: Qwen3VITAOmniConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+        self.config = config
+
+        # Modality front-ends.
+        self.vision_embeddings = Qwen3VITAOmniVisionEmbeddings(config)
+        self.audio_embeddings = Qwen3VITAOmniAudioEmbeddings(config)
+
+        # Shared Qwen3 transformer body.
+        self.encoder = Qwen3VITAOmniEncoder(config)
+
+        # Modality-specific post-encoder mergers + projectors.
+        self.vision_merger = Qwen3VITAOmniVisionPatchMerger(config)
+        self.audio_merger = Qwen3VITAOmniAudioPatchMerger(config)
+
+        self.post_init()
+
+    # ------------------------------------------------------------------ vision
+    def forward_vision(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vision path: patch linear → shared encoder (2D RoPE, packed) → 2x2
+        spatial merge → projector. Returns ``[N, out_hidden_size]``."""
+        hidden_states = self.vision_embeddings(pixel_values, image_grid_thw)
+
+        rotary_pos_emb = self.encoder.vision_rot_pos_emb(image_grid_thw).to(hidden_states.device)
+        cu_seqlens = torch.repeat_interleave(
+            image_grid_thw[:, 1] * image_grid_thw[:, 2],
+            image_grid_thw[:, 0],
+        ).cumsum(
+            dim=0,
+            dtype=image_grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+        )
+        cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0), value=0)
+
+        hidden_states = self.encoder(
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=rotary_pos_emb,
+        ).last_hidden_state
+
+        hidden_states = self.vision_merger(hidden_states)
+        return hidden_states
+
+    # ------------------------------------------------------------------- audio
+    def forward_audio(
+        self,
+        audios,
+    ):
+        """Audio path: Conv2d front-end (8x down-sample) → shared encoder
+        (1D RoPE, packed) → 2x temporal merge → projector.
+
+        Args:
+            audios: a list of ``[T_i, num_mel_bins]`` tensors (the same input
+                convention used by :class:`Qwen3VITACNNAudio` elsewhere in this
+                file).
+
+        Returns:
+            A tuple ``(features, feature_lens)`` where ``features`` has shape
+            ``[B, S_out, out_hidden_size]`` and ``feature_lens`` holds the
+            valid length per sample after temporal merge.
+        """
+        audio_lengths = torch.as_tensor([len(x) for x in audios])
+        stacked = torch.cat(audios, dim=0).transpose(1, 0)  # [num_mel, total_T]
+        hidden_states, feature_lens = self.audio_embeddings(stacked, audio_lengths)
+
+        # Packed 1D rotary positions + cu_seqlens.
+        feature_lens = feature_lens.to(hidden_states.device)
+        cu_seqlens = torch.nn.functional.pad(
+            feature_lens.cumsum(dim=0, dtype=torch.int32), (1, 0), value=0
+        )
+        rotary_pos_emb = self.encoder.audio_rot_pos_emb(feature_lens).to(hidden_states.device)
+
+        hidden_states = self.encoder(
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=rotary_pos_emb,
+        ).last_hidden_state
+
+        # Re-batch to ``[B, S, H]`` and apply temporal merge + projector.
+        features = hidden_states.split(feature_lens.tolist(), dim=0)
+        features = torch.nn.utils.rnn.pad_sequence(features, batch_first=True, padding_value=0.0)
+        features = self.audio_merger(features)
+
+        merged_lens = -(-feature_lens // int(self.config.temporal_merge_size))
+        return features, merged_lens
+
+    # -------------------------------------------------------------- top-level
+    def forward(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        audios: Optional[Any] = None,
+        modality: Optional[str] = None,
+        **kwargs,
+    ):
+        """Dispatch by modality (mirrors ``MegatronOmniModel.forward``)."""
+        has_vision = pixel_values is not None and image_grid_thw is not None
+        has_audio = audios is not None
+
+        if modality == "vision" or (has_vision and not has_audio):
+            return self.forward_vision(pixel_values, image_grid_thw)
+
+        if modality == "audio" or (has_audio and not has_vision):
+            return self.forward_audio(audios)
+
+        if has_vision and has_audio:
+            v = self.forward_vision(pixel_values, image_grid_thw)
+            a, a_len = self.forward_audio(audios)
+            return {"vision": v, "audio": (a, a_len)}
+
+        raise ValueError(
+            "Qwen3VITAOmniModel.forward requires at least one of (pixel_values, image_grid_thw) "
+            "or (audios,)."
+        )
+
+
 class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
     def __init__(self, config: Qwen3VITAConfig):
         super().__init__(config)
-        self.audio_model = Qwen3VITAAudioModel._from_config(config.audio_config)
-        self.vision_model = Qwen3VITAVisionModel._from_config(config.vision_config)
+
+        self.omni_model = None
+        self.vision_model = None
+        self.audio_model = None
+        if config.omni_config is not None:
+            self.omni_model = Qwen3VITAOmniModel._from_config(config.omni_config)
+        if config.vision_config is not None:
+            self.vision_model = Qwen3VITAVisionModel._from_config(config.vision_config)
+        if config.audio_config is not None:
+            self.audio_model = Qwen3VITAAudioModel._from_config(config.audio_config)
+
         self.language_model = Qwen3VITATextModel._from_config(config.text_config)
 
     def get_input_embeddings(self):
@@ -1789,6 +2329,32 @@ class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.language_model.embed_tokens = value
+
+    # ------------------------------------------------------------------
+    # Modality forward dispatch — when ``self.omni_model`` is present, the
+    # vision and audio inputs go through the shared Qwen3 omni encoder
+    # (mirrors ``GPTMMModel._preprocess`` in
+    # ``vita_megatron/core/models/multimodal/gpt_mm_model.py``).
+    # ------------------------------------------------------------------
+    def _encode_vision(self, pixel_values, image_grid_thw):
+        """Return image embeddings of shape ``[N, hidden]``."""
+        if self.omni_model is not None:
+            return self.omni_model(
+                modality="vision",
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+            )
+        return self.vision_model(
+            pixel_values=pixel_values,
+            attention_mask=None,
+            grid_thw=image_grid_thw,
+        ).last_hidden_state
+
+    def _encode_audio(self, audios):
+        """Return ``(audio_embeddings, audio_lengths)``."""
+        if self.omni_model is not None:
+            return self.omni_model(modality="audio", audios=audios)
+        return self.audio_model(audios)
 
     def forward(
         self,
@@ -1825,21 +2391,19 @@ class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
                 for chunk_idx in range(chunk_num):
                     _image_grid_thw = image_grid_thw[chunk_idx]
                     im_ed = im_st + (_image_grid_thw[:, 1] * _image_grid_thw[:, 2] * _image_grid_thw[:, 0]).sum().item()
-                    _image_embeds = self.vision_model(
+                    _image_embeds = self._encode_vision(
                         pixel_values=images[im_st:im_ed],
-                        attention_mask=None,
-                        grid_thw=image_grid_thw[chunk_idx],
-                    ).last_hidden_state
+                        image_grid_thw=image_grid_thw[chunk_idx],
+                    )
                     image_embeds.append(_image_embeds)
 
                     im_st = im_ed
                 image_embeds = torch.cat(image_embeds, dim=0)
             else:
-                image_embeds = self.vision_model(
+                image_embeds = self._encode_vision(
                     pixel_values=images,
-                    attention_mask=None,
-                    grid_thw=image_grid_thw,
-                ).last_hidden_state
+                    image_grid_thw=image_grid_thw,
+                )
             # print(f"image_embeds {image_embeds.size()}")
             # assert image_embeds.shape[0] == len(images)
             fake_images = None
@@ -1863,11 +2427,10 @@ class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
             # print(f"{image_grid_thw.size()=}")
             # print(f"{fake_images.size()=}")
 
-            image_embeds = self.vision_model(
+            image_embeds = self._encode_vision(
                 pixel_values=fake_images,
-                attention_mask=None,
-                grid_thw=image_grid_thw,
-            ).last_hidden_state
+                image_grid_thw=image_grid_thw,
+            )
             # image_embeds = image_embeds[:, 1:, :]
             # image_embeds = self.vision_projection(image_embeds)
 
@@ -1879,7 +2442,7 @@ class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
             image_embeds = None
 
         if audios is not None:
-            audio_embeds, audio_lengths = self.audio_model(audios)
+            audio_embeds, audio_lengths = self._encode_audio(audios)
             # if torch.distributed.get_rank() == 0:
             #     print(f"audio_embeds {audio_embeds.size()}")
             # assert audio_embeds.shape[0] == len(audios)
@@ -1904,7 +2467,7 @@ class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
             device = self.get_input_embeddings().weight.data.device
             dtype = self.get_input_embeddings().weight.data.dtype
             fake_audios = torch.ones((1, 1, 560), dtype=dtype, device=device)
-            audio_embeds, audio_lengths = self.audio_model(fake_audios)
+            audio_embeds, audio_lengths = self._encode_audio(fake_audios)
             # audio_embeds = self.audio_projection(audio_embeds)
 
         else:
@@ -5333,9 +5896,13 @@ class Qwen3VITAProcessor(ProcessorMixin):
 
 __all__ = [
     "Qwen3VITAConfig",
+    "Qwen3VITAOmniConfig",
     "Qwen3VITAPreTrainedModel",
     "Qwen3VITAModel",
     "Qwen3VITAForCausalLM",
+    "Qwen3VITAOmniPreTrainedModel",
+    "Qwen3VITAOmniEncoder",
+    "Qwen3VITAOmniModel",
     "Qwen3VITAProcessor",
     "Qwen3VITAImageProcessor",
     "Qwen3VITAVideoProcessor",
