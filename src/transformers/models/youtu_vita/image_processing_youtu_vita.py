@@ -22,13 +22,13 @@ from .tokenization_youtu_vita import VisionTokenizer
 logger = logging.get_logger(__name__)
 
 
-# _GLOBAL_TOKEN = Youtu_VITA_TOKEN_bus1()
-_GLOBAL_TOKEN = Youtu_VITA_TOKEN()
+# _GLOBAL_CONSTANTS = Youtu_VITA_TOKEN_bus1()
+_GLOBAL_CONSTANTS = Youtu_VITA_TOKEN()
 
 
 def get_token():
-    _ensure_var_is_initialized(_GLOBAL_TOKEN, "token")
-    return _GLOBAL_TOKEN
+    _ensure_var_is_initialized(_GLOBAL_CONSTANTS, "token")
+    return _GLOBAL_CONSTANTS
 
 
 def _ensure_var_is_initialized(var, name):
@@ -130,13 +130,13 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         self.image_max_num_tokens = image_max_num_tokens
         self.image_min_num_tokens = image_min_num_tokens
 
-        GLOBAL_TOKEN = get_token()
+        GLOBAL_CONSTANTS = get_token()
         if vision_normalize_type == "imagenet":
-            MEAN, STD = GLOBAL_TOKEN.IMAGENET_DEFAULT_MEAN, GLOBAL_TOKEN.IMAGENET_DEFAULT_STD
+            MEAN, STD = GLOBAL_CONSTANTS.IMAGENET_DEFAULT_MEAN, GLOBAL_CONSTANTS.IMAGENET_DEFAULT_STD
         elif vision_normalize_type == "clip":
-            MEAN, STD = GLOBAL_TOKEN.OPENAI_CLIP_MEAN, GLOBAL_TOKEN.OPENAI_CLIP_STD
+            MEAN, STD = GLOBAL_CONSTANTS.OPENAI_CLIP_MEAN, GLOBAL_CONSTANTS.OPENAI_CLIP_STD
         elif vision_normalize_type == "siglip":
-            MEAN, STD = GLOBAL_TOKEN.IMAGENET_STANDARD_MEAN, GLOBAL_TOKEN.IMAGENET_STANDARD_STD
+            MEAN, STD = GLOBAL_CONSTANTS.IMAGENET_STANDARD_MEAN, GLOBAL_CONSTANTS.IMAGENET_STANDARD_STD
         else:
             raise NotImplementedError(vision_normalize_type)
         self.mean = MEAN
@@ -552,19 +552,19 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         **kwargs,
     ):
 
-        GLOBAL_TOKEN = get_token()
+        GLOBAL_CONSTANTS = get_token()
 
-        IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_CONTEXT_TOKEN)
-        IMG_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_START_TOKEN)
-        IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_END_TOKEN)
-        IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_TAG_TOKEN)
+        IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_CONTEXT_TOKEN)
+        IMG_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_START_TOKEN)
+        IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_END_TOKEN)
+        IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_TAG_TOKEN)
 
         if self.vision_resolution_type == "native":
             pass
         else:
-            PATCH_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.PATCH_CONTEXT_TOKEN)
-            PATCH_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.PATCH_START_TOKEN)
-            PATCH_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.PATCH_END_TOKEN)
+            PATCH_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.PATCH_CONTEXT_TOKEN)
+            PATCH_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.PATCH_START_TOKEN)
+            PATCH_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.PATCH_END_TOKEN)
 
         if self.vision_tokenizer.first_vision_token is not None:
             IMG_FIRST_ID = tokenizer.convert_tokens_to_ids(self.vision_tokenizer.first_vision_token)
@@ -666,7 +666,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                     if is_pretrain:
                         new_targets += [IMG_START_ID]
                     else:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                 if self.vision_resolution_type == "native":
                     resolution = f"{_image_grid_thw[0][1] * self.patch_size}*{_image_grid_thw[0][2] * self.patch_size}"
@@ -675,16 +675,16 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                     if targets is not None:
                         if is_pretrain:
                             # new_targets += size_input_id
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(size_input_id)
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(size_input_id)
                         else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(size_input_id)
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(size_input_id)
 
                     new_input_ids += nl_tokens
                     if targets is not None:
                         if is_pretrain:
                             new_targets += [IMG_EOL_ID]
                         else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(nl_tokens)
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
 
                     for _h in range(_image_grid_thw[0][0] * _image_grid_thw[0][1] // self.spatial_merge_size):
                         image_token_length = _image_grid_thw[0][2] // self.spatial_merge_size
@@ -703,14 +703,14 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
 
                         new_input_ids += [IMG_CONTEXT_ID] * image_token_length
                         if targets is not None:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
 
                         new_input_ids += nl_tokens
                         if targets is not None:
                             if is_pretrain:
                                 new_targets += nl_tokens
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(nl_tokens)
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
 
                 else:
                     image_token_length = (
@@ -735,14 +735,14 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
 
                     new_input_ids += [IMG_CONTEXT_ID] * image_token_length
                     if targets is not None:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
 
                 new_input_ids += [IMG_END_ID]
                 if targets is not None:
                     if is_pretrain:
                         new_targets += [IMG_END_ID]
                     else:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                 if len(image_patches) > 1:
                     for _ in range(0, best_height, self.tile_image_size):
@@ -751,7 +751,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                             if is_pretrain:
                                 new_targets += nl_tokens
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(nl_tokens)
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
 
                         for _ in range(0, best_width, self.tile_image_size):
                             new_input_ids += [PATCH_START_ID]
@@ -759,7 +759,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                                 if is_pretrain:
                                     new_targets += [PATCH_START_ID]
                                 else:
-                                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                             image_indice_b = torch.zeros(
                                 1, image_token_length, dtype=torch.int64
@@ -776,14 +776,14 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
 
                             new_input_ids += [PATCH_CONTEXT_ID] * image_token_length
                             if targets is not None:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
 
                             new_input_ids += [PATCH_END_ID]
                             if targets is not None:
                                 if is_pretrain:
                                     new_targets += [PATCH_END_ID]
                                 else:
-                                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
             st = img_pos + 1
 

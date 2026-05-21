@@ -180,6 +180,27 @@ class YoutuVITATextConfig(PreTrainedConfig):
         super().__post_init__(**kwargs)
 
 
+class YoutuVITAOmniConfig(YoutuVITATextConfig):
+    model_type = "youtu_vita_omni"
+    base_config_key = "omni_config"
+
+    # ---- Omni-specific fields ------------------------------------------------
+    # Vision front-end
+    num_channels: int = 3
+    patch_size: int = 16
+    spatial_merge_size: int = 2
+    # Audio Conv2d front-end (mirrors :class:`YoutuVITACNNAudioEmbeddings`)
+    num_mel_bins: int = 128
+    downsample_hidden_size: int = 512
+    n_window: int = 50
+    n_window_infer: int = 800
+    conv_chunksize: int = 500
+    temporal_merge_size: int = 2
+    # Projection to LM hidden size
+    merger_hidden_size: int = 4608
+    out_hidden_size: int = 4608
+
+
 class YoutuVITAConfig(PreTrainedConfig):
     r"""
     YoutuVITAConfig
@@ -190,6 +211,7 @@ class YoutuVITAConfig(PreTrainedConfig):
         "audio_config": YoutuVITAAudioConfig,
         "vision_config": YoutuVITAVisionConfig,
         "text_config": YoutuVITATextConfig,
+        "omni_config": YoutuVITAOmniConfig,
     }
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -198,6 +220,7 @@ class YoutuVITAConfig(PreTrainedConfig):
         audio_config=None,
         text_config=None,
         vision_config=None,
+        omni_config=None,
         # image_token_id=133375,
         # video_token_id=133379,
         # audio_token_id=133383,
@@ -208,20 +231,23 @@ class YoutuVITAConfig(PreTrainedConfig):
         tie_word_embeddings=False,
         **kwargs,
     ):
-        if isinstance(audio_config, dict):
-            self.audio_config = self.sub_configs["audio_config"](**audio_config)
-        elif audio_config is None:
-            self.audio_config = self.sub_configs["audio_config"]()
+        def _build_sub_config(key, value):
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                return self.sub_configs[key](**value)
+            return value
 
-        if isinstance(vision_config, dict):
-            self.vision_config = self.sub_configs["vision_config"](**vision_config)
-        elif vision_config is None:
-            self.vision_config = self.sub_configs["vision_config"]()
+        self.audio_config = _build_sub_config("audio_config", audio_config)
+        self.vision_config = _build_sub_config("vision_config", vision_config)
+        self.omni_config = _build_sub_config("omni_config", omni_config)
 
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
+        else:
+            self.text_config = text_config
 
         # self.image_token_id = image_token_id
         # self.video_token_id = video_token_id

@@ -30,6 +30,7 @@ from ...video_processing_utils import BaseVideoProcessor
 from ...video_utils import VideoInput
 from ..siglip2.configuration_siglip2 import Siglip2VisionConfig
 from ..youtu.configuration_youtu import YoutuConfig
+from ..qwen3.configuration_qwen3 import Qwen3Config
 from ..youtu.modeling_youtu import (
     YoutuAttention,
     YoutuDecoderLayer,
@@ -39,6 +40,8 @@ from ..youtu.modeling_youtu import (
     YoutuRMSNorm,
     YoutuRotaryEmbedding,
 )
+from ..qwen3_vita.modeling_qwen3_vita import Qwen3VITAOmniModel
+from ..qwen3_vita.configuration_qwen3_vita import Qwen3VITAOmniConfig
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
@@ -50,14 +53,12 @@ if is_decord_available():
 if is_torchaudio_available():
     import torchaudio
 
-import ffmpeg
 from funasr.frontends.wav_frontend import WavFrontend
 from funasr.utils.load_utils import extract_fbank
 
 is_aiter_available = False
 
 logger = logging.get_logger(__name__)
-
 
 
 class YoutuVITAAudioConfig(PreTrainedConfig):
@@ -171,13 +172,24 @@ class YoutuVITATextConfig(YoutuConfig):
     pass
 
 
+class YoutuVITAOmniConfig(Qwen3VITAOmniConfig):
+
+    model_type = "youtu_vita_omni"
+    base_config_key = "omni_config"
+
+
 class YoutuVITAConfig(PreTrainedConfig):
     r"""
     YoutuVITAConfig
     """
 
     model_type = "youtu_vita"
-    sub_configs = {"audio_config": YoutuVITAAudioConfig, "vision_config": YoutuVITAVisionConfig, "text_config": YoutuVITATextConfig}
+    sub_configs = {
+        "audio_config": YoutuVITAAudioConfig,
+        "vision_config": YoutuVITAVisionConfig,
+        "text_config": YoutuVITATextConfig,
+        "omni_config": YoutuVITAOmniConfig,
+    }
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -185,6 +197,7 @@ class YoutuVITAConfig(PreTrainedConfig):
         audio_config=None,
         text_config=None,
         vision_config=None,
+        omni_config=None,
         # image_token_id=133375,
         # video_token_id=133379,
         # audio_token_id=133383,
@@ -195,20 +208,23 @@ class YoutuVITAConfig(PreTrainedConfig):
         tie_word_embeddings=False,
         **kwargs,
     ):
-        if isinstance(audio_config, dict):
-            self.audio_config = self.sub_configs["audio_config"](**audio_config)
-        elif audio_config is None:
-            self.audio_config = self.sub_configs["audio_config"]()
+        def _build_sub_config(key, value):
+            if value is None:
+                return None
+            if isinstance(value, dict):
+                return self.sub_configs[key](**value)
+            return value
 
-        if isinstance(vision_config, dict):
-            self.vision_config = self.sub_configs["vision_config"](**vision_config)
-        elif vision_config is None:
-            self.vision_config = self.sub_configs["vision_config"]()
+        self.audio_config = _build_sub_config("audio_config", audio_config)
+        self.vision_config = _build_sub_config("vision_config", vision_config)
+        self.omni_config = _build_sub_config("omni_config", omni_config)
 
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
             self.text_config = self.sub_configs["text_config"]()
+        else:
+            self.text_config = text_config
 
         # self.image_token_id = image_token_id
         # self.video_token_id = video_token_id
@@ -220,8 +236,6 @@ class YoutuVITAConfig(PreTrainedConfig):
 
         self.tie_word_embeddings = tie_word_embeddings
         super().__init__(**kwargs)
-
-
 
 
 def _get_feat_extract_output_lengths(input_lengths):
@@ -344,35 +358,6 @@ class YoutuVITACNNAudio(nn.Module):
         features = torch.nn.utils.rnn.pad_sequence(features, batch_first=True, padding_value=0.0)
 
         return features, feature_lengths
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 class YoutuVITAAudioSinusoidalPositionEncoder(torch.nn.Module):
@@ -1294,7 +1279,7 @@ class YoutuVITAVisionAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = False,
+        # output_attentions: Optional[bool] = False,
         cu_seqlens: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -1350,10 +1335,11 @@ class YoutuVITAVisionAttention(nn.Module):
         attn_output = attn_output.reshape(seq_length, embed_dim).contiguous()
         attn_output = self.out_proj(attn_output)
 
-        if not output_attentions:
-            attn_weights = None
+        # if not output_attentions:
+        #     attn_weights = None
 
         return attn_output, attn_weights
+
 
 class YoutuVITAVisionFlashAttention2(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -1416,6 +1402,7 @@ class YoutuVITAVisionFlashAttention2(nn.Module):
         attn_output = self.out_proj(attn_output)
         return attn_output, None
 
+
 class YoutuVITAVisionMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1445,7 +1432,7 @@ class YoutuVITAVisionEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        output_attentions: Optional[bool] = False,
+        # output_attentions: Optional[bool] = False,
         cu_seqlens: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.FloatTensor]:
@@ -1462,10 +1449,10 @@ class YoutuVITAVisionEncoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
+        hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            output_attentions=output_attentions,
+            # output_attentions=output_attentions,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
         )
@@ -1476,12 +1463,15 @@ class YoutuVITAVisionEncoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        return hidden_states
+        
+        # outputs = (hidden_states,)
 
-        if output_attentions:
-            outputs += (attn_weights,)
+        # if output_attentions:
+        #     outputs += (attn_weights,)
 
-        return outputs
+        # return outputs
+
 
 class YoutuVITAVisionEncoder(nn.Module):
     """
@@ -1536,14 +1526,13 @@ class YoutuVITAVisionEncoder(nn.Module):
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
-    # Ignore copy
     def forward(
         self,
         inputs_embeds,
         grid_thw,
         attention_mask: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
+        # output_attentions: Optional[bool] = None,
+        # output_hidden_states: Optional[bool] = None,
     ) -> BaseModelOutput:
         r"""
         Args:
@@ -1567,16 +1556,15 @@ class YoutuVITAVisionEncoder(nn.Module):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        # output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        # output_hidden_states = (
+        #     output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        # )
 
-        encoder_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
+        # encoder_states = () if output_hidden_states else None
+        # all_attentions = () if output_attentions else None
 
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
-
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
@@ -1588,14 +1576,15 @@ class YoutuVITAVisionEncoder(nn.Module):
 
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            if output_hidden_states:
-                encoder_states = encoder_states + (hidden_states,)
+            encoder_layer.self_attn.is_causal = False
+            # if output_hidden_states:
+            #     encoder_states = encoder_states + (hidden_states,)
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     encoder_layer.__call__,
                     hidden_states,
                     attention_mask,
-                    output_attentions,
+                    # output_attentions,
                     cu_seqlens,
                     position_embeddings,
                 )
@@ -1603,23 +1592,23 @@ class YoutuVITAVisionEncoder(nn.Module):
                 layer_outputs = encoder_layer(
                     hidden_states,
                     attention_mask,
-                    output_attentions=output_attentions,
+                    # output_attentions=output_attentions,
                     cu_seqlens=cu_seqlens, 
                     position_embeddings=position_embeddings
                 )
 
-            hidden_states = layer_outputs[0]
+            # hidden_states = layer_outputs[0]
 
-            if output_attentions:
-                all_attentions = all_attentions + (layer_outputs[1],)
+            # if output_attentions:
+            #     all_attentions = all_attentions + (layer_outputs[1],)
 
-        if output_hidden_states:
-            encoder_states = encoder_states + (hidden_states,)
+        # if output_hidden_states:
+        #     encoder_states = encoder_states + (hidden_states,)
 
         return BaseModelOutput(
             last_hidden_state=hidden_states,
-            hidden_states=encoder_states,
-            attentions=all_attentions,
+            # hidden_states=encoder_states,
+            # attentions=all_attentions,
         )
 
 
@@ -1642,17 +1631,17 @@ class YoutuVITAVisionModel(YoutuVITAVisionPreTrainedModel):
         pixel_values: torch.FloatTensor,
         grid_thw: torch.LongTensor,
         attention_mask: torch.Tensor,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
+        # output_attentions: Optional[bool] = None,
+        # output_hidden_states: Optional[bool] = None,
     ) -> BaseModelOutputWithPooling:
         r"""
         Returns:
 
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        # output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        # output_hidden_states = (
+        #     output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        # )
 
         hidden_states = self.embeddings(pixel_values, grid_thw)
 
@@ -1666,24 +1655,24 @@ class YoutuVITAVisionModel(YoutuVITAVisionPreTrainedModel):
             inputs_embeds=hidden_states,
             grid_thw=grid_thw,
             attention_mask=encoder_attention_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            # output_attentions=output_attentions,
+            # output_hidden_states=output_hidden_states,
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
         # last_hidden_state = self.post_layernorm(last_hidden_state)
 
         # pooler_output = self.head(last_hidden_state, attention_mask) if self.use_head else None
-        pooler_output = None
+        # pooler_output = None
 
         assert last_hidden_state.shape[0] == len(pixel_values)
         last_hidden_state = self.merger(last_hidden_state)
 
         return BaseModelOutputWithPooling(
             last_hidden_state=last_hidden_state,
-            pooler_output=pooler_output,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
+            # pooler_output=pooler_output,
+            # hidden_states=encoder_outputs.hidden_states,
+            # attentions=encoder_outputs.attentions,
         )
 
 
@@ -1691,11 +1680,33 @@ class YoutuVITATextModel(YoutuVITAPreTrainedModel, YoutuModel):
     config: YoutuVITATextConfig
 
 
+# ---------------------------------------------------------------------------
+# Omni encoder (shared Qwen3 transformer for vision + audio).
+#
+# Mirrors ``vita_megatron/core/models/omni`` (``omni_model.py``,
+# ``qwen3_model.py``): a single Qwen3-style transformer body consumes packed
+# features from both modalities with 2D (vision) / 1D (audio) rotary positions,
+# followed by a modality-specific merger+MLP projector into the LM hidden dim.
+# ---------------------------------------------------------------------------
+
+
+class YoutuVITAOmniModel(Qwen3VITAOmniModel):
+    pass
+
+
 class YoutuVITAModel(YoutuVITAPreTrainedModel):
     def __init__(self, config: YoutuVITAConfig):
         super().__init__(config)
-        self.audio_model = YoutuVITAAudioModel._from_config(config.audio_config)
-        self.vision_model = YoutuVITAVisionModel._from_config(config.vision_config)
+        self.omni_model = None
+        self.vision_model = None
+        self.audio_model = None
+        if config.omni_config is not None:
+            self.omni_model = YoutuVITAOmniModel._from_config(config.omni_config)
+        if config.vision_config is not None:
+            self.vision_model = YoutuVITAVisionModel._from_config(config.vision_config)
+        if config.audio_config is not None:
+            self.audio_model = YoutuVITAAudioModel._from_config(config.audio_config)
+
         self.language_model = YoutuVITATextModel._from_config(config.text_config)
 
     def get_input_embeddings(self):
@@ -1703,6 +1714,32 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.language_model.embed_tokens = value
+
+    # ------------------------------------------------------------------
+    # Modality forward dispatch — when ``self.omni_model`` is present, the
+    # vision and audio inputs go through the shared Qwen3 omni encoder
+    # (mirrors ``GPTMMModel._preprocess`` in
+    # ``vita_megatron/core/models/multimodal/gpt_mm_model.py``).
+    # ------------------------------------------------------------------
+    def _encode_vision(self, pixel_values, image_grid_thw):
+        """Return image embeddings of shape ``[N, hidden]``."""
+        if self.omni_model is not None:
+            return self.omni_model(
+                modality="vision",
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+            )
+        return self.vision_model(
+            pixel_values=pixel_values,
+            attention_mask=None,
+            grid_thw=image_grid_thw,
+        ).last_hidden_state
+
+    def _encode_audio(self, audios):
+        """Return ``(audio_embeddings, audio_lengths)``."""
+        if self.omni_model is not None:
+            return self.omni_model(modality="audio", audios=audios)
+        return self.audio_model(audios)
 
     def forward(
         self,
@@ -1739,21 +1776,19 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
                 for chunk_idx in range(chunk_num):
                     _image_grid_thw = image_grid_thw[chunk_idx]
                     im_ed = im_st + (_image_grid_thw[:, 1] * _image_grid_thw[:, 2] * _image_grid_thw[:, 0]).sum().item()
-                    _image_embeds = self.vision_model(
+                    _image_embeds = self._encode_vision(
                         pixel_values=images[im_st:im_ed],
-                        attention_mask=None,
-                        grid_thw=image_grid_thw[chunk_idx],
-                    ).last_hidden_state
+                        image_grid_thw=image_grid_thw[chunk_idx],
+                    )
                     image_embeds.append(_image_embeds)
 
                     im_st = im_ed
                 image_embeds = torch.cat(image_embeds, dim=0)
             else:
-                image_embeds = self.vision_model(
+                image_embeds = self._encode_vision(
                     pixel_values=images,
-                    attention_mask=None,
-                    grid_thw=image_grid_thw,
-                ).last_hidden_state
+                    image_grid_thw=image_grid_thw,
+                )
             # print(f"image_embeds {image_embeds.size()}")
             # assert image_embeds.shape[0] == len(images)
             fake_images = None
@@ -1777,11 +1812,10 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
             # print(f"{image_grid_thw.size()=}")
             # print(f"{fake_images.size()=}")
 
-            image_embeds = self.vision_model(
+            image_embeds = self._encode_vision(
                 pixel_values=fake_images,
-                attention_mask=None,
-                grid_thw=image_grid_thw,
-            ).last_hidden_state
+                image_grid_thw=image_grid_thw,
+            )
             # image_embeds = image_embeds[:, 1:, :]
             # image_embeds = self.vision_projection(image_embeds)
 
@@ -1793,7 +1827,7 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
             image_embeds = None
 
         if audios is not None:
-            audio_embeds, audio_lengths = self.audio_model(audios)
+            audio_embeds, audio_lengths = self._encode_audio(audios)
             # if torch.distributed.get_rank() == 0:
             #     print(f"audio_embeds {audio_embeds.size()}")
             # assert audio_embeds.shape[0] == len(audios)
@@ -1818,7 +1852,7 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
             device = self.get_input_embeddings().weight.data.device
             dtype = self.get_input_embeddings().weight.data.dtype
             fake_audios = torch.ones((1, 1, 560), dtype=dtype, device=device)
-            audio_embeds, audio_lengths = self.audio_model(fake_audios)
+            audio_embeds, audio_lengths = self._encode_audio(fake_audios)
             # audio_embeds = self.audio_projection(audio_embeds)
 
         else:
@@ -2264,22 +2298,18 @@ class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
         )
 
 
-# _GLOBAL_TOKEN = Youtu_VITA_TOKEN_bus1()
-_GLOBAL_TOKEN = Youtu_VITA_TOKEN()
+# _GLOBAL_CONSTANTS = Youtu_VITA_TOKEN_bus1()
+_GLOBAL_CONSTANTS = Youtu_VITA_TOKEN()
 
 
 def get_token():
-    _ensure_var_is_initialized(_GLOBAL_TOKEN, "token")
-    return _GLOBAL_TOKEN
+    _ensure_var_is_initialized(_GLOBAL_CONSTANTS, "token")
+    return _GLOBAL_CONSTANTS
 
 
 def _ensure_var_is_initialized(var, name):
     """Make sure the input variable is not None."""
     assert var is not None, "{} is not initialized.".format(name)
-
-
-
-
 
 
 def update_tokenizer_for_glm4voice(tokenizer):
@@ -2348,7 +2378,7 @@ class GLM4VoiceTokenizer:
         else:
             self.device = "cuda"
             # self.device = "cpu"
-        # self.device = "cpu"
+        self.device = "cpu"
 
         logger.info(f"{self.device=}")
 
@@ -2405,7 +2435,7 @@ class GLM4VoiceTokenizer:
     @torch.no_grad()
     # @torch.compiler.disable
     def decode(self, audio_tokens, option_steps=10, **kwargs):
-        if not hasattr(self, "whisper_model"):
+        if not hasattr(self, "audio_decoder"):
             self.load_model()
 
         this_uuid = str(uuid.uuid4())
@@ -3250,12 +3280,12 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         audio_chunk_max_second=30,
         **kwargs,
     ):
-        GLOBAL_TOKEN = get_token()
+        GLOBAL_CONSTANTS = get_token()
 
-        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_CONTEXT_TOKEN)
-        AUD_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_TAG_TOKEN)
-        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_START_TOKEN)
-        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_END_TOKEN)
+        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_CONTEXT_TOKEN)
+        AUD_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_TAG_TOKEN)
+        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_START_TOKEN)
+        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_END_TOKEN)
 
         if self.audio_tokenizer.tokenizer_discrete is not None:
             AUD_FIRST_ID = tokenizer.convert_tokens_to_ids(
@@ -3289,7 +3319,7 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                 new_targets += targets[st:aud_pos]
             if additional_targets_list is not None:
                 additional_targets_list = [
-                    x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * (aud_pos - st)
+                    x + [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * (aud_pos - st)
                     for x in additional_targets_list
                 ]
 
@@ -3434,7 +3464,7 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                             if is_pretrain:
                                 new_targets += _input_id
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(
                                     _input_id
                                 )
 
@@ -3443,10 +3473,10 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                         if is_pretrain:
                             new_targets += [AUD_START_ID]
                         else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
                     if additional_targets_list is not None:
                         additional_targets_list = [
-                            x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                            x + [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
                             for x in additional_targets_list
                         ]
 
@@ -3471,11 +3501,11 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                     new_input_ids += [AUD_CONTEXT_ID] * audio_token_length
                     if targets is not None:
                         new_targets += [
-                            GLOBAL_TOKEN.IGNORE_TOKEN_ID
+                            GLOBAL_CONSTANTS.IGNORE_TOKEN_ID
                         ] * audio_token_length
                     if additional_targets_list is not None:
                         additional_targets_list = [
-                            x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * audio_token_length
+                            x + [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * audio_token_length
                             for x in additional_targets_list
                         ]
 
@@ -3484,10 +3514,10 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                         if is_pretrain:
                             new_targets += [AUD_END_ID]
                         else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
                     if additional_targets_list is not None:
                         additional_targets_list = [
-                            x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                            x + [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
                             for x in additional_targets_list
                         ]
 
@@ -3498,7 +3528,7 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
             new_targets += targets[st:]
         if additional_targets_list is not None:
             additional_targets_list = [
-                x + [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * (len(targets) - st)
+                x + [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * (len(targets) - st)
                 for x in additional_targets_list
             ]
 
@@ -3517,23 +3547,6 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
             )
 
         return input_ids, audios, audio_indices
-
-
-def has_audio(video_path):
-    if not isinstance(video_path, str):
-        return False
-
-    if os.path.isdir(video_path):
-        return False
-
-    try:
-        # Probe for audio streams only
-        probe_result = ffmpeg.probe(video_path, select_streams="a")
-        # If 'streams' list is not empty, it indicates an audio stream exists
-        return bool(probe_result["streams"])
-    except Exception as e:
-        logger.error(f"Error probing video: {e}")
-        return False
 
 
 class YoutuVITAVideoProcessor(BaseVideoProcessor):
@@ -3705,7 +3718,6 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                 raise NotImplementedError(video_file_or_dir)
 
         audio = None
-        # if has_audio(video_file_or_dir):
         try:
             audio, sampling_rate = torchaudio.load(video_file_or_dir)
             # print(f"{audio.size()=} {sampling_rate=}")
@@ -3842,23 +3854,23 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         video_audio_chunk_min_second = kwargs.get("video_audio_chuk_min_second", self.video_audio_chunk_min_second)
         video_audio_chunk_max_second = kwargs.get("video_audio_chuk_max_second", self.video_audio_chunk_max_second)
 
-        GLOBAL_TOKEN = get_token()
+        GLOBAL_CONSTANTS = get_token()
 
-        IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_CONTEXT_TOKEN)
-        IMG_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_START_TOKEN)
-        IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_END_TOKEN)
+        IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_CONTEXT_TOKEN)
+        IMG_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_START_TOKEN)
+        IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_END_TOKEN)
 
-        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_CONTEXT_TOKEN)
-        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_START_TOKEN)
-        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_END_TOKEN)
+        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_CONTEXT_TOKEN)
+        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_START_TOKEN)
+        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_END_TOKEN)
 
-        VID_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_CONTEXT_TOKEN)
-        VID_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_START_TOKEN)
-        VID_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_END_TOKEN)
+        VID_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_CONTEXT_TOKEN)
+        VID_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_START_TOKEN)
+        VID_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_END_TOKEN)
 
-        IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_TAG_TOKEN)
-        AUD_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_TAG_TOKEN)
-        VID_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_TAG_TOKEN)
+        IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_TAG_TOKEN)
+        AUD_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_TAG_TOKEN)
+        VID_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_TAG_TOKEN)
 
         nl_tokens = tokenizer("\n", add_special_tokens=False).input_ids
 
@@ -4012,7 +4024,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
             new_input_ids += [VID_START_ID]
             if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
             timestamp_format = "HHMMSS"
 
@@ -4050,7 +4062,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                         if is_pretrain:
                             new_targets += _input_id
                         else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
 
                     if vid_idx in contiguous_video_idxs:
                         new_input_ids += [IMG_START_ID]
@@ -4058,7 +4070,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             if is_pretrain:
                                 new_targets += [IMG_START_ID]
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                         if self.image_processor.vision_resolution_type == "native":
                             resolution = f"{_video_grid_thw[0][1] * self.patch_size}*{_video_grid_thw[0][2] * self.patch_size}"
@@ -4067,9 +4079,9 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             if targets is not None:
                                 if is_pretrain:
                                     # new_targets += _input_id
-                                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
+                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
                                 else:
-                                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
+                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
 
                             for _ in range(
                                 _video_grid_thw[0][0]
@@ -4097,7 +4109,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                                 new_input_ids += [IMG_CONTEXT_ID] * image_token_length
                                 if targets is not None:
                                     new_targets += [
-                                        GLOBAL_TOKEN.IGNORE_TOKEN_ID
+                                        GLOBAL_CONSTANTS.IGNORE_TOKEN_ID
                                     ] * image_token_length
 
                                 new_input_ids += nl_tokens
@@ -4105,7 +4117,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                                     if is_pretrain:
                                         new_targets += nl_tokens
                                     else:
-                                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(
+                                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(
                                             nl_tokens
                                         )
 
@@ -4134,14 +4146,14 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
                             new_input_ids += [IMG_CONTEXT_ID] * image_token_length
                             if targets is not None:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
 
                         new_input_ids += [IMG_END_ID]
                         if targets is not None:
                             if is_pretrain:
                                 new_targets += [IMG_END_ID]
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                     if vid_idx in discrete_video_idxs:
                         raise NotImplementedError
@@ -4161,7 +4173,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                         if is_pretrain:
                             new_targets += _input_id
                         else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
 
                     if vid_idx in contiguous_video_idxs:
                         new_input_ids += [AUD_START_ID]
@@ -4169,7 +4181,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             if is_pretrain:
                                 new_targets += [AUD_START_ID]
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                         audio_token_length = -(-audio_token_length_func(len(audio_chunk_frame)) // self.temporal_merge_size)
                         audio_indice_b = torch.zeros(
@@ -4189,14 +4201,14 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
                         new_input_ids += [AUD_CONTEXT_ID] * audio_token_length
                         if targets is not None:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * audio_token_length
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * audio_token_length
 
                         new_input_ids += [AUD_END_ID]
                         if targets is not None:
                             if is_pretrain:
                                 new_targets += [AUD_END_ID]
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                     if vid_idx in discrete_video_idxs:
                         raise NotImplementedError
@@ -4206,7 +4218,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                 if is_pretrain:
                     new_targets += [VID_END_ID]
                 else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
             video_grid_thw.extend(_video_grid_thw)
             second_per_grids.extend(_second_per_grids)
@@ -4307,13 +4319,13 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         self.image_max_num_tokens = image_max_num_tokens
         self.image_min_num_tokens = image_min_num_tokens
 
-        GLOBAL_TOKEN = get_token()
+        GLOBAL_CONSTANTS = get_token()
         if vision_normalize_type == "imagenet":
-            MEAN, STD = GLOBAL_TOKEN.IMAGENET_DEFAULT_MEAN, GLOBAL_TOKEN.IMAGENET_DEFAULT_STD
+            MEAN, STD = GLOBAL_CONSTANTS.IMAGENET_DEFAULT_MEAN, GLOBAL_CONSTANTS.IMAGENET_DEFAULT_STD
         elif vision_normalize_type == "clip":
-            MEAN, STD = GLOBAL_TOKEN.OPENAI_CLIP_MEAN, GLOBAL_TOKEN.OPENAI_CLIP_STD
+            MEAN, STD = GLOBAL_CONSTANTS.OPENAI_CLIP_MEAN, GLOBAL_CONSTANTS.OPENAI_CLIP_STD
         elif vision_normalize_type == "siglip":
-            MEAN, STD = GLOBAL_TOKEN.IMAGENET_STANDARD_MEAN, GLOBAL_TOKEN.IMAGENET_STANDARD_STD
+            MEAN, STD = GLOBAL_CONSTANTS.IMAGENET_STANDARD_MEAN, GLOBAL_CONSTANTS.IMAGENET_STANDARD_STD
         else:
             raise NotImplementedError(vision_normalize_type)
         self.mean = MEAN
@@ -4735,19 +4747,19 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         **kwargs,
     ):
 
-        GLOBAL_TOKEN = get_token()
+        GLOBAL_CONSTANTS = get_token()
 
-        IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_CONTEXT_TOKEN)
-        IMG_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_START_TOKEN)
-        IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_END_TOKEN)
-        IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_TAG_TOKEN)
+        IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_CONTEXT_TOKEN)
+        IMG_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_START_TOKEN)
+        IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_END_TOKEN)
+        IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_TAG_TOKEN)
 
         if self.vision_resolution_type == "native":
             pass
         else:
-            PATCH_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.PATCH_CONTEXT_TOKEN)
-            PATCH_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.PATCH_START_TOKEN)
-            PATCH_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.PATCH_END_TOKEN)
+            PATCH_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.PATCH_CONTEXT_TOKEN)
+            PATCH_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.PATCH_START_TOKEN)
+            PATCH_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.PATCH_END_TOKEN)
 
         if self.vision_tokenizer.first_vision_token is not None:
             IMG_FIRST_ID = tokenizer.convert_tokens_to_ids(self.vision_tokenizer.first_vision_token)
@@ -4854,7 +4866,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                     if is_pretrain:
                         new_targets += [IMG_START_ID]
                     else:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                 if self.vision_resolution_type == "native":
                     resolution = f"{_image_grid_thw[0][1] * self.patch_size}*{_image_grid_thw[0][2] * self.patch_size}"
@@ -4863,16 +4875,16 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                     if targets is not None:
                         if is_pretrain:
                             # new_targets += size_input_id
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(size_input_id)
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(size_input_id)
                         else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(size_input_id)
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(size_input_id)
 
                     new_input_ids += nl_tokens
                     if targets is not None:
                         if is_pretrain:
                             new_targets += [IMG_EOL_ID]
                         else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(nl_tokens)
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
 
                     for _h in range(
                         _image_grid_thw[0][0] * _image_grid_thw[0][1] // self.spatial_merge_size
@@ -4895,14 +4907,14 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
 
                         new_input_ids += [IMG_CONTEXT_ID] * image_token_length
                         if targets is not None:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
 
                         new_input_ids += nl_tokens
                         if targets is not None:
                             if is_pretrain:
                                 new_targets += nl_tokens
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(nl_tokens)
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
 
                 else:
                     image_token_length = (
@@ -4927,14 +4939,14 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
 
                     new_input_ids += [IMG_CONTEXT_ID] * image_token_length
                     if targets is not None:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
 
                 new_input_ids += [IMG_END_ID]
                 if targets is not None:
                     if is_pretrain:
                         new_targets += [IMG_END_ID]
                     else:
-                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                 if len(image_patches) > 1:
                     for _ in range(0, best_height, self.tile_image_size):
@@ -4943,7 +4955,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                             if is_pretrain:
                                 new_targets += nl_tokens
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(nl_tokens)
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
 
                         for _ in range(0, best_width, self.tile_image_size):
                             new_input_ids += [PATCH_START_ID]
@@ -4951,7 +4963,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                                 if is_pretrain:
                                     new_targets += [PATCH_START_ID]
                                 else:
-                                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                             image_indice_b = torch.zeros(
                                 1, image_token_length, dtype=torch.int64
@@ -4970,14 +4982,14 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
 
                             new_input_ids += [PATCH_CONTEXT_ID] * image_token_length
                             if targets is not None:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
 
                             new_input_ids += [PATCH_END_ID]
                             if targets is not None:
                                 if is_pretrain:
                                     new_targets += [PATCH_END_ID]
                                 else:
-                                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
             st = img_pos + 1
 
