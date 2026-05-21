@@ -26,13 +26,13 @@ if is_torchaudio_available():
     import torchaudio
 
 
-# _GLOBAL_TOKEN = Youtu_VITA_TOKEN_bus1()
-_GLOBAL_TOKEN = Youtu_VITA_TOKEN()
+# _GLOBAL_CONSTANTS = Youtu_VITA_TOKEN_bus1()
+_GLOBAL_CONSTANTS = Youtu_VITA_TOKEN()
 
 
 def get_token():
-    _ensure_var_is_initialized(_GLOBAL_TOKEN, "token")
-    return _GLOBAL_TOKEN
+    _ensure_var_is_initialized(_GLOBAL_CONSTANTS, "token")
+    return _GLOBAL_CONSTANTS
 
 
 def _ensure_var_is_initialized(var, name):
@@ -204,7 +204,6 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                 raise NotImplementedError(video_file_or_dir)
 
         audio = None
-        # if has_audio(video_file_or_dir):
         try:
             audio, sampling_rate = torchaudio.load(video_file_or_dir)
             # print(f"{audio.size()=} {sampling_rate=}")
@@ -324,23 +323,23 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         video_audio_chunk_min_second = kwargs.get("video_audio_chuk_min_second", self.video_audio_chunk_min_second)
         video_audio_chunk_max_second = kwargs.get("video_audio_chuk_max_second", self.video_audio_chunk_max_second)
 
-        GLOBAL_TOKEN = get_token()
+        GLOBAL_CONSTANTS = get_token()
 
-        IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_CONTEXT_TOKEN)
-        IMG_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_START_TOKEN)
-        IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_END_TOKEN)
+        IMG_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_CONTEXT_TOKEN)
+        IMG_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_START_TOKEN)
+        IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_END_TOKEN)
 
-        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_CONTEXT_TOKEN)
-        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_START_TOKEN)
-        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_END_TOKEN)
+        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_CONTEXT_TOKEN)
+        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_START_TOKEN)
+        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_END_TOKEN)
 
-        VID_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_CONTEXT_TOKEN)
-        VID_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_START_TOKEN)
-        VID_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_END_TOKEN)
+        VID_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_CONTEXT_TOKEN)
+        VID_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_START_TOKEN)
+        VID_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_END_TOKEN)
 
-        IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.IMG_TAG_TOKEN)
-        AUD_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.AUD_TAG_TOKEN)
-        VID_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_TOKEN.VID_TAG_TOKEN)
+        IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_TAG_TOKEN)
+        AUD_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_TAG_TOKEN)
+        VID_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_TAG_TOKEN)
 
         nl_tokens = tokenizer("\n", add_special_tokens=False).input_ids
 
@@ -492,7 +491,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
             new_input_ids += [VID_START_ID]
             if targets is not None:
-                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
             timestamp_format = "HHMMSS"
 
@@ -526,7 +525,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                         if is_pretrain:
                             new_targets += _input_id
                         else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
 
                     if vid_idx in contiguous_video_idxs:
                         new_input_ids += [IMG_START_ID]
@@ -534,7 +533,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             if is_pretrain:
                                 new_targets += [IMG_START_ID]
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                         if self.image_processor.vision_resolution_type == "native":
                             resolution = (
@@ -545,9 +544,9 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             if targets is not None:
                                 if is_pretrain:
                                     # new_targets += _input_id
-                                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
+                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
                                 else:
-                                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
+                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
 
                             for _ in range(_video_grid_thw[0][0] * _video_grid_thw[0][1] // self.spatial_merge_size):
                                 image_token_length = _video_grid_thw[0][2] // self.spatial_merge_size
@@ -566,14 +565,14 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
                                 new_input_ids += [IMG_CONTEXT_ID] * image_token_length
                                 if targets is not None:
-                                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
+                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
 
                                 new_input_ids += nl_tokens
                                 if targets is not None:
                                     if is_pretrain:
                                         new_targets += nl_tokens
                                     else:
-                                        new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(nl_tokens)
+                                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
 
                         else:
                             image_token_length = (
@@ -598,14 +597,14 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
                             new_input_ids += [IMG_CONTEXT_ID] * image_token_length
                             if targets is not None:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * image_token_length
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
 
                         new_input_ids += [IMG_END_ID]
                         if targets is not None:
                             if is_pretrain:
                                 new_targets += [IMG_END_ID]
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                     if vid_idx in discrete_video_idxs:
                         raise NotImplementedError
@@ -622,7 +621,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                         if is_pretrain:
                             new_targets += _input_id
                         else:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * len(_input_id)
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
 
                     if vid_idx in contiguous_video_idxs:
                         new_input_ids += [AUD_START_ID]
@@ -630,7 +629,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             if is_pretrain:
                                 new_targets += [AUD_START_ID]
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                         audio_token_length = -(
                             -audio_token_length_func(len(audio_chunk_frame)) // self.temporal_merge_size
@@ -650,14 +649,14 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
                         new_input_ids += [AUD_CONTEXT_ID] * audio_token_length
                         if targets is not None:
-                            new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID] * audio_token_length
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * audio_token_length
 
                         new_input_ids += [AUD_END_ID]
                         if targets is not None:
                             if is_pretrain:
                                 new_targets += [AUD_END_ID]
                             else:
-                                new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                     if vid_idx in discrete_video_idxs:
                         raise NotImplementedError
@@ -667,7 +666,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                 if is_pretrain:
                     new_targets += [VID_END_ID]
                 else:
-                    new_targets += [GLOBAL_TOKEN.IGNORE_TOKEN_ID]
+                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
             video_grid_thw.extend(_video_grid_thw)
             second_per_grids.extend(_second_per_grids)

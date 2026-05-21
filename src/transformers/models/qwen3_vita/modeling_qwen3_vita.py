@@ -5,12 +5,10 @@
 #                          modular_qwen3_vita.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 from typing import Any, Optional
 
-import ffmpeg
 import torch
 from torch import nn
 
@@ -32,12 +30,7 @@ from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import AudioKwargs, Unpack
 from ...trainer_pt_utils import LabelSmoother
-from ...utils import (
-    TransformersKwargs,
-    auto_docstring,
-    is_flash_attn_2_available,
-    logging,
-)
+from ...utils import TransformersKwargs, auto_docstring, is_flash_attn_2_available, logging
 from ...utils.generic import maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
 from .configuration_qwen3_vita import (
@@ -1034,20 +1027,6 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def vision_apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
-    return q_embed, k_embed
-
-
 @use_kernelized_func(apply_rotary_pos_emb)
 class Qwen3VITATextAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -1099,16 +1078,7 @@ class Qwen3VITATextAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        if getattr(self.config, "use_llm", False):
-            # [B, H, S, D] -> [S, H, D]
-            query_states = query_states.squeeze(0).transpose(0, 1)
-            key_states = key_states.squeeze(0).transpose(0, 1)
-            query_states, key_states = vision_apply_rotary_pos_emb(query_states, key_states, cos, sin)
-            # [S, H, D] -> [B, H, S, D]
-            query_states = query_states.transpose(0, 1).unsqueeze(0)
-            key_states = key_states.transpose(0, 1).unsqueeze(0)
-        else:
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
@@ -1305,6 +1275,20 @@ def vision_eager_attention_forward(
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
+
+
+def vision_apply_rotary_pos_emb(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+    return q_embed, k_embed
 
 
 class Qwen3VITAVisionAttention(nn.Module):
@@ -1555,12 +1539,10 @@ class Qwen3VITAVisionEncoder(nn.Module):
     def __init__(self, config: Qwen3VITAVisionConfig):
         super().__init__()
         self.config = config
-        if config.use_llm:
-            self.layers = nn.ModuleList(
-                [Qwen3VITATextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-            )
-        else:
-            self.layers = nn.ModuleList([Qwen3VITAVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
+        # if self.config.use_llm:
+        #     self.layers = nn.ModuleList([Qwen3VITATextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        # else:
+        self.layers = nn.ModuleList([Qwen3VITAVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
         self.spatial_merge_size = 2
@@ -1640,18 +1622,18 @@ class Qwen3VITAVisionEncoder(nn.Module):
         # encoder_states = () if output_hidden_states else None
         # all_attentions = () if output_attentions else None
 
-        if getattr(self.config, "use_llm", False) and False:
-            # position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
-            # position_ids = position_ids.unsqueeze(0)
-            # position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+        # if self.config.use_llm and False:
+        #     # position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+        #     # position_ids = position_ids.unsqueeze(0)
+        #     # position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
-            rotary_pos_emb = self.rot_pos_emb(grid_thw)
-            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-            position_embeddings = (emb.cos().unsqueeze(0), emb.sin().unsqueeze(0))
-        else:
-            rotary_pos_emb = self.rot_pos_emb(grid_thw)
-            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-            position_embeddings = (emb.cos(), emb.sin())
+        #     rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        #     emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        #     position_embeddings = (emb.cos().unsqueeze(0), emb.sin().unsqueeze(0))
+        # else:
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
         # print(f"{position_embeddings[0].shape=} {position_embeddings[1].shape=} {inputs_embeds.shape=}")
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
@@ -1730,8 +1712,8 @@ class Qwen3VITAVisionModel(Qwen3VITAVisionPreTrainedModel):
         # )
 
         hidden_states = self.embeddings(pixel_values, grid_thw)
-        if getattr(self.config, "use_llm", False):
-            hidden_states = hidden_states.unsqueeze(0)
+        # if self.config.use_llm:
+        #     hidden_states = hidden_states.unsqueeze(0)
 
         if attention_mask is not None and not self._use_flash_attention_2:
             # [batch_size, seq_len] -> [batch_size, 1, tgt_seq_len, src_seq_len]
@@ -1753,8 +1735,8 @@ class Qwen3VITAVisionModel(Qwen3VITAVisionPreTrainedModel):
         # pooler_output = self.head(last_hidden_state, attention_mask) if self.use_head else None
         # pooler_output = None
 
-        if getattr(self.config, "use_llm", False):
-            last_hidden_state = last_hidden_state.squeeze(0)
+        # if self.config.use_llm:
+        #     last_hidden_state = last_hidden_state.squeeze(0)
 
         assert last_hidden_state.shape[0] == len(pixel_values)
         last_hidden_state = self.merger(last_hidden_state)
@@ -1868,7 +1850,6 @@ class Qwen3VITAOmniPreTrainedModel(PreTrainedModel):
     _supports_flash_attn = True
     _supports_sdpa = True
     config: Qwen3VITAOmniConfig
-    base_model_prefix = "model"
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -2229,23 +2210,6 @@ class Qwen3VITAOmniAudioPatchMerger(Qwen3VITAAudioPatchMerger):
 
     def __init__(self, config: Qwen3VITAOmniConfig) -> None:
         super().__init__(config)
-
-
-def has_audio(video_path):
-    if not isinstance(video_path, str):
-        return False
-
-    if os.path.isdir(video_path):
-        return False
-
-    try:
-        # Probe for audio streams only
-        probe_result = ffmpeg.probe(video_path, select_streams="a")
-        # If 'streams' list is not empty, it indicates an audio stream exists
-        return bool(probe_result["streams"])
-    except Exception as e:
-        logger.error(f"Error probing video: {e}")
-        return False
 
 
 class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):

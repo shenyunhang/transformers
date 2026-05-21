@@ -8,7 +8,7 @@
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, fields
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
@@ -18,7 +18,7 @@ from ... import initialization as init
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
-from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub
+from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
 from ...masking_utils import create_causal_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import GradientCheckpointingLayer
@@ -35,7 +35,13 @@ from ...trainer_pt_utils import LabelSmoother
 from ...utils import TransformersKwargs, auto_docstring, is_flash_attn_2_available, logging
 from ...utils.generic import is_flash_attention_requested, maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
-from .configuration_youtu_vita import YoutuVITAAudioConfig, YoutuVITAConfig, YoutuVITATextConfig, YoutuVITAVisionConfig
+from .configuration_youtu_vita import (
+    YoutuVITAAudioConfig,
+    YoutuVITAConfig,
+    YoutuVITAOmniConfig,
+    YoutuVITATextConfig,
+    YoutuVITAVisionConfig,
+)
 
 
 if is_flash_attn_2_available():
@@ -1399,7 +1405,7 @@ class YoutuVITAVisionAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        output_attentions: bool | None = False,
+        # output_attentions: Optional[bool] = False,
         cu_seqlens: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1455,8 +1461,8 @@ class YoutuVITAVisionAttention(nn.Module):
         attn_output = attn_output.reshape(seq_length, embed_dim).contiguous()
         attn_output = self.out_proj(attn_output)
 
-        if not output_attentions:
-            attn_weights = None
+        # if not output_attentions:
+        #     attn_weights = None
 
         return attn_output, attn_weights
 
@@ -1565,7 +1571,7 @@ class YoutuVITAVisionEncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        output_attentions: bool | None = False,
+        # output_attentions: Optional[bool] = False,
         cu_seqlens: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.FloatTensor]:
@@ -1582,10 +1588,10 @@ class YoutuVITAVisionEncoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
+        hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            output_attentions=output_attentions,
+            # output_attentions=output_attentions,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
         )
@@ -1596,12 +1602,14 @@ class YoutuVITAVisionEncoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        return hidden_states
 
-        if output_attentions:
-            outputs += (attn_weights,)
+        # outputs = (hidden_states,)
 
-        return outputs
+        # if output_attentions:
+        #     outputs += (attn_weights,)
+
+        # return outputs
 
 
 class YoutuVITAVisionEncoder(nn.Module):
@@ -1657,14 +1665,13 @@ class YoutuVITAVisionEncoder(nn.Module):
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
         return rotary_pos_emb
 
-    # Ignore copy
     def forward(
         self,
         inputs_embeds,
         grid_thw,
         attention_mask: torch.Tensor | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
+        # output_attentions: Optional[bool] = None,
+        # output_hidden_states: Optional[bool] = None,
     ) -> BaseModelOutput:
         r"""
         Args:
@@ -1688,16 +1695,15 @@ class YoutuVITAVisionEncoder(nn.Module):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        # output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        # output_hidden_states = (
+        #     output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        # )
 
-        encoder_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
+        # encoder_states = () if output_hidden_states else None
+        # all_attentions = () if output_attentions else None
 
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
-
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
@@ -1709,14 +1715,15 @@ class YoutuVITAVisionEncoder(nn.Module):
 
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            if output_hidden_states:
-                encoder_states = encoder_states + (hidden_states,)
+            encoder_layer.self_attn.is_causal = False
+            # if output_hidden_states:
+            #     encoder_states = encoder_states + (hidden_states,)
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     encoder_layer.__call__,
                     hidden_states,
                     attention_mask,
-                    output_attentions,
+                    # output_attentions,
                     cu_seqlens,
                     position_embeddings,
                 )
@@ -1724,23 +1731,23 @@ class YoutuVITAVisionEncoder(nn.Module):
                 layer_outputs = encoder_layer(
                     hidden_states,
                     attention_mask,
-                    output_attentions=output_attentions,
+                    # output_attentions=output_attentions,
                     cu_seqlens=cu_seqlens,
                     position_embeddings=position_embeddings,
                 )
 
-            hidden_states = layer_outputs[0]
+            # hidden_states = layer_outputs[0]
 
-            if output_attentions:
-                all_attentions = all_attentions + (layer_outputs[1],)
+            # if output_attentions:
+            #     all_attentions = all_attentions + (layer_outputs[1],)
 
-        if output_hidden_states:
-            encoder_states = encoder_states + (hidden_states,)
+        # if output_hidden_states:
+        #     encoder_states = encoder_states + (hidden_states,)
 
         return BaseModelOutput(
             last_hidden_state=hidden_states,
-            hidden_states=encoder_states,
-            attentions=all_attentions,
+            # hidden_states=encoder_states,
+            # attentions=all_attentions,
         )
 
 
@@ -1763,17 +1770,17 @@ class YoutuVITAVisionModel(YoutuVITAVisionPreTrainedModel):
         pixel_values: torch.FloatTensor,
         grid_thw: torch.LongTensor,
         attention_mask: torch.Tensor,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
+        # output_attentions: Optional[bool] = None,
+        # output_hidden_states: Optional[bool] = None,
     ) -> BaseModelOutputWithPooling:
         r"""
         Returns:
 
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        # output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        # output_hidden_states = (
+        #     output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        # )
 
         hidden_states = self.embeddings(pixel_values, grid_thw)
 
@@ -1787,24 +1794,24 @@ class YoutuVITAVisionModel(YoutuVITAVisionPreTrainedModel):
             inputs_embeds=hidden_states,
             grid_thw=grid_thw,
             attention_mask=encoder_attention_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
+            # output_attentions=output_attentions,
+            # output_hidden_states=output_hidden_states,
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
         # last_hidden_state = self.post_layernorm(last_hidden_state)
 
         # pooler_output = self.head(last_hidden_state, attention_mask) if self.use_head else None
-        pooler_output = None
+        # pooler_output = None
 
         assert last_hidden_state.shape[0] == len(pixel_values)
         last_hidden_state = self.merger(last_hidden_state)
 
         return BaseModelOutputWithPooling(
             last_hidden_state=last_hidden_state,
-            pooler_output=pooler_output,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
+            # pooler_output=pooler_output,
+            # hidden_states=encoder_outputs.hidden_states,
+            # attentions=encoder_outputs.attentions,
         )
 
 
@@ -1884,11 +1891,527 @@ class YoutuVITATextModel(YoutuVITAPreTrainedModel):
         )
 
 
+# ---------------------------------------------------------------------------
+# Omni encoder (shared Qwen3 transformer for vision + audio).
+#
+# Mirrors ``vita_megatron/core/models/omni`` (``omni_model.py``,
+# ``qwen3_model.py``): a single Qwen3-style transformer body consumes packed
+# features from both modalities with 2D (vision) / 1D (audio) rotary positions,
+# followed by a modality-specific merger+MLP projector into the LM hidden dim.
+# ---------------------------------------------------------------------------
+
+
+class YoutuVITAOmniPreTrainedModel(PreTrainedModel):
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    config: YoutuVITAOmniConfig
+
+
+@use_kernel_forward_from_hub("RMSNorm")
+class YoutuVITAOmniRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        """
+        YoutuVITAOmniRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+class YoutuVITAOmniRotaryEmbedding(nn.Module):
+    """1D rotary building block shared by vision (2D) and audio (1D) RoPE.
+
+    Mirrors ``_RotaryEmbedding`` in ``vita_megatron/core/models/omni/qwen3_model.py``.
+    """
+
+    def __init__(self, dim: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+
+    def forward(self, seqlen) -> torch.Tensor:
+        # ``seqlen`` may be a python int or a 0-D / 1-D tensor.
+        if isinstance(seqlen, torch.Tensor):
+            device = seqlen.device
+            length = int(seqlen.max().item()) if seqlen.dim() > 0 else int(seqlen.item())
+        else:
+            device = torch.device("cpu")
+            length = int(seqlen)
+        inv_freq = 1.0 / (self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim))
+        seq = torch.arange(length, device=device, dtype=inv_freq.dtype)
+        return torch.outer(seq, inv_freq)
+
+
+class YoutuVITAOmniVisionEmbeddings(YoutuVITAVisionEmbeddings):
+    """Linear patch embedding for already-patchified vision pixel values.
+
+    Identical to :class:`YoutuVITAVisionEmbeddings`; only the config type
+    differs (omni reuses ``hidden_size``/``patch_size``/``num_channels`` from
+    :class:`YoutuVITAOmniConfig`). Mirrors ``LinearVisionEncoder`` in
+    ``vita_megatron/core/models/vision/linear_model.py``.
+    """
+
+    def __init__(self, config: YoutuVITAOmniConfig):
+        super().__init__(config)
+
+
+class YoutuVITAOmniAudioEmbeddings(YoutuVITACNNAudioEmbeddings):
+    """Conv2d audio front-end producing 8x temporally down-sampled features.
+
+    Inherits the three Conv2d stack from :class:`YoutuVITACNNAudioEmbeddings`
+    and adds a final linear projection so the CNN output is aligned with the
+    shared omni transformer ``hidden_size`` (mirrors
+    ``Conv2dAudioEncoderWithProj`` in
+    ``vita_megatron/core/models/audio/cnn_model.py``).
+    """
+
+    def __init__(self, config: YoutuVITAOmniConfig):
+        super().__init__(config)
+        # After three stride-2, padding=1 convolutions the feature axis is
+        # reduced as ``ceil(n / 2)`` at each step.
+        mel_after_cnn = (config.num_mel_bins + 1) // 2
+        mel_after_cnn = (mel_after_cnn + 1) // 2
+        mel_after_cnn = (mel_after_cnn + 1) // 2
+        self.proj_in_features = config.downsample_hidden_size * mel_after_cnn
+        self.linear_proj = nn.Linear(self.proj_in_features, config.hidden_size, bias=False)
+
+    def forward(self, input_features, feature_lens=None):
+        hidden_states, aftercnn_lens = super().forward(input_features, feature_lens)
+        hidden_states = self.linear_proj(hidden_states)
+        return hidden_states, aftercnn_lens
+
+
+class YoutuVITAOmniMLP(nn.Module):
+    """SwiGLU MLP (Qwen3 style). Inherits :class:`Qwen3MLP` directly."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
+
+@use_kernelized_func(apply_rotary_pos_emb)
+class YoutuVITAOmniFlashAttention2(nn.Module):
+    """Packed ``thd``-layout Qwen3-style attention (qk-norm, GQA) that takes
+    ``cu_seqlens`` and per-token ``(cos, sin)`` rotary positions.
+
+    Inherits :class:`Qwen3Attention` for the projection layers / qk-norm /
+    GQA wiring; only the forward path differs (varlen flash attention with
+    packed sequences instead of the standard causal LM attention).
+    """
+
+    def __init__(self, config: YoutuVITAOmniConfig, layer_idx: int = 0):
+        super().__init__()
+        self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        # Encoder use-case: bidirectional attention.
+        self.is_causal = False
+
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
+        self.q_norm = YoutuVITATextRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )  # unlike olmo, only on the head dim!
+        self.k_norm = YoutuVITATextRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )  # thus post q_norm does not need reshape
+        self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+        # Mirror naming used by :class:`YoutuVITAVisionFlashAttention2`.
+        self.dropout = config.attention_dropout
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        # ``hidden_states``: [seq_len, hidden] (packed ``thd``).
+        seq_length = hidden_states.shape[0]
+        num_heads = self.config.num_attention_heads
+        num_key_value_heads = self.config.num_key_value_heads
+
+        queries = self.q_proj(hidden_states).view(seq_length, num_heads, self.head_dim)
+        keys = self.k_proj(hidden_states).view(seq_length, num_key_value_heads, self.head_dim)
+        values = self.v_proj(hidden_states).view(seq_length, num_key_value_heads, self.head_dim)
+
+        queries = self.q_norm(queries)
+        keys = self.k_norm(keys)
+
+        cos, sin = position_embeddings
+        queries, keys = vision_apply_rotary_pos_emb_flashatt(queries.unsqueeze(0), keys.unsqueeze(0), cos, sin)
+        queries = queries.squeeze(0)
+        keys = keys.squeeze(0)
+
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        if is_aiter_available:
+            attn_output = flash_attn_varlen_func(
+                queries,
+                keys,
+                values,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                return_lse=True,
+            )[0].reshape(seq_length, -1)
+        else:
+            attn_output = flash_attn_varlen_func(
+                queries,
+                keys,
+                values,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+            ).reshape(seq_length, -1)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+
+class YoutuVITAOmniEncoderLayer(nn.Module):
+    """Qwen3-style transformer block (pre-norm, SwiGLU, qk-norm)."""
+
+    def __init__(self, config: YoutuVITAOmniConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.input_layernorm = YoutuVITAOmniRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = YoutuVITAOmniFlashAttention2(config)
+        self.post_attention_layernorm = YoutuVITAOmniRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = YoutuVITAOmniMLP(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
+    """Shared Qwen3 transformer body used by both vision and audio inputs.
+
+    Equivalent of ``Qwen3Model`` in
+    ``vita_megatron/core/models/omni/qwen3_model.py``. Consumes already-projected
+    features of shape ``[seq_len, hidden]`` together with packed-sequence
+    metadata (``cu_seqlens``, per-token ``(cos, sin)`` rotary positions).
+    """
+
+    config: YoutuVITAOmniConfig
+    _no_split_modules = ["YoutuVITAOmniEncoderLayer"]
+
+    def __init__(self, config: YoutuVITAOmniConfig):
+        super().__init__(config)
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.spatial_merge_size = int(config.spatial_merge_size)
+        self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
+
+        # Rotary building block. ``head_dim // 2`` matches the megatron reference
+        # (``kv_channels // 2``) — vision concatenates ``(h, w)`` pos so the
+        # final freqs dim equals ``head_dim``, audio duplicates to match.
+        self.rotary_pos_emb = YoutuVITAOmniRotaryEmbedding(config.head_dim // 2)
+
+        self.layers = nn.ModuleList([YoutuVITAOmniEncoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.gradient_checkpointing = False
+
+        self.post_init()
+
+    # ------------------------------------------------------------------ RoPE
+    def vision_rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        """2D rotary positions for Qwen-VL ``grid_thw``."""
+        pos_ids = []
+        for t, h, w in grid_thw:
+            t, h, w = int(t), int(h), int(w)
+            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            hpos_ids = hpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            hpos_ids = hpos_ids.permute(0, 2, 1, 3).flatten()
+
+            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            wpos_ids = wpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            wpos_ids = wpos_ids.permute(0, 2, 1, 3).flatten()
+            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+        pos_ids = torch.cat(pos_ids, dim=0)
+        max_grid_size = grid_thw[:, 1:].max()
+        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+        return rotary_pos_emb
+
+    def audio_rot_pos_emb(self, lens: torch.Tensor) -> torch.Tensor:
+        """1D rotary positions for packed audio sequences."""
+        max_len = int(lens.max().item())
+        rotary_pos_emb_full = self.rotary_pos_emb(max_len)  # [max_len, dim/2]
+        out = []
+        for length in lens.tolist():
+            out.append(rotary_pos_emb_full[: int(length)])
+        rotary_pos_emb = torch.cat(out, dim=0)
+        # Duplicate along feature axis so we can reuse the same (cos, sin)
+        # application as the 2D vision path.
+        rotary_pos_emb = torch.cat([rotary_pos_emb, rotary_pos_emb], dim=-1)
+        return rotary_pos_emb
+
+    # ---------------------------------------------------------------- forward
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+    ) -> BaseModelOutput:
+        """Run the transformer body on packed features.
+
+        Args:
+            hidden_states: ``[seq_len, hidden]`` already-projected features.
+            cu_seqlens: cumulative sequence lengths (``thd`` varlen format).
+            rotary_pos_emb: ``[seq_len, head_dim]`` rotary positions (already
+                concatenated for both ``h`` and ``w`` / duplicated for audio).
+        """
+        hidden_states = hidden_states.contiguous()
+
+        # Per-token (cos, sin) used by ``vision_apply_rotary_pos_emb_flashatt``.
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+
+        for layer in self.layers:
+            if self.gradient_checkpointing and self.training:
+                hidden_states = self._gradient_checkpointing_func(
+                    layer.__call__,
+                    hidden_states,
+                    cu_seqlens,
+                    position_embeddings,
+                )
+            else:
+                hidden_states = layer(
+                    hidden_states=hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    position_embeddings=position_embeddings,
+                )
+
+        return BaseModelOutput(last_hidden_state=hidden_states)
+
+
+class YoutuVITAOmniVisionPatchMerger(YoutuVITAVisionPatchMerger):
+    """2x2 spatial merge (4x token reduction) + MLP projection to
+    ``out_hidden_size``. Inherits :class:`YoutuVITAVisionPatchMerger`; only the
+    config type differs (omni reuses ``hidden_size`` / ``spatial_merge_size``
+    / ``merger_hidden_size`` / ``out_hidden_size`` from
+    :class:`YoutuVITAOmniConfig`).
+    """
+
+    def __init__(self, config: YoutuVITAOmniConfig) -> None:
+        super().__init__(config)
+
+
+class YoutuVITAOmniAudioPatchMerger(YoutuVITAAudioPatchMerger):
+    """2x temporal merge + MLP projection to ``out_hidden_size``. Inherits
+    :class:`YoutuVITAAudioPatchMerger`; only the config type differs.
+    """
+
+    def __init__(self, config: YoutuVITAOmniConfig) -> None:
+        super().__init__(config)
+
+
+class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
+    """Top-level omni encoder: shared Qwen3 transformer + modality-specific
+    front-ends and mergers. Mirrors :class:`MegatronOmniModel`.
+
+    Forward dispatch by modality:
+
+    * ``modality == "vision"`` or only vision inputs given → returns
+      ``image_embeddings`` of shape ``[N, out_hidden_size]``.
+    * ``modality == "audio"`` or only audio inputs given → returns
+      ``(audio_embeddings, audio_lengths)``.
+    * Both given → returns ``{"vision": ..., "audio": (..., ...)}``.
+    """
+
+    config: YoutuVITAOmniConfig
+    _input_embed_layer = "patch_embedding"
+
+    def __init__(self, config: YoutuVITAOmniConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+        self.config = config
+
+        # Modality front-ends.
+        self.vision_embeddings = YoutuVITAOmniVisionEmbeddings(config)
+        self.audio_embeddings = YoutuVITAOmniAudioEmbeddings(config)
+
+        # Shared Qwen3 transformer body.
+        self.encoder = YoutuVITAOmniEncoder(config)
+
+        # Modality-specific post-encoder mergers + projectors.
+        self.vision_merger = YoutuVITAOmniVisionPatchMerger(config)
+        self.audio_merger = YoutuVITAOmniAudioPatchMerger(config)
+
+        self.post_init()
+
+    # ------------------------------------------------------------------ vision
+    def forward_vision(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vision path: patch linear → shared encoder (2D RoPE, packed) → 2x2
+        spatial merge → projector. Returns ``[N, out_hidden_size]``."""
+        hidden_states = self.vision_embeddings(pixel_values, image_grid_thw)
+
+        rotary_pos_emb = self.encoder.vision_rot_pos_emb(image_grid_thw).to(hidden_states.device)
+        cu_seqlens = torch.repeat_interleave(
+            image_grid_thw[:, 1] * image_grid_thw[:, 2],
+            image_grid_thw[:, 0],
+        ).cumsum(
+            dim=0,
+            dtype=image_grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+        )
+        cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0), value=0)
+
+        hidden_states = self.encoder(
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=rotary_pos_emb,
+        ).last_hidden_state
+
+        hidden_states = self.vision_merger(hidden_states)
+        return hidden_states
+
+    # ------------------------------------------------------------------- audio
+    def forward_audio(
+        self,
+        audios,
+    ):
+        """Audio path: Conv2d front-end (8x down-sample) → shared encoder
+        (1D RoPE, packed) → 2x temporal merge → projector.
+
+        Args:
+            audios: a list of ``[T_i, num_mel_bins]`` tensors (the same input
+                convention used by :class:`YoutuVITACNNAudio` elsewhere in this
+                file).
+
+        Returns:
+            A tuple ``(features, feature_lens)`` where ``features`` has shape
+            ``[B, S_out, out_hidden_size]`` and ``feature_lens`` holds the
+            valid length per sample after temporal merge.
+        """
+        audio_lengths = torch.as_tensor([len(x) for x in audios])
+        stacked = torch.cat(audios, dim=0).transpose(1, 0)  # [num_mel, total_T]
+        hidden_states, feature_lens = self.audio_embeddings(stacked, audio_lengths)
+
+        # Packed 1D rotary positions + cu_seqlens.
+        feature_lens = feature_lens.to(hidden_states.device)
+        cu_seqlens = torch.nn.functional.pad(feature_lens.cumsum(dim=0, dtype=torch.int32), (1, 0), value=0)
+        rotary_pos_emb = self.encoder.audio_rot_pos_emb(feature_lens).to(hidden_states.device)
+
+        hidden_states = self.encoder(
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=rotary_pos_emb,
+        ).last_hidden_state
+
+        # Re-batch to ``[B, S, H]`` and apply temporal merge + projector.
+        features = hidden_states.split(feature_lens.tolist(), dim=0)
+        features = torch.nn.utils.rnn.pad_sequence(features, batch_first=True, padding_value=0.0)
+        features = self.audio_merger(features)
+
+        merged_lens = -(-feature_lens // int(self.config.temporal_merge_size))
+        return features, merged_lens
+
+    # -------------------------------------------------------------- top-level
+    def forward(
+        self,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        audios: Any | None = None,
+        modality: str | None = None,
+        **kwargs,
+    ):
+        """Dispatch by modality (mirrors ``MegatronOmniModel.forward``)."""
+        has_vision = pixel_values is not None and image_grid_thw is not None
+        has_audio = audios is not None
+
+        if modality == "vision" or (has_vision and not has_audio):
+            return self.forward_vision(pixel_values, image_grid_thw)
+
+        if modality == "audio" or (has_audio and not has_vision):
+            return self.forward_audio(audios)
+
+        if has_vision and has_audio:
+            v = self.forward_vision(pixel_values, image_grid_thw)
+            a, a_len = self.forward_audio(audios)
+            return {"vision": v, "audio": (a, a_len)}
+
+        raise ValueError(
+            "YoutuVITAOmniModel.forward requires at least one of (pixel_values, image_grid_thw) or (audios,)."
+        )
+
+
 class YoutuVITAModel(YoutuVITAPreTrainedModel):
     def __init__(self, config: YoutuVITAConfig):
         super().__init__(config)
-        self.audio_model = YoutuVITAAudioModel._from_config(config.audio_config)
-        self.vision_model = YoutuVITAVisionModel._from_config(config.vision_config)
+        self.omni_model = None
+        self.vision_model = None
+        self.audio_model = None
+        if config.omni_config is not None:
+            self.omni_model = YoutuVITAOmniModel._from_config(config.omni_config)
+        if config.vision_config is not None:
+            self.vision_model = YoutuVITAVisionModel._from_config(config.vision_config)
+        if config.audio_config is not None:
+            self.audio_model = YoutuVITAAudioModel._from_config(config.audio_config)
+
         self.language_model = YoutuVITATextModel._from_config(config.text_config)
 
     def get_input_embeddings(self):
@@ -1896,6 +2419,32 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.language_model.embed_tokens = value
+
+    # ------------------------------------------------------------------
+    # Modality forward dispatch — when ``self.omni_model`` is present, the
+    # vision and audio inputs go through the shared Qwen3 omni encoder
+    # (mirrors ``GPTMMModel._preprocess`` in
+    # ``vita_megatron/core/models/multimodal/gpt_mm_model.py``).
+    # ------------------------------------------------------------------
+    def _encode_vision(self, pixel_values, image_grid_thw):
+        """Return image embeddings of shape ``[N, hidden]``."""
+        if self.omni_model is not None:
+            return self.omni_model(
+                modality="vision",
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+            )
+        return self.vision_model(
+            pixel_values=pixel_values,
+            attention_mask=None,
+            grid_thw=image_grid_thw,
+        ).last_hidden_state
+
+    def _encode_audio(self, audios):
+        """Return ``(audio_embeddings, audio_lengths)``."""
+        if self.omni_model is not None:
+            return self.omni_model(modality="audio", audios=audios)
+        return self.audio_model(audios)
 
     def forward(
         self,
@@ -1934,21 +2483,19 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
                     im_ed = (
                         im_st + (_image_grid_thw[:, 1] * _image_grid_thw[:, 2] * _image_grid_thw[:, 0]).sum().item()
                     )
-                    _image_embeds = self.vision_model(
+                    _image_embeds = self._encode_vision(
                         pixel_values=images[im_st:im_ed],
-                        attention_mask=None,
-                        grid_thw=image_grid_thw[chunk_idx],
-                    ).last_hidden_state
+                        image_grid_thw=image_grid_thw[chunk_idx],
+                    )
                     image_embeds.append(_image_embeds)
 
                     im_st = im_ed
                 image_embeds = torch.cat(image_embeds, dim=0)
             else:
-                image_embeds = self.vision_model(
+                image_embeds = self._encode_vision(
                     pixel_values=images,
-                    attention_mask=None,
-                    grid_thw=image_grid_thw,
-                ).last_hidden_state
+                    image_grid_thw=image_grid_thw,
+                )
             # print(f"image_embeds {image_embeds.size()}")
             # assert image_embeds.shape[0] == len(images)
             fake_images = None
@@ -1983,11 +2530,10 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
             # print(f"{image_grid_thw.size()=}")
             # print(f"{fake_images.size()=}")
 
-            image_embeds = self.vision_model(
+            image_embeds = self._encode_vision(
                 pixel_values=fake_images,
-                attention_mask=None,
-                grid_thw=image_grid_thw,
-            ).last_hidden_state
+                image_grid_thw=image_grid_thw,
+            )
             # image_embeds = image_embeds[:, 1:, :]
             # image_embeds = self.vision_projection(image_embeds)
 
@@ -1999,7 +2545,7 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
             image_embeds = None
 
         if audios is not None:
-            audio_embeds, audio_lengths = self.audio_model(audios)
+            audio_embeds, audio_lengths = self._encode_audio(audios)
             # if torch.distributed.get_rank() == 0:
             #     print(f"audio_embeds {audio_embeds.size()}")
             # assert audio_embeds.shape[0] == len(audios)
@@ -2024,7 +2570,7 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
             device = self.get_input_embeddings().weight.data.device
             dtype = self.get_input_embeddings().weight.data.dtype
             fake_audios = torch.ones((1, 1, 560), dtype=dtype, device=device)
-            audio_embeds, audio_lengths = self.audio_model(fake_audios)
+            audio_embeds, audio_lengths = self._encode_audio(fake_audios)
             # audio_embeds = self.audio_projection(audio_embeds)
 
         else:

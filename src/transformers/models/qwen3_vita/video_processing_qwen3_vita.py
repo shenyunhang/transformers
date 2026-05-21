@@ -204,7 +204,6 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
                 raise NotImplementedError(video_file_or_dir)
 
         audio = None
-        # if has_audio(video_file_or_dir):
         try:
             audio, sampling_rate = torchaudio.load(video_file_or_dir)
             # print(f"{audio.size()=} {sampling_rate=}")

@@ -121,7 +121,7 @@ class Qwen3VITAVisionConfig(PreTrainedConfig):
         spatial_merge_size=2,
         out_hidden_size=4608,
         merger_hidden_size=4608,
-        use_llm=False,
+        # use_llm=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -140,7 +140,7 @@ class Qwen3VITAVisionConfig(PreTrainedConfig):
         self.out_hidden_size = out_hidden_size
         self.merger_hidden_size = merger_hidden_size
 
-        self.use_llm = use_llm
+        # self.use_llm = use_llm
 
     def __post_init__(self, **kwargs):
         self.sliding_window = self.sliding_window if self.use_sliding_window else None
@@ -225,105 +225,8 @@ class Qwen3VITATextConfig(PreTrainedConfig):
         super().__post_init__(**kwargs)
 
 
-@auto_docstring(checkpoint="Qwen/Qwen3VITAOmni-8B")
-@strict
-class Qwen3VITAOmniConfig(PreTrainedConfig):
-    r"""
-    Config for the shared Qwen3-style omni encoder that ingests both vision and
-    audio inputs (mirrors the megatron reference implementation at
-    ``vita_megatron/core/models/omni``). The encoder body is a Qwen3-style
-    transformer (qk-norm, GQA, SiLU MLP) consuming already-tokenised features
-    of shape ``[seq_len, hidden_size]`` with packed attention metadata
-    (``cu_seqlens``, 2D/1D rotary positions).
-
-    Inherits [`Qwen3Config`] for the shared transformer-body hyper-parameters
-    (``hidden_size``, ``num_hidden_layers``, ``num_attention_heads``,
-    ``num_key_value_heads``, ``head_dim``, ``hidden_act``, ``rms_norm_eps``,
-    ``attention_dropout``, ...). Adds omni-specific fields for the vision
-    linear patch front-end, the audio Conv2d front-end, and the modality
-    mergers that project to the LM hidden size.
-
-    Args:
-        num_channels (`int`, *optional*, defaults to 3):
-            Number of input channels for the vision patch front-end (RGB = 3).
-        patch_size (`int`, *optional*, defaults to 16):
-            Spatial size of the vision patch, i.e. each patch flattens to
-            ``num_channels * patch_size ** 2`` features.
-        spatial_merge_size (`int`, *optional*, defaults to 2):
-            After the shared transformer the vision tokens are merged by an
-            ``spatial_merge_size x spatial_merge_size`` spatial window (4x
-            token reduction by default) before the projection MLP.
-        num_mel_bins (`int`, *optional*, defaults to 128):
-            Number of mel filterbank bins of the input log-mel spectrogram
-            consumed by the Conv2d audio front-end.
-        downsample_hidden_size (`int`, *optional*, defaults to 512):
-            Channel dimension used by the three stride-2 Conv2d layers of the
-            audio front-end before the projection to ``hidden_size``.
-        n_window (`int`, *optional*, defaults to 50):
-            Training-time chunk size (in frames) used to split the input
-            log-mel spectrogram before convolution.
-        n_window_infer (`int`, *optional*, defaults to 800):
-            Inference-time chunk size (in frames) used to split the input
-            log-mel spectrogram before convolution.
-        conv_chunksize (`int`, *optional*, defaults to 500):
-            Number of chunks processed together in a single conv forward to
-            bound peak activation memory.
-        temporal_merge_size (`int`, *optional*, defaults to 2):
-            After the shared transformer the audio tokens are merged by a
-            factor of ``temporal_merge_size`` along the time axis before the
-            projection MLP.
-        merger_hidden_size (`int`, *optional*, defaults to 4608):
-            Hidden dimension of the merger MLP that projects merged features
-            from the shared encoder to ``out_hidden_size``.
-        out_hidden_size (`int`, *optional*, defaults to 4608):
-            Output dimension of the omni encoder, aligned with the language
-            model embedding dimension.
-    """
-
+class Qwen3VITAOmniConfig(Qwen3VITATextConfig):
     model_type = "qwen3_vita_omni"
-    keys_to_ignore_at_inference = ["past_key_values"]
-
-    # Default tensor parallel plan for base model `Qwen3VITAOmni`
-    base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.q_norm": "replicated_with_grad_allreduce",
-        "layers.*.self_attn.k_norm": "replicated_with_grad_allreduce",
-        "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
-    }
-    base_model_pp_plan = {
-        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
-        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
-        "norm": (["hidden_states"], ["hidden_states"]),
-    }
-
-    vocab_size: int = 151936
-    hidden_size: int = 4096
-    intermediate_size: int = 22016
-    num_hidden_layers: int = 32
-    num_attention_heads: int = 32
-    num_key_value_heads: int | None = 32
-    head_dim: int = 128
-    hidden_act: str = "silu"
-    max_position_embeddings: int = 32768
-    initializer_range: float = 0.02
-    rms_norm_eps: float = 1e-6
-    use_cache: bool = True
-    tie_word_embeddings: bool = False
-    rope_parameters: RopeParameters | dict | None = None
-    attention_bias: bool = False
-    use_sliding_window: bool = False
-    sliding_window: int | None = 4096
-    max_window_layers: int = 28
-    layer_types: list[str] | None = None
-    attention_dropout: float | int = 0.0
-    pad_token_id: int | None = None
-    bos_token_id: int | None = None
-    eos_token_id: int | list[int] | None = None
     base_config_key = "omni_config"
 
     # ---- Omni-specific fields ------------------------------------------------
@@ -341,20 +244,6 @@ class Qwen3VITAOmniConfig(PreTrainedConfig):
     # Projection to LM hidden size
     merger_hidden_size: int = 4608
     out_hidden_size: int = 4608
-
-    def __post_init__(self, **kwargs):
-        self.sliding_window = self.sliding_window if self.use_sliding_window else None
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
-
-        if self.layer_types is None:
-            self.layer_types = [
-                "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
-                else "full_attention"
-                for i in range(self.num_hidden_layers)
-            ]
-        super().__post_init__(**kwargs)
 
 
 class Qwen3VITAConfig(PreTrainedConfig):
@@ -398,7 +287,6 @@ class Qwen3VITAConfig(PreTrainedConfig):
         self.vision_config = _build_sub_config("vision_config", vision_config)
         self.omni_config = _build_sub_config("omni_config", omni_config)
 
-        # Text config is mandatory (the language model is always built).
         if isinstance(text_config, dict):
             self.text_config = self.sub_configs["text_config"](**text_config)
         elif text_config is None:
