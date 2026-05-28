@@ -4076,7 +4076,6 @@ class Qwen3VITAImagesKwargs(ImagesKwargs, total=False):
     discrete_image_idxs: list
     contiguous_image_idxs: list
 
-    vision_resolution_type: str
     vision_normalize_type: str
     image_min_num_tokens: int
     image_max_num_tokens: int
@@ -4096,7 +4095,6 @@ class Qwen3VITAAudioKwargs(AudioKwargs, total=False):
 class Qwen3VITAVideosKwargs(VideosKwargs, total=False):
     """
     """
-    vision_resolution_type: str
     video_min_num_tokens: int
     video_max_num_tokens: int
     video_image_min_num_tokens: int
@@ -4126,13 +4124,11 @@ class Qwen3VITAProcessorKwargs(ProcessingKwargs, total=False):
             "padding_side": "left",
         },
         "images_kwargs": {
-            # "vision_resolution_type": "native",
             # "vision_normalize_type": "siglip",
             # "image_min_num_tokens": 4,
             # "image_max_num_tokens": 8192,
         },
         "videos_kwargs": {
-            # "vision_resolution_type": "native",
             # "video_min_num_tokens": 64,
             # "video_max_num_tokens": 8192,
             # "video_image_min_num_tokens": 4,
@@ -4474,6 +4470,8 @@ class Qwen3VITAFeatureExtractor(SequenceFeatureExtractor):
                     audio_token_length = -(
                         -audio_token_length_func(len(audio)) // self.temporal_merge_size
                     )
+                    assert audio_token_length > 0
+
                     audio_indice_b = torch.zeros(
                         1, audio_token_length, dtype=torch.int64
                     )  # This will change in collate_fn
@@ -4549,7 +4547,6 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         self,
         image_processor=None,
         audio_processor=None,
-        vision_resolution_type="native",
         video_max_num_frames=64,
         video_max_fps=1,
         video_min_num_tokens=64,
@@ -4572,7 +4569,6 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         self.image_processor = image_processor
         self.audio_processor = audio_processor
 
-        self.vision_resolution_type = vision_resolution_type
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
         self.temporal_merge_size = temporal_merge_size
@@ -4733,46 +4729,37 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
             video_max_fps=video_max_fps,
         )
 
-        if self.vision_resolution_type == "native":
-            min_pixels = (
-                (self.patch_size * self.spatial_merge_size) ** 2
-                * self.video_min_num_tokens
-                // len(images)
-            )
-            max_pixels = (
-                (self.patch_size * self.spatial_merge_size) ** 2
-                * self.video_max_num_tokens
-                // len(images)
-            )
+        min_pixels = (
+            (self.patch_size * self.spatial_merge_size) ** 2
+            * self.video_min_num_tokens
+            // len(images)
+        )
+        max_pixels = (
+            (self.patch_size * self.spatial_merge_size) ** 2
+            * self.video_max_num_tokens
+            // len(images)
+        )
 
-            image_min_pixels = (
-                self.patch_size * self.spatial_merge_size
-            ) ** 2 * self.video_image_min_num_tokens
-            image_max_pixels = (
-                self.patch_size * self.spatial_merge_size
-            ) ** 2 * self.video_image_max_num_tokens
+        image_min_pixels = (
+            self.patch_size * self.spatial_merge_size
+        ) ** 2 * self.video_image_min_num_tokens
+        image_max_pixels = (
+            self.patch_size * self.spatial_merge_size
+        ) ** 2 * self.video_image_max_num_tokens
 
-            min_pixels = max(min_pixels, image_min_pixels)
-            max_pixels = min(max_pixels, image_max_pixels)
+        min_pixels = max(min_pixels, image_min_pixels)
+        max_pixels = min(max_pixels, image_max_pixels)
 
-            # print(f"{len(images)=} {min_pixels=} {max_pixels=}")
-            image_data = self.image_processor.process_images(
-                images,
-                is_contiguous=True,
-                vision_resolution_type=self.vision_resolution_type,
-                min_pixels=min_pixels,
-                max_pixels=max_pixels,
-            )
-            image_frames = image_data["images"]
-            best_height = image_data["image_height"]
-            best_width = image_data["image_width"]
-        else:
-            image_data = self.image_processor.process_images_to_tensor(
-                images
-            )
-            image_frames = image_data["images"]
-            best_height = image_data["image_height"]
-            best_width = image_data["image_width"]
+        # print(f"{len(images)=} {min_pixels=} {max_pixels=}")
+        image_data = self.image_processor.process_images(
+            images,
+            is_contiguous=True,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+        image_frames = image_data["images"]
+        best_height = image_data["image_height"]
+        best_width = image_data["image_width"]
 
         if audio is not None:
             total_time = len(audio) / sampling_rate
@@ -5027,19 +5014,15 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
             # assert len(audio_frames) == sum([len(x) for x in audio_chunks])
 
             if use_vision_in_video:
-                if self.image_processor.vision_resolution_type == "native":
-                    images.append(
-                        torch.cat(
-                            [
-                                self.image_processor.convert_image_to_patches_with_pixel_shuffle(x)
-                                for x in image_frames
-                            ],
-                            dim=0,
-                        )
+                images.append(
+                    torch.cat(
+                        [
+                            self.image_processor.convert_image_to_patches_with_pixel_shuffle(x)
+                            for x in image_frames
+                        ],
+                        dim=0,
                     )
-
-                else:
-                    images.append(image_frames)
+                )
 
             if use_audio_in_video and audio_frames is not None:
                 # audios.extend(audio_frames)
@@ -5095,62 +5078,23 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
                             else:
                                 new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
-                        if self.image_processor.vision_resolution_type == "native":
-                            resolution = f"{_video_grid_thw[0][1] * self.patch_size}*{_video_grid_thw[0][2] * self.patch_size}"
-                            _input_id = tokenizer(resolution, add_special_tokens=False).input_ids
-                            new_input_ids += _input_id
-                            if targets is not None:
-                                if is_pretrain:
-                                    # new_targets += _input_id
-                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
-                                else:
-                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
+                        resolution = f"{_video_grid_thw[0][1] * self.patch_size}*{_video_grid_thw[0][2] * self.patch_size}"
+                        _input_id = tokenizer(resolution, add_special_tokens=False).input_ids
+                        new_input_ids += _input_id
+                        if targets is not None:
+                            if is_pretrain:
+                                # new_targets += _input_id
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
+                            else:
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
 
-                            for _ in range(
-                                _video_grid_thw[0][0]
-                                * _video_grid_thw[0][1]
-                                // self.spatial_merge_size
-                            ):
-                                image_token_length = (
-                                    _video_grid_thw[0][2] // self.spatial_merge_size
-                                )
-                                image_indice_b = torch.zeros(
-                                    1, image_token_length, dtype=torch.int64
-                                )  # This will change in collate_fn
-                                image_indice_s = (
-                                    torch.arange(
-                                        len(new_input_ids), len(new_input_ids) + image_token_length
-                                    )
-                                    .unsqueeze(0)
-                                    .repeat(1, 1)
-                                )
-                                image_indice_b_s = torch.stack(
-                                    [image_indice_b, image_indice_s], dim=0
-                                )  # 2, num_image, image_length
-                                image_indices.append(image_indice_b_s.view(2, -1))
-
-                                new_input_ids += [IMG_CONTEXT_ID] * image_token_length
-                                if targets is not None:
-                                    new_targets += [
-                                        GLOBAL_CONSTANTS.IGNORE_TOKEN_ID
-                                    ] * image_token_length
-
-                                new_input_ids += nl_tokens
-                                if targets is not None:
-                                    if is_pretrain:
-                                        new_targets += nl_tokens
-                                    else:
-                                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(
-                                            nl_tokens
-                                        )
-
-                        else:
+                        for _ in range(
+                            _video_grid_thw[0][0]
+                            * _video_grid_thw[0][1]
+                            // self.spatial_merge_size
+                        ):
                             image_token_length = (
-                                _video_grid_thw[0][0]
-                                * _video_grid_thw[0][1]
-                                * _video_grid_thw[0][2]
-                                // self.spatial_merge_size
-                                // self.spatial_merge_size
+                                _video_grid_thw[0][2] // self.spatial_merge_size
                             )
                             image_indice_b = torch.zeros(
                                 1, image_token_length, dtype=torch.int64
@@ -5165,11 +5109,22 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
                             image_indice_b_s = torch.stack(
                                 [image_indice_b, image_indice_s], dim=0
                             )  # 2, num_image, image_length
-                            image_indices.append(image_indice_b_s)
+                            image_indices.append(image_indice_b_s.view(2, -1))
 
                             new_input_ids += [IMG_CONTEXT_ID] * image_token_length
                             if targets is not None:
-                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
+                                new_targets += [
+                                    GLOBAL_CONSTANTS.IGNORE_TOKEN_ID
+                                ] * image_token_length
+
+                            new_input_ids += nl_tokens
+                            if targets is not None:
+                                if is_pretrain:
+                                    new_targets += nl_tokens
+                                else:
+                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(
+                                        nl_tokens
+                                    )
 
                         new_input_ids += [IMG_END_ID]
                         if targets is not None:
@@ -5207,6 +5162,7 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
                                 new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                         audio_token_length = -(-audio_token_length_func(len(audio_chunk_frame)) // self.temporal_merge_size)
+                        assert audio_token_length > 0
                         audio_indice_b = torch.zeros(
                             1, audio_token_length, dtype=torch.int64
                         )  # This will change in collate_fn
@@ -5306,308 +5262,6 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
             video_split_out,
         )
 
-    def add_video_input_contiguous(
-        self,
-        input_ids,
-        video_paths,
-        tokenizer,
-        targets=None,
-        is_pretrain=False,
-        **kwargs,
-    ):
-        """Continuous-token video path. Mirrors
-        :meth:`VideoProcessor.add_video_input_contiguous` in
-        ``cognitron_mm/processor/video_processor.py``: every image chunk is
-        wrapped by ``VID_START / VID_CONTEXT / VID_END`` and every audio chunk
-        by ``AUD_START / AUD_CONTEXT / AUD_END`` (no outer ``VID_*`` brackets
-        per video). Always emits a ``video_split`` row per video so the
-        downstream joint encoder (``video_omni_fusion=True``) can pair
-        same-video vision and audio inside one packed attention window.
-        """
-        video_max_num_frames = kwargs.get("video_max_num_frames", self.video_max_num_frames)
-        video_max_fps = kwargs.get("video_max_fps", self.video_max_fps)
-        use_audio_in_video = kwargs.get("use_audio_in_video", self.use_audio_in_video)
-        use_vision_in_video = kwargs.get("use_vision_in_video", self.use_vision_in_video)
-        video_audio_chunk_min_second = kwargs.get(
-            "video_audio_chunk_min_second", self.video_audio_chunk_min_second
-        )
-        video_audio_chunk_max_second = kwargs.get(
-            "video_audio_chunk_max_second", self.video_audio_chunk_max_second
-        )
-
-        GLOBAL_CONSTANTS = get_token()
-
-        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_CONTEXT_TOKEN)
-        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_START_TOKEN)
-        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_END_TOKEN)
-
-        VID_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_CONTEXT_TOKEN)
-        VID_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_START_TOKEN)
-        VID_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_END_TOKEN)
-
-        VID_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_TAG_TOKEN)
-
-        vid_positions = [i for i, x in enumerate(input_ids) if x == VID_TAG_ID]
-        assert len(vid_positions) == len(video_paths), video_paths
-
-        images = []
-        image_indices = []
-        audios = []
-        audio_indices = []
-        video_grid_thw = []
-        second_per_grids = []
-        video_split = []
-
-        new_input_ids = []
-        new_targets = []
-        st = 0
-        for vid_idx, vid_pos in enumerate(vid_positions):
-            # Snapshot per-video accounting before processing this video.
-            num_images_before = len(video_grid_thw)
-            num_audios_before = len(audios)
-
-            (
-                image_frames,
-                audio_frames,
-                audio_token_length_func,
-                _video_grid_thw,
-                _second_per_grids,
-                second_frames,
-                duration_seconds,
-            ) = self.process_video(video_paths[vid_idx], video_max_num_frames, video_max_fps)
-
-            if audio_frames is not None:
-                num_frames = min(len(image_frames), len(audio_frames))
-                image_frames = image_frames[:num_frames]
-                audio_frames = audio_frames[:num_frames]
-
-            new_input_ids += input_ids[st:vid_pos]
-            if targets is not None:
-                new_targets += targets[st:vid_pos]
-
-            (
-                image_chunks,
-                image_second_chunks,
-                audio_chunks,
-                audio_second_chunks,
-            ) = self._chunk_audio_video_frames(
-                image_frames,
-                audio_frames,
-                second_frames,
-                duration_seconds,
-                video_audio_chunk_min_second,
-                video_audio_chunk_max_second,
-            )
-
-            assert len(image_frames) == sum(len(x) for x in image_chunks)
-
-            if use_vision_in_video:
-                if self.image_processor.vision_resolution_type == "native":
-                    images.append(
-                        torch.cat(
-                            [
-                                self.image_processor.convert_image_to_patches_with_pixel_shuffle(x)
-                                for x in image_frames
-                            ],
-                            dim=0,
-                        )
-                    )
-                else:
-                    images.append(image_frames)
-
-            if use_audio_in_video and audio_frames is not None:
-                audios.extend([xx for x in audio_chunks for xx in x])
-
-            for (
-                image_chunk_frames,
-                image_second_chunk_frames,
-                audio_chunk_frames,
-                audio_second_chunk_frames,
-            ) in zip(
-                image_chunks,
-                image_second_chunks,
-                audio_chunks,
-                audio_second_chunks,
-            ):
-                if not use_vision_in_video:
-                    image_chunk_frames = []
-                    image_second_chunk_frames = []
-                if not use_audio_in_video:
-                    audio_chunk_frames = []
-                    audio_second_chunk_frames = []
-
-                for image_chunk_frame, image_second_chunk_frame in zip(
-                    image_chunk_frames, image_second_chunk_frames
-                ):
-                    # add timestamp
-                    timestamp = time.strftime(
-                        "%H:%M:%S", time.gmtime(round(image_second_chunk_frame))
-                    )
-                    _input_id = tokenizer(timestamp, add_special_tokens=False).input_ids
-                    new_input_ids += _input_id
-                    if targets is not None:
-                        if is_pretrain:
-                            new_targets += _input_id
-                        else:
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
-
-                    new_input_ids += [VID_START_ID]
-                    if targets is not None:
-                        if is_pretrain:
-                            new_targets += [VID_START_ID]
-                        else:
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
-
-                    image_token_length = (
-                        _video_grid_thw[0][0]
-                        * _video_grid_thw[0][1]
-                        * _video_grid_thw[0][2]
-                        // self.spatial_merge_size
-                        // self.spatial_merge_size
-                    )
-                    image_indice_b = torch.zeros(
-                        1, image_token_length, dtype=torch.int64
-                    )  # This will change in collate_fn
-                    image_indice_s = (
-                        torch.arange(
-                            len(new_input_ids), len(new_input_ids) + image_token_length
-                        )
-                        .unsqueeze(0)
-                        .repeat(1, 1)
-                    )
-                    image_indice_b_s = torch.stack(
-                        [image_indice_b, image_indice_s], dim=0
-                    )  # 2, num_image, image_length
-                    if self.image_processor.vision_resolution_type == "native":
-                        image_indices.append(image_indice_b_s.view(2, -1))
-                    else:
-                        image_indices.append(image_indice_b_s)
-
-                    new_input_ids += [VID_CONTEXT_ID] * image_token_length
-                    if targets is not None:
-                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
-
-                    new_input_ids += [VID_END_ID]
-                    if targets is not None:
-                        if is_pretrain:
-                            new_targets += [VID_END_ID]
-                        else:
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
-
-                for audio_chunk_frame, audio_second_chunk_frame in zip(
-                    audio_chunk_frames, audio_second_chunk_frames
-                ):
-                    # add timestamp
-                    timestamp = time.strftime(
-                        "%H:%M:%S", time.gmtime(round(audio_second_chunk_frame))
-                    )
-                    _input_id = tokenizer(timestamp, add_special_tokens=False).input_ids
-                    new_input_ids += _input_id
-                    if targets is not None:
-                        if is_pretrain:
-                            new_targets += _input_id
-                        else:
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
-
-                    new_input_ids += [AUD_START_ID]
-                    if targets is not None:
-                        if is_pretrain:
-                            new_targets += [AUD_START_ID]
-                        else:
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
-
-                    audio_token_length = -(
-                        -audio_token_length_func(len(audio_chunk_frame))
-                        // self.temporal_merge_size
-                    )
-                    assert audio_token_length > 0
-
-                    audio_indice_b = torch.zeros(
-                        1, audio_token_length, dtype=torch.int64
-                    )  # This will change in collate_fn
-                    audio_indice_s = (
-                        torch.arange(
-                            len(new_input_ids), len(new_input_ids) + audio_token_length
-                        )
-                        .unsqueeze(0)
-                        .repeat(1, 1)
-                    )
-                    audio_indice_b_s = torch.stack(
-                        [audio_indice_b, audio_indice_s], dim=0
-                    )  # 2, num_audio, audio_length
-                    audio_indices.append(audio_indice_b_s)
-
-                    new_input_ids += [AUD_CONTEXT_ID] * audio_token_length
-                    if targets is not None:
-                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * audio_token_length
-
-                    new_input_ids += [AUD_END_ID]
-                    if targets is not None:
-                        if is_pretrain:
-                            new_targets += [AUD_END_ID]
-                        else:
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
-
-            video_grid_thw.extend(_video_grid_thw)
-            second_per_grids.extend(_second_per_grids)
-
-            video_split.append(
-                (
-                    len(video_grid_thw) - num_images_before,
-                    len(audios) - num_audios_before,
-                )
-            )
-
-            st = vid_pos + 1
-
-        new_input_ids += input_ids[st:]
-        if targets is not None:
-            new_targets += targets[st:]
-
-        input_ids = new_input_ids
-        if targets is not None:
-            targets = new_targets
-
-        video_grid_thw = torch.tensor(video_grid_thw, dtype=torch.long)
-        second_per_grids = torch.tensor(second_per_grids, dtype=torch.long)
-
-        video_split_out = video_split if len(video_split) > 0 else None
-
-        if targets is not None:
-            return (
-                input_ids,
-                images,
-                image_indices,
-                audios,
-                audio_indices,
-                video_grid_thw,
-                second_per_grids,
-                targets,
-                video_split_out,
-            )
-
-        if len(images) == 0:
-            images = None
-            image_indices = None
-        else:
-            images = torch.cat(images, dim=0).contiguous()
-            image_indices = torch.cat(image_indices, dim=1).contiguous()
-
-        if len(audios) == 0:
-            audios = None
-            audio_indices = None
-
-        return (
-            input_ids,
-            images,
-            image_indices,
-            audios,
-            audio_indices,
-            video_grid_thw,
-            second_per_grids,
-            video_split_out,
-        )
-
 
 class Qwen3VITAImageProcessor(BaseImageProcessor):
     model_input_names = ["images", "image_indices", "image_grid_thw"]
@@ -5618,7 +5272,6 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
         image_size=448,
         image_size_discrete=None,
         vision_normalize_type="imagenet",
-        vision_resolution_type="native",
         min_tile_grid=1,
         max_tile_grid=6,
         image_min_num_tokens=4,
@@ -5633,7 +5286,6 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
         super().__init__(**kwargs)
         self.image_size = image_size
         self.image_size_discrete = image_size_discrete
-        self.vision_resolution_type = vision_resolution_type
         self.min_tile_grid = min_tile_grid
         self.max_tile_grid = max_tile_grid
         self.tile_image_size = image_size
@@ -5652,41 +5304,9 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
         self.mean = MEAN
         self.std = STD
 
-        if self.vision_resolution_type == "anyres":
-            raise NotImplemented
-            self.grid_pinpoints = [
-                (i, j)
-                for i in range(min_tile_grid, max_tile_grid + 1)
-                for j in range(min_tile_grid, max_tile_grid + 1)
-            ]
-            self.possible_resolutions = [
-                [dim * self.tile_image_size for dim in pair] for pair in self.grid_pinpoints
-            ]
-            logger.info(f"{self.grid_pinpoints=}")
-            logger.info(f"{self.possible_resolutions=}")
-
-        if self.vision_resolution_type == "dynamic":
-            max_num = self.max_tile_grid
-            min_num = self.min_tile_grid
-            # calculate the existing image aspect ratio
-            target_ratios = set(
-                (i, j)
-                for n in range(min_num, max_num + 1)
-                for i in range(1, n + 1)
-                for j in range(1, n + 1)
-                if i * j <= max_num and i * j >= min_num
-            )
-            self.target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
-            self.possible_resolutions = [
-                [dim * self.tile_image_size for dim in pair] for pair in self.target_ratios
-            ]
-            logger.info(f"{self.target_ratios=}")
-            logger.info(f"{self.possible_resolutions=}")
-
-        if self.vision_resolution_type == "native":
-            self.min_pixels = (patch_size * spatial_merge_size) ** 2 * image_min_num_tokens
-            self.max_pixels = (patch_size * spatial_merge_size) ** 2 * image_max_num_tokens
-            logger.info(f"{self.min_pixels=} {self.max_pixels=}")
+        self.min_pixels = (patch_size * spatial_merge_size) ** 2 * image_min_num_tokens
+        self.max_pixels = (patch_size * spatial_merge_size) ** 2 * image_max_num_tokens
+        logger.info(f"{self.min_pixels=} {self.max_pixels=}")
 
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
@@ -5772,23 +5392,6 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
 
         return image
 
-    def process_image_to_tiles(self, image_or_path, **kwargs):
-        if self.vision_resolution_type == "anyres":
-            return self.process_anyres(image_or_path)
-        if self.vision_resolution_type == "dynamic":
-            return self.process_dynamic(image_or_path)
-        if self.vision_resolution_type == "native":
-            return self.process_native(image_or_path, **kwargs)
-
-        if isinstance(image_or_path, str):
-            image = PIL.Image.open(image_or_path).convert("RGB")
-        elif isinstance(image_or_path, PIL.Image.Image):
-            image = image_or_path.convert("RGB")
-        else:
-            image = image_or_path
-
-        return self.process_images_to_tensor([image])
-
     def process_image(self, image_or_path, is_discrete=False, is_contiguous=False, **kwargs):
 
         assert not (is_discrete and is_contiguous)
@@ -5827,22 +5430,7 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
             return image_data
 
         if is_contiguous:
-            vision_resolution_type = kwargs.get("vision_resolution_type", self.vision_resolution_type)
-            if self.vision_resolution_type == "anyres":
-                return self.process_anyres(image_or_path)
-            if self.vision_resolution_type == "dynamic":
-                return self.process_dynamic(image_or_path)
-            if self.vision_resolution_type == "native":
-                return self.process_native(image_or_path, **kwargs)
-
-            if isinstance(image_or_path, str):
-                image = PIL.Image.open(image_or_path).convert("RGB")
-            elif isinstance(image_or_path, PIL.Image.Image):
-                image = image_or_path.convert("RGB")
-            else:
-                image = image_or_path
-
-            return self.process_images_to_tensor([image])
+            return self.process_native(image_or_path, **kwargs)
 
     def process_images(self, image_or_paths, is_discrete=False, is_contiguous=False, **kwargs):
         images = []
@@ -5868,62 +5456,6 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
     def process_token_to_image(self, image_tokens, **kwargs):
         image_data = self.vision_tokenizer.decode(image_tokens, **kwargs)
         return image_data
-
-    def process_anyres(self, image_or_path):
-        if isinstance(image_or_path, str):
-            image = PIL.Image.open(image_or_path).convert("RGB")
-        elif isinstance(image_or_path, PIL.Image.Image):
-            image = image_or_path.convert("RGB")
-        else:
-            image = image_or_path
-
-        best_resolution = select_best_resolution(image.size, self.possible_resolutions)
-        image_padded = resize_and_pad_image(image, best_resolution)
-        patches = divide_to_patches(image_padded, self.tile_image_size)
-
-        if best_resolution == (self.tile_image_size, self.tile_image_size):
-            image_patches = [image]
-        else:
-            image_patches = [image] + patches
-
-        image_patches, _ = self.process_images_to_tensor(image_patches)
-
-        # print(f"image {image.size} best_resolution {best_resolution} image_padded {image_padded.size} patches {len(patches)} image_patches {image_patches.size()}")
-        return {
-            "images": image_patches,
-            "image_height": best_resolution[1],
-            "image_width": best_resolution[0],
-        }
-
-        return image_patches, best_resolution
-
-    def process_dynamic(self, image_or_path):
-        if isinstance(image_or_path, str):
-            image = PIL.Image.open(image_or_path).convert("RGB")
-        elif isinstance(image_or_path, PIL.Image.Image):
-            image = image_or_path.convert("RGB")
-        else:
-            image = image_or_path
-
-        image_patches, best_resolution = dynamic_preprocess(
-            image,
-            min_num=self.min_tile_grid,
-            max_num=self.max_tile_grid,
-            image_size=self.tile_image_size,
-            use_thumbnail=True,
-        )
-
-        image_data = self.process_images_to_tensor(image_patches)
-        image_patches = image_data["images"]
-
-        # print(f"{image.size()=} {best_resolution=} {image_patches.size()=}")
-        return {
-            "images": image_patches,
-            "image_height": best_resolution[1],
-            "image_width": best_resolution[0],
-        }
-
-        return image_patches, best_resolution
 
     def process_native(self, image_or_path, **kwargs):
         if isinstance(image_or_path, str):
@@ -6075,13 +5607,6 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
         IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_END_TOKEN)
         IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_TAG_TOKEN)
 
-        if self.vision_resolution_type == "native":
-            pass
-        else:
-            PATCH_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.PATCH_CONTEXT_TOKEN)
-            PATCH_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.PATCH_START_TOKEN)
-            PATCH_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.PATCH_END_TOKEN)
-
         if self.vision_tokenizer.first_vision_token is not None:
             IMG_FIRST_ID = tokenizer.convert_tokens_to_ids(self.vision_tokenizer.first_vision_token)
             IMG_EOL_ID = tokenizer.convert_tokens_to_ids("<|vision_eol|>")
@@ -6110,20 +5635,9 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
             # --------------------------------------------------------------------------
             # add discrete
             if img_idx in discrete_image_idxs:
-                assert self.vision_resolution_type == "native"
-                image_data = self.process_image(
-                    image_or_paths[img_idx],
-                    is_contiguous=True,
-                    min_pixels=self.min_pixels,
-                    max_pixels=self.max_pixels // (self.spatial_merge_size * self.spatial_merge_size * 8 * 8),
-                )
-                image_height = image_data["image_height"]
-                image_width = image_data["image_width"]
                 image_data = self.process_image(
                     image_or_paths[img_idx],
                     is_discrete=True,
-                    image_height=image_height,
-                    image_width=image_width,
                 )
                 image_tokens = image_data["image_tokens"]
                 image_height = image_data["image_height"]
@@ -6169,18 +5683,15 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
                 _image_grid_thw = self.get_image_grid_thw(image_patches)
                 image_grid_thw.extend(_image_grid_thw)
 
-                if self.vision_resolution_type == "native":
-                    images.append(
-                        torch.cat(
-                            [
-                                self.convert_image_to_patches_with_pixel_shuffle(x)
-                                for x in image_patches
-                            ],
-                            dim=0,
-                        )
+                images.append(
+                    torch.cat(
+                        [
+                            self.convert_image_to_patches_with_pixel_shuffle(x)
+                            for x in image_patches
+                        ],
+                        dim=0,
                     )
-                else:
-                    images.append(image_patches)
+                )
 
                 new_input_ids += [IMG_START_ID]
                 if targets is not None:
@@ -6189,78 +5700,49 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
                     else:
                         new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
-                if self.vision_resolution_type == "native":
-                    resolution = f"{_image_grid_thw[0][1] * self.patch_size}*{_image_grid_thw[0][2] * self.patch_size}"
-                    size_input_id = tokenizer(resolution, add_special_tokens=False).input_ids
-                    new_input_ids += size_input_id
-                    if targets is not None:
-                        if is_pretrain:
-                            # new_targets += size_input_id
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(size_input_id)
-                        else:
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(size_input_id)
+                resolution = f"{_image_grid_thw[0][1] * self.patch_size}*{_image_grid_thw[0][2] * self.patch_size}"
+                size_input_id = tokenizer(resolution, add_special_tokens=False).input_ids
+                new_input_ids += size_input_id
+                if targets is not None:
+                    if is_pretrain:
+                        # new_targets += size_input_id
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(size_input_id)
+                    else:
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(size_input_id)
 
-                    new_input_ids += nl_tokens
-                    if targets is not None:
-                        if is_pretrain:
-                            new_targets += [IMG_EOL_ID]
-                        else:
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
+                new_input_ids += nl_tokens
+                if targets is not None:
+                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
 
-                    for _h in range(
-                        _image_grid_thw[0][0] * _image_grid_thw[0][1] // self.spatial_merge_size
-                    ):
-                        image_token_length = _image_grid_thw[0][2] // self.spatial_merge_size
-                        image_indice_b = torch.zeros(
-                            1, image_token_length, dtype=torch.int64
-                        )  # This will change in collate_fn
-                        image_indice_s = (
-                            torch.arange(
-                                len(new_input_ids), len(new_input_ids) + image_token_length
-                            )
-                            .unsqueeze(0)
-                            .repeat(1, 1)
-                        )
-                        image_indice_b_s = torch.stack(
-                            [image_indice_b, image_indice_s], dim=0
-                        )  # 2, num_image, image_length
-                        image_indices.append(image_indice_b_s.view(2, -1))
-
-                        new_input_ids += [IMG_CONTEXT_ID] * image_token_length
-                        if targets is not None:
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
-
-                        new_input_ids += nl_tokens
-                        if targets is not None:
-                            if is_pretrain:
-                                new_targets += nl_tokens
-                            else:
-                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
-
-                else:
-                    image_token_length = (
-                        _image_grid_thw[0][0]
-                        * _image_grid_thw[0][1]
-                        * _image_grid_thw[0][2]
-                        // self.spatial_merge_size
-                        // self.spatial_merge_size
-                    )
+                for _h in range(
+                    _image_grid_thw[0][0] * _image_grid_thw[0][1] // self.spatial_merge_size
+                ):
+                    image_token_length = _image_grid_thw[0][2] // self.spatial_merge_size
                     image_indice_b = torch.zeros(
                         1, image_token_length, dtype=torch.int64
                     )  # This will change in collate_fn
                     image_indice_s = (
-                        torch.arange(len(new_input_ids), len(new_input_ids) + image_token_length)
+                        torch.arange(
+                            len(new_input_ids), len(new_input_ids) + image_token_length
+                        )
                         .unsqueeze(0)
                         .repeat(1, 1)
                     )
                     image_indice_b_s = torch.stack(
                         [image_indice_b, image_indice_s], dim=0
                     )  # 2, num_image, image_length
-                    image_indices.append(image_indice_b_s)
+                    image_indices.append(image_indice_b_s.view(2, -1))
 
                     new_input_ids += [IMG_CONTEXT_ID] * image_token_length
                     if targets is not None:
                         new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
+
+                    new_input_ids += nl_tokens
+                    if targets is not None:
+                        if is_pretrain:
+                            new_targets += nl_tokens
+                        else:
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
 
                 new_input_ids += [IMG_END_ID]
                 if targets is not None:
@@ -6268,49 +5750,6 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
                         new_targets += [IMG_END_ID]
                     else:
                         new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
-
-                if len(image_patches) > 1:
-                    for _ in range(0, best_height, self.tile_image_size):
-                        new_input_ids += nl_tokens
-                        if targets is not None:
-                            if is_pretrain:
-                                new_targets += nl_tokens
-                            else:
-                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
-
-                        for _ in range(0, best_width, self.tile_image_size):
-                            new_input_ids += [PATCH_START_ID]
-                            if targets is not None:
-                                if is_pretrain:
-                                    new_targets += [PATCH_START_ID]
-                                else:
-                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
-
-                            image_indice_b = torch.zeros(
-                                1, image_token_length, dtype=torch.int64
-                            )  # This will change in collate_fn
-                            image_indice_s = (
-                                torch.arange(
-                                    len(new_input_ids), len(new_input_ids) + image_token_length
-                                )
-                                .unsqueeze(0)
-                                .repeat(1, 1)
-                            )
-                            image_indice_b_s = torch.stack(
-                                [image_indice_b, image_indice_s], dim=0
-                            )  # 2, num_image, image_length
-                            image_indices.append(image_indice_b_s)
-
-                            new_input_ids += [PATCH_CONTEXT_ID] * image_token_length
-                            if targets is not None:
-                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
-
-                            new_input_ids += [PATCH_END_ID]
-                            if targets is not None:
-                                if is_pretrain:
-                                    new_targets += [PATCH_END_ID]
-                                else:
-                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
             st = img_pos + 1
 
@@ -6531,7 +5970,6 @@ class Qwen3VITAProcessor(ProcessorMixin):
                 image_grid_thw,
                 second_per_grids,
                 video_split,
-                # ) = self.video_processor.add_video_input_contiguous(
             ) = self.video_processor.add_video_input_discrete_or_contiguous(
                 input_ids,
                 videos,
