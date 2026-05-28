@@ -4297,7 +4297,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         image_size=448,
         image_size_discrete=None,
         vision_normalize_type="imagenet",
-        vision_resolution_type="dynamic",
+        vision_resolution_type="native",
         min_tile_grid=1,
         max_tile_grid=6,
         image_min_num_tokens=4,

@@ -2370,6 +2370,224 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         merged_lens = -(-feature_lens // int(self.config.temporal_merge_size))
         return features, merged_lens
 
+    # ------------------------------------------------------------------ video
+    def forward_video(
+        self,
+        video_images: torch.Tensor,
+        video_image_grid_thw: torch.Tensor,
+        video_audios: list | None = None,
+        video_split: torch.Tensor | None = None,
+    ):
+        """Joint video path: vision frames and audio chunks of the same video
+        share an attention window inside ``self.encoder`` while remaining
+        attention-isolated from other videos in the batch.
+
+        Mirrors :meth:`MegatronOmniModel.forward_video` in
+        ``vita_megatron/core/models/omni/omni_model.py``.
+
+        Args:
+            video_images: ``[N_patch_rows, 3 * patch_dim ** 2]`` -- all video
+                frames concatenated along dim 0.
+            video_image_grid_thw: ``[N_grid_rows, 3]`` -- per-frame
+                ``(T, H, W)`` rows. Multiple rows may belong to the same video.
+            video_audios: list of ``[T_i, num_mel_bins]`` per audio-chunk
+                tensors (same convention as :meth:`forward_audio`); multiple
+                chunks may belong to the same video. ``None`` or empty list
+                if no audio.
+            video_split: ``[N_video, 2]`` -- per-video ``(num_images,
+                num_audios)`` deltas. The number of vision patch rows belonging
+                to a video is fully determined by the corresponding rows of
+                ``video_image_grid_thw``.
+
+        Returns:
+            tuple ``(video_image_embeddings, video_audio_embeddings,
+            video_audio_lens_after_merge)``:
+
+            * ``video_image_embeddings``: ``[N_v_after_merge, out_hidden_size]``
+            * ``video_audio_embeddings``: ``[N_audios, max_S_after_merge,
+              out_hidden_size]``
+            * ``video_audio_lens_after_merge``: ``[N_audios]``
+        """
+        if video_split is None or video_split.numel() == 0:
+            raise ValueError(
+                "YoutuVITAOmniModel.forward_video requires a non-empty `video_split` tensor of shape [N_video, 2]."
+            )
+
+        device = video_images.device
+
+        # 1. Per-modality frontends.
+        vision_features = self.vision_embeddings(video_images, video_image_grid_thw)
+
+        has_audio = video_audios is not None and len(video_audios) > 0
+        if has_audio:
+            video_audio_lens = torch.as_tensor([x.shape[0] for x in video_audios], dtype=torch.long, device=device)
+            packed_audio = torch.cat(list(video_audios), dim=0).transpose(1, 0)
+            audio_features, audio_token_lens = self.audio_embeddings(packed_audio, video_audio_lens)
+            audio_token_lens = audio_token_lens.to(device)
+        else:
+            video_audio_lens = torch.zeros((0,), dtype=torch.long, device=device)
+            audio_features = vision_features.new_zeros((0, vision_features.size(-1)))
+            audio_token_lens = torch.zeros((0,), dtype=torch.long, device=device)
+
+        # 2. Per-video segmentation: split flat per-modality buffers, build
+        # rotary embeddings, interleave image / audio chunks in temporal order.
+        num_videos = int(video_split.shape[0])
+
+        image_cursor = 0
+        audio_chunk_cursor = 0
+        vision_patch_cursor = 0
+        audio_token_cursor = 0
+
+        segment_features = []
+        segment_rotary = []
+        segment_lengths = []
+        segment_modality_masks = []  # True = vision, False = audio
+        per_video_audio_chunk_lens = []
+
+        for video_index in range(num_videos):
+            num_images = int(video_split[video_index, 0].item())
+            num_audio_chunks = int(video_split[video_index, 1].item())
+
+            # ---- vision slice ----
+            video_grid_thw = video_image_grid_thw[image_cursor : image_cursor + num_images]
+            if num_images > 0:
+                num_patch_rows = int((video_grid_thw[:, 0] * video_grid_thw[:, 1] * video_grid_thw[:, 2]).sum().item())
+            else:
+                num_patch_rows = 0
+            video_vision_features = vision_features[vision_patch_cursor : vision_patch_cursor + num_patch_rows]
+            image_cursor += num_images
+            vision_patch_cursor += num_patch_rows
+
+            # ---- audio slice ----
+            video_audio_chunk_lens = audio_token_lens[audio_chunk_cursor : audio_chunk_cursor + num_audio_chunks]
+            video_audio_total_tokens = int(video_audio_chunk_lens.sum().item()) if num_audio_chunks > 0 else 0
+            video_audio_features = audio_features[audio_token_cursor : audio_token_cursor + video_audio_total_tokens]
+            audio_chunk_cursor += num_audio_chunks
+            audio_token_cursor += video_audio_total_tokens
+
+            # ---- per-frame vision rotary ----
+            if num_images > 0:
+                video_vision_rotary = self.encoder.vision_rot_pos_emb(video_grid_thw).to(device)
+                tokens_per_frame = (video_grid_thw[:, 0] * video_grid_thw[:, 1] * video_grid_thw[:, 2]).tolist()
+                vision_feature_chunks = list(video_vision_features.split(tokens_per_frame, dim=0))
+                vision_rotary_chunks = list(video_vision_rotary.split(tokens_per_frame, dim=0))
+            else:
+                vision_feature_chunks, vision_rotary_chunks = [], []
+
+            # ---- per-chunk audio rotary ----
+            if num_audio_chunks > 0:
+                video_audio_rotary = self.encoder.audio_rot_pos_emb(video_audio_chunk_lens).to(device)
+                tokens_per_audio_chunk = video_audio_chunk_lens.tolist()
+                audio_feature_chunks = list(video_audio_features.split(tokens_per_audio_chunk, dim=0))
+                audio_rotary_chunks = list(video_audio_rotary.split(tokens_per_audio_chunk, dim=0))
+            else:
+                audio_feature_chunks, audio_rotary_chunks = [], []
+
+            # ---- interleave I and A in temporal order ----
+            # If both modalities are present, distribute audio chunks across
+            # image chunks: each image is followed by ``audios_per_image`` audio
+            # chunks, the first ``extra_audio_count`` images get one extra
+            # trailing audio chunk. If only one modality is present, keep its
+            # natural order.
+            interleaved_features = []
+            interleaved_rotary = []
+            interleaved_modality_mask = []
+
+            num_image_chunks = len(vision_feature_chunks)
+            num_audio_chunks_actual = len(audio_feature_chunks)
+
+            if num_image_chunks == 0 and num_audio_chunks_actual == 0:
+                continue
+            elif num_image_chunks == 0:
+                for audio_chunk, audio_rot in zip(audio_feature_chunks, audio_rotary_chunks):
+                    interleaved_features.append(audio_chunk)
+                    interleaved_rotary.append(audio_rot)
+                    interleaved_modality_mask.append(torch.zeros(audio_chunk.size(0), dtype=torch.bool, device=device))
+            elif num_audio_chunks_actual == 0:
+                for image_chunk, image_rot in zip(vision_feature_chunks, vision_rotary_chunks):
+                    interleaved_features.append(image_chunk)
+                    interleaved_rotary.append(image_rot)
+                    interleaved_modality_mask.append(torch.ones(image_chunk.size(0), dtype=torch.bool, device=device))
+            else:
+                audios_per_image, extra_audio_count = divmod(num_audio_chunks_actual, num_image_chunks)
+                audio_index = 0
+                for image_index in range(num_image_chunks):
+                    image_chunk = vision_feature_chunks[image_index]
+                    image_rot = vision_rotary_chunks[image_index]
+                    interleaved_features.append(image_chunk)
+                    interleaved_rotary.append(image_rot)
+                    interleaved_modality_mask.append(torch.ones(image_chunk.size(0), dtype=torch.bool, device=device))
+                    audios_to_take = audios_per_image + (1 if image_index < extra_audio_count else 0)
+                    for _ in range(audios_to_take):
+                        audio_chunk = audio_feature_chunks[audio_index]
+                        audio_rot = audio_rotary_chunks[audio_index]
+                        interleaved_features.append(audio_chunk)
+                        interleaved_rotary.append(audio_rot)
+                        interleaved_modality_mask.append(
+                            torch.zeros(audio_chunk.size(0), dtype=torch.bool, device=device)
+                        )
+                        audio_index += 1
+                assert audio_index == num_audio_chunks_actual, (
+                    f"video {video_index}: distributed {audio_index} audio chunks, expected {num_audio_chunks_actual}"
+                )
+
+            video_segment_features = torch.cat(interleaved_features, dim=0)
+            video_segment_rotary = torch.cat(interleaved_rotary, dim=0)
+            video_segment_mask = torch.cat(interleaved_modality_mask, dim=0)
+
+            segment_features.append(video_segment_features)
+            segment_rotary.append(video_segment_rotary)
+            segment_modality_masks.append(video_segment_mask)
+            segment_lengths.append(video_segment_features.size(0))
+            per_video_audio_chunk_lens.append(video_audio_chunk_lens)
+
+        # 3. Concatenate per-video segments into one packed sequence.
+        if len(segment_features) == 0:
+            empty_vision = vision_features.new_zeros((0, self.config.out_hidden_size))
+            empty_audio = vision_features.new_zeros((0, 0, self.config.out_hidden_size))
+            empty_lens = torch.zeros((0,), dtype=torch.long, device=device)
+            return empty_vision, empty_audio, empty_lens
+
+        packed_features = torch.cat(segment_features, dim=0)
+        packed_rotary = torch.cat(segment_rotary, dim=0)
+        packed_modality_mask = torch.cat(segment_modality_masks, dim=0)
+
+        cu_seqlens = torch.nn.functional.pad(
+            torch.tensor(segment_lengths, dtype=torch.int32, device=device).cumsum(dim=0, dtype=torch.int32),
+            (1, 0),
+            value=0,
+        )
+
+        # 4. Run the shared transformer once over the packed sequence.
+        encoder_output = self.encoder(
+            hidden_states=packed_features,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=packed_rotary,
+        ).last_hidden_state
+
+        # 5. Split encoder output back via ``packed_modality_mask``.
+        vision_output = encoder_output[packed_modality_mask]
+        audio_output_packed = encoder_output[~packed_modality_mask]
+
+        # ---- Vision post-processing ----
+        if vision_output.size(0) > 0:
+            vision_output = self.vision_merger(vision_output)
+        else:
+            vision_output = encoder_output.new_zeros((0, self.config.out_hidden_size))
+
+        # ---- Audio post-processing ----
+        if audio_output_packed.size(0) > 0 and len(per_video_audio_chunk_lens) > 0:
+            all_audio_chunk_lens = torch.cat(per_video_audio_chunk_lens, dim=0)
+            audio_chunks_split = audio_output_packed.split(all_audio_chunk_lens.tolist(), dim=0)
+            audio_output = torch.nn.utils.rnn.pad_sequence(audio_chunks_split, batch_first=True, padding_value=0.0)
+            audio_output = self.audio_merger(audio_output)
+            audio_lens_after_merge = -(-all_audio_chunk_lens // int(self.config.temporal_merge_size))
+        else:
+            audio_output = encoder_output.new_zeros((0, 0, self.config.out_hidden_size))
+            audio_lens_after_merge = torch.zeros((0,), dtype=torch.long, device=device)
+
+        return vision_output, audio_output, audio_lens_after_merge
+
     # -------------------------------------------------------------- top-level
     def forward(
         self,
@@ -2377,11 +2595,36 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         image_grid_thw: torch.Tensor | None = None,
         audios: Any | None = None,
         modality: str | None = None,
+        # video_omni_fusion joint path
+        video_images: torch.Tensor | None = None,
+        video_image_grid_thw: torch.Tensor | None = None,
+        video_audios: list | None = None,
+        video_split: torch.Tensor | None = None,
         **kwargs,
     ):
-        """Dispatch by modality (mirrors ``MegatronOmniModel.forward``)."""
+        """Dispatch by modality (mirrors ``MegatronOmniModel.forward``).
+
+        * ``modality == "vision"`` or only vision inputs → ``image_embeddings``
+          of shape ``[N, out_hidden_size]``.
+        * ``modality == "audio"`` or only audio inputs → ``(audio_embeddings,
+          audio_lengths)``.
+        * ``modality == "video"`` or ``video_split`` is given → joint encode,
+          returns ``(video_image_embeddings, video_audio_embeddings,
+          video_audio_lens_after_merge)``.
+        * Both vision and audio (legacy independent dual call) → ``{"vision":
+          ..., "audio": (..., ...)}``.
+        """
         has_vision = pixel_values is not None and image_grid_thw is not None
         has_audio = audios is not None
+        has_video = video_split is not None and video_split.numel() > 0
+
+        if modality == "video" or (has_video and modality is None):
+            return self.forward_video(
+                video_images=video_images,
+                video_image_grid_thw=video_image_grid_thw,
+                video_audios=video_audios,
+                video_split=video_split,
+            )
 
         if modality == "vision" or (has_vision and not has_audio):
             return self.forward_vision(pixel_values, image_grid_thw)
@@ -2395,7 +2638,8 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
             return {"vision": v, "audio": (a, a_len)}
 
         raise ValueError(
-            "YoutuVITAOmniModel.forward requires at least one of (pixel_values, image_grid_thw) or (audios,)."
+            "YoutuVITAOmniModel.forward requires at least one of (pixel_values, image_grid_thw), "
+            "(audios,), or (video_images, video_image_grid_thw, video_split)."
         )
 
 
