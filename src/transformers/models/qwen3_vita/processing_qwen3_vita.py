@@ -46,6 +46,11 @@ class Qwen3VITAVideosKwargs(VideosKwargs, total=False):
     video_key_frame: bool
     use_audio_in_video: bool
     use_vision_in_video: bool
+    # When True, video frames+audio of the same video are jointly encoded by
+    # ``Qwen3VITAOmniModel.forward_video`` so they can attend to each other.
+    # When False (default), video frames/audio fall back to the standalone
+    # image/audio paths.
+    video_omni_fusion: bool
 
 
 class Qwen3VITAProcessorKwargs(ProcessingKwargs, total=False):
@@ -59,24 +64,25 @@ class Qwen3VITAProcessorKwargs(ProcessingKwargs, total=False):
             "padding_side": "left",
         },
         "images_kwargs": {
-            "vision_resolution_type": "native",
-            "vision_normalize_type": "siglip",
-            "image_min_num_tokens": 4,
-            "image_max_num_tokens": 8192,
+            # "vision_resolution_type": "native",
+            # "vision_normalize_type": "siglip",
+            # "image_min_num_tokens": 4,
+            # "image_max_num_tokens": 8192,
         },
         "videos_kwargs": {
-            "vision_resolution_type": "native",
-            "video_min_num_tokens": 64,
-            "video_max_num_tokens": 8192,
-            "video_image_min_num_tokens": 4,
-            "video_image_max_num_tokens": 256,
-            "video_max_num_frames": 64,
-            "temporal_patch_size": 1,
-            "spatial_merge_size": 2,
-            "patch_size": 16,
-            "video_key_frame": False,
-            "use_audio_in_video": True,
-            "use_vision_in_video": True,
+            # "vision_resolution_type": "native",
+            # "video_min_num_tokens": 64,
+            # "video_max_num_tokens": 8192,
+            # "video_image_min_num_tokens": 4,
+            # "video_image_max_num_tokens": 256,
+            # "video_max_num_frames": 64,
+            # "temporal_patch_size": 1,
+            # "spatial_merge_size": 2,
+            # "patch_size":16,
+            # "video_key_frame": False,
+            # "use_audio_in_video": True,
+            # "use_vision_in_video": True,
+            # "video_omni_fusion": False,
         },
         "audio_kwargs": {
             "sampling_rate": 16000,
@@ -171,6 +177,13 @@ class Qwen3VITAProcessor(ProcessorMixin):
         if videos:
             if isinstance(videos, (list, tuple)) and all(isinstance(videos_i, (list, tuple)) for videos_i in videos):
                 videos = [vid for vid_list in videos for vid in vid_list]
+
+            # Joint-encode switch: when True, same-video vision/audio go
+            # through ``Qwen3VITAOmniModel.forward_video`` together. When
+            # False (default), video frames/audio are fed into the
+            # standalone image/audio paths (current behavior).
+            video_omni_fusion = output_kwargs["videos_kwargs"].pop("video_omni_fusion", False)
+
             (
                 input_ids,
                 _images,
@@ -179,6 +192,7 @@ class Qwen3VITAProcessor(ProcessorMixin):
                 audio_indices,
                 image_grid_thw,
                 second_per_grids,
+                video_split,
                 # ) = self.video_processor.add_video_input_contiguous(
             ) = self.video_processor.add_video_input_discrete_or_contiguous(
                 input_ids,
@@ -195,12 +209,29 @@ class Qwen3VITAProcessor(ProcessorMixin):
                 audio_seqlens = None
             else:
                 audio_seqlens = [len(x) for x in _audios]
-            videos_inputs["images"] = _images
-            videos_inputs["image_indices"] = image_indices
-            videos_inputs["audios"] = _audios
-            videos_inputs["audio_indices"] = audio_indices
-            videos_inputs["image_grid_thw"] = image_grid_thw
-            # videos_inputs["second_per_grids"] = second_per_grids
+
+            if video_omni_fusion and _images is not None:
+                # Joint-encode mode: emit dedicated ``video_*`` keys so the
+                # model's joint forward path picks them up. ``video_audios``
+                # / ``video_audio_indices`` keep the list form used by the
+                # standalone audio path.
+                videos_inputs["video_images"] = _images
+                videos_inputs["video_image_grid_thw"] = image_grid_thw
+                videos_inputs["video_image_indices"] = image_indices
+                if _audios is not None:
+                    videos_inputs["video_audios"] = _audios
+                    videos_inputs["video_audio_indices"] = audio_indices
+                videos_inputs["video_split"] = torch.tensor(video_split, dtype=torch.long)
+            else:
+                # Independent mode (default, current behavior unchanged):
+                # video frames/audio are fed into the standalone image/audio
+                # paths via the ``images`` / ``audios`` keys.
+                videos_inputs["images"] = _images
+                videos_inputs["image_indices"] = image_indices
+                videos_inputs["audios"] = _audios
+                videos_inputs["audio_indices"] = audio_indices
+                videos_inputs["image_grid_thw"] = image_grid_thw
+                # videos_inputs["second_per_grids"] = second_per_grids
 
         input_ids = torch.tensor([input_ids], dtype=torch.long)
         texts_inputs["input_ids"] = input_ids

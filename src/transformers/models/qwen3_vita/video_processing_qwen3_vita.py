@@ -48,7 +48,7 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         self,
         image_processor=None,
         audio_processor=None,
-        vision_resolution_type=None,
+        vision_resolution_type="native",
         video_max_num_frames=64,
         video_max_fps=1,
         video_min_num_tokens=64,
@@ -305,6 +305,101 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
             duration_seconds,
         )
 
+    @staticmethod
+    def _chunk_audio_video_frames(
+        image_frames,
+        audio_frames,
+        second_frames,
+        duration_seconds,
+        video_audio_chunk_min_second,
+        video_audio_chunk_max_second,
+    ):
+        """Split image/audio frames into time-aligned chunks based on audio
+        duration limits. Mirrors :meth:`VideoProcessor._chunk_audio_video_frames`
+        in ``cognitron_mm/processor/video_processor.py``.
+
+        Returns:
+            ``(image_chunks, image_second_chunks, audio_chunks, audio_second_chunks)``
+        """
+        if audio_frames is None:
+            return [image_frames], [second_frames], [[]], [[]]
+
+        second_per_audio = 1.0 * duration_seconds / sum(len(x) for x in audio_frames)
+
+        image_chunks = []
+        image_second_chunks = []
+        audio_chunks = []
+        audio_second_chunks = []
+
+        image_chunk = []
+        image_second_chunk = []
+        audio_chunk = []
+        audio_second_chunk = []
+
+        for image_frame, audio_frame, second_frame in zip(image_frames, audio_frames, second_frames):
+            audio_second = len(audio_frame) * second_per_audio
+            audio_chunk_second = sum(len(x) * second_per_audio for x in audio_chunk)
+
+            if audio_second + audio_chunk_second < video_audio_chunk_min_second:
+                image_chunk.append(image_frame)
+                image_second_chunk.append(second_frame)
+                audio_chunk.append(audio_frame)
+                audio_second_chunk.append(second_frame)
+
+            elif audio_second + audio_chunk_second <= video_audio_chunk_max_second:
+                image_chunk.append(image_frame)
+                image_second_chunk.append(second_frame)
+                audio_chunk.append(audio_frame)
+                audio_second_chunk.append(second_frame)
+
+                image_chunks.append(image_chunk)
+                image_second_chunks.append(image_second_chunk)
+
+                audio_chunk = [torch.cat(audio_chunk, dim=0)]
+                audio_second_chunk = [audio_second_chunk[0]]
+                audio_chunks.append(audio_chunk)
+                audio_second_chunks.append(audio_second_chunk)
+
+                image_chunk = []
+                image_second_chunk = []
+                audio_chunk = []
+                audio_second_chunk = []
+
+            else:
+                assert audio_chunk_second == 0
+
+                image_chunk.append(image_frame)
+                image_second_chunk.append(second_frame)
+
+                audio_chunk_size = int(video_audio_chunk_max_second / second_per_audio)
+                audio_chunk = torch.split(audio_frame, audio_chunk_size)
+                cur_second = second_frame
+                for x in audio_chunk:
+                    audio_second_chunk.append(cur_second)
+                    cur_second += len(x) * second_per_audio
+
+                image_chunks.append(image_chunk)
+                image_second_chunks.append(image_second_chunk)
+
+                audio_chunks.append(audio_chunk)
+                audio_second_chunks.append(audio_second_chunk)
+
+                image_chunk = []
+                image_second_chunk = []
+                audio_chunk = []
+                audio_second_chunk = []
+
+        if len(image_chunk) > 0:
+            image_chunks.append(image_chunk)
+            image_second_chunks.append(image_second_chunk)
+
+            audio_chunk = [torch.cat(audio_chunk, dim=0)]
+            audio_second_chunk = [audio_second_chunk[0]]
+            audio_chunks.append(audio_chunk)
+            audio_second_chunks.append(audio_second_chunk)
+
+        return image_chunks, image_second_chunks, audio_chunks, audio_second_chunks
+
     def add_video_input_discrete_or_contiguous(
         self,
         input_ids,
@@ -320,8 +415,8 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         video_max_fps = kwargs.get("video_max_fps", self.video_max_fps)
         use_audio_in_video = kwargs.get("use_audio_in_video", self.use_audio_in_video)
         use_vision_in_video = kwargs.get("use_vision_in_video", self.use_vision_in_video)
-        video_audio_chunk_min_second = kwargs.get("video_audio_chuk_min_second", self.video_audio_chunk_min_second)
-        video_audio_chunk_max_second = kwargs.get("video_audio_chuk_max_second", self.video_audio_chunk_max_second)
+        video_audio_chunk_min_second = kwargs.get("video_audio_chunk_min_second", self.video_audio_chunk_min_second)
+        video_audio_chunk_max_second = kwargs.get("video_audio_chunk_max_second", self.video_audio_chunk_max_second)
 
         GLOBAL_CONSTANTS = get_token()
 
@@ -355,11 +450,19 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         audio_indices = []
         video_grid_thw = []
         second_per_grids = []
+        # Per-video splits ``(num_images, num_audios)``, consumed downstream
+        # by the ``video_omni_fusion`` joint-encode path. Mirrors
+        # :meth:`VideoProcessor.add_video_input_contiguous` in
+        # ``cognitron_mm/processor/video_processor.py``.
+        video_split = []
 
         new_input_ids = []
         new_targets = []
         st = 0
         for vid_idx, vid_pos in enumerate(vid_positions):
+            # Snapshot per-video accounting before processing this video.
+            num_images_before = len(video_grid_thw)
+            num_audios_before = len(audios)
             (
                 image_frames,
                 audio_frames,
@@ -383,89 +486,19 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
             if targets is not None:
                 new_targets += targets[st:vid_pos]
 
-            if audio_frames is not None:
-                second_per_audio = 1.0 * duration_seconds / sum([len(x) for x in audio_frames])
-
-                image_chunks = []
-                image_second_chunks = []
-                audio_chunks = []
-                audio_second_chunks = []
-
-                image_chunk = []
-                image_second_chunk = []
-                audio_chunk = []
-                audio_second_chunk = []
-                for image_frame, audio_frame, second_frame in zip(image_frames, audio_frames, second_frames):
-                    audio_second = len(audio_frame) * second_per_audio
-                    audio_chunk_second = sum([len(x) * second_per_audio for x in audio_chunk])
-
-                    if audio_second + audio_chunk_second < video_audio_chunk_min_second:
-                        image_chunk.append(image_frame)
-                        image_second_chunk.append(second_frame)
-
-                        audio_chunk.append(audio_frame)
-                        audio_second_chunk.append(second_frame)
-
-                    elif audio_second + audio_chunk_second <= video_audio_chunk_max_second:
-                        image_chunk.append(image_frame)
-                        image_second_chunk.append(second_frame)
-
-                        audio_chunk.append(audio_frame)
-                        audio_second_chunk.append(second_frame)
-
-                        image_chunks.append(image_chunk)
-                        image_second_chunks.append(image_second_chunk)
-
-                        audio_chunk = [torch.cat(audio_chunk, dim=0)]
-                        audio_second_chunk = [audio_second_chunk[0]]
-                        audio_chunks.append(audio_chunk)
-                        audio_second_chunks.append(audio_second_chunk)
-
-                        image_chunk = []
-                        image_second_chunk = []
-
-                        audio_chunk = []
-                        audio_second_chunk = []
-
-                    else:
-                        assert audio_chunk_second == 0
-
-                        image_chunk.append(image_frame)
-                        image_second_chunk.append(second_frame)
-
-                        audio_chunk_size = int(video_audio_chunk_max_second / second_per_audio)
-                        audio_chunk = torch.split(audio_frame, audio_chunk_size)
-                        cur_second = second_frame
-                        for x in audio_chunk:
-                            audio_second_chunk.append(cur_second)
-                            cur_second += len(x) * second_per_audio
-
-                        image_chunks.append(image_chunk)
-                        image_second_chunks.append(image_second_chunk)
-
-                        audio_chunks.append(audio_chunk)
-                        audio_second_chunks.append(audio_second_chunk)
-
-                        image_chunk = []
-                        image_second_chunk = []
-
-                        audio_chunk = []
-                        audio_second_chunk = []
-
-                if len(image_chunk) > 0:
-                    image_chunks.append(image_chunk)
-                    image_second_chunks.append(image_second_chunk)
-
-                    audio_chunk = [torch.cat(audio_chunk, dim=0)]
-                    audio_second_chunk = [audio_second_chunk[0]]
-                    audio_chunks.append(audio_chunk)
-                    audio_second_chunks.append(audio_second_chunk)
-
-            else:
-                image_chunks = [image_frames]
-                image_second_chunks = [second_frames]
-                audio_chunks = [[]]
-                audio_second_chunks = [[]]
+            (
+                image_chunks,
+                image_second_chunks,
+                audio_chunks,
+                audio_second_chunks,
+            ) = self._chunk_audio_video_frames(
+                image_frames,
+                audio_frames,
+                second_frames,
+                duration_seconds,
+                video_audio_chunk_min_second,
+                video_audio_chunk_max_second,
+            )
 
             assert len(image_frames) == sum([len(x) for x in image_chunks])
             # assert len(audio_frames) == sum([len(x) for x in audio_chunks])
@@ -671,6 +704,14 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
             video_grid_thw.extend(_video_grid_thw)
             second_per_grids.extend(_second_per_grids)
 
+            # Record per-video split delta after processing this video.
+            video_split.append(
+                (
+                    len(video_grid_thw) - num_images_before,
+                    len(audios) - num_audios_before,
+                )
+            )
+
             st = vid_pos + 1
 
         new_input_ids += input_ids[st:]
@@ -684,6 +725,10 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         video_grid_thw = torch.tensor(video_grid_thw, dtype=torch.long)
         second_per_grids = torch.tensor(second_per_grids, dtype=torch.long)
 
+        # Per-video split metadata, consumed by the joint-video encoder when
+        # ``video_omni_fusion`` is enabled. ``None`` when no videos.
+        video_split_out = video_split if len(video_split) > 0 else None
+
         if targets is not None:
             return (
                 input_ids,
@@ -694,22 +739,15 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
                 video_grid_thw,
                 second_per_grids,
                 targets,
+                video_split_out,
             )
 
         if len(images) == 0:
             images = None
             image_indices = None
-
         else:
-            images = torch.cat(images, dim=0)
-            image_indices = torch.cat(image_indices, dim=1)
-
-            image_indices = image_indices.contiguous().to(torch.cuda.current_device())
-            if True:
-                images = torch.tensor(images, dtype=torch.float32).contiguous().to(torch.cuda.current_device())
-
-            else:
-                images = torch.tensor(images, dtype=torch.float16).contiguous().to(torch.cuda.current_device())
+            images = torch.cat(images, dim=0).contiguous()
+            image_indices = torch.cat(image_indices, dim=1).contiguous()
 
         if len(audios) == 0:
             audios = None
@@ -723,6 +761,292 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
             audio_indices,
             video_grid_thw,
             second_per_grids,
+            video_split_out,
+        )
+
+    def add_video_input_contiguous(
+        self,
+        input_ids,
+        video_paths,
+        tokenizer,
+        targets=None,
+        is_pretrain=False,
+        **kwargs,
+    ):
+        """Continuous-token video path. Mirrors
+        :meth:`VideoProcessor.add_video_input_contiguous` in
+        ``cognitron_mm/processor/video_processor.py``: every image chunk is
+        wrapped by ``VID_START / VID_CONTEXT / VID_END`` and every audio chunk
+        by ``AUD_START / AUD_CONTEXT / AUD_END`` (no outer ``VID_*`` brackets
+        per video). Always emits a ``video_split`` row per video so the
+        downstream joint encoder (``video_omni_fusion=True``) can pair
+        same-video vision and audio inside one packed attention window.
+        """
+        video_max_num_frames = kwargs.get("video_max_num_frames", self.video_max_num_frames)
+        video_max_fps = kwargs.get("video_max_fps", self.video_max_fps)
+        use_audio_in_video = kwargs.get("use_audio_in_video", self.use_audio_in_video)
+        use_vision_in_video = kwargs.get("use_vision_in_video", self.use_vision_in_video)
+        video_audio_chunk_min_second = kwargs.get("video_audio_chunk_min_second", self.video_audio_chunk_min_second)
+        video_audio_chunk_max_second = kwargs.get("video_audio_chunk_max_second", self.video_audio_chunk_max_second)
+
+        GLOBAL_CONSTANTS = get_token()
+
+        AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_CONTEXT_TOKEN)
+        AUD_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_START_TOKEN)
+        AUD_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_END_TOKEN)
+
+        VID_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_CONTEXT_TOKEN)
+        VID_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_START_TOKEN)
+        VID_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_END_TOKEN)
+
+        VID_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.VID_TAG_TOKEN)
+
+        vid_positions = [i for i, x in enumerate(input_ids) if x == VID_TAG_ID]
+        assert len(vid_positions) == len(video_paths), video_paths
+
+        images = []
+        image_indices = []
+        audios = []
+        audio_indices = []
+        video_grid_thw = []
+        second_per_grids = []
+        video_split = []
+
+        new_input_ids = []
+        new_targets = []
+        st = 0
+        for vid_idx, vid_pos in enumerate(vid_positions):
+            # Snapshot per-video accounting before processing this video.
+            num_images_before = len(video_grid_thw)
+            num_audios_before = len(audios)
+
+            (
+                image_frames,
+                audio_frames,
+                audio_token_length_func,
+                _video_grid_thw,
+                _second_per_grids,
+                second_frames,
+                duration_seconds,
+            ) = self.process_video(video_paths[vid_idx], video_max_num_frames, video_max_fps)
+
+            if audio_frames is not None:
+                num_frames = min(len(image_frames), len(audio_frames))
+                image_frames = image_frames[:num_frames]
+                audio_frames = audio_frames[:num_frames]
+
+            new_input_ids += input_ids[st:vid_pos]
+            if targets is not None:
+                new_targets += targets[st:vid_pos]
+
+            (
+                image_chunks,
+                image_second_chunks,
+                audio_chunks,
+                audio_second_chunks,
+            ) = self._chunk_audio_video_frames(
+                image_frames,
+                audio_frames,
+                second_frames,
+                duration_seconds,
+                video_audio_chunk_min_second,
+                video_audio_chunk_max_second,
+            )
+
+            assert len(image_frames) == sum(len(x) for x in image_chunks)
+
+            if use_vision_in_video:
+                if self.image_processor.vision_resolution_type == "native":
+                    images.append(
+                        torch.cat(
+                            [
+                                self.image_processor.convert_image_to_patches_with_pixel_shuffle(x)
+                                for x in image_frames
+                            ],
+                            dim=0,
+                        )
+                    )
+                else:
+                    images.append(image_frames)
+
+            if use_audio_in_video and audio_frames is not None:
+                audios.extend([xx for x in audio_chunks for xx in x])
+
+            for (
+                image_chunk_frames,
+                image_second_chunk_frames,
+                audio_chunk_frames,
+                audio_second_chunk_frames,
+            ) in zip(
+                image_chunks,
+                image_second_chunks,
+                audio_chunks,
+                audio_second_chunks,
+            ):
+                if not use_vision_in_video:
+                    image_chunk_frames = []
+                    image_second_chunk_frames = []
+                if not use_audio_in_video:
+                    audio_chunk_frames = []
+                    audio_second_chunk_frames = []
+
+                for image_chunk_frame, image_second_chunk_frame in zip(image_chunk_frames, image_second_chunk_frames):
+                    # add timestamp
+                    timestamp = time.strftime("%H:%M:%S", time.gmtime(round(image_second_chunk_frame)))
+                    _input_id = tokenizer(timestamp, add_special_tokens=False).input_ids
+                    new_input_ids += _input_id
+                    if targets is not None:
+                        if is_pretrain:
+                            new_targets += _input_id
+                        else:
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
+
+                    new_input_ids += [VID_START_ID]
+                    if targets is not None:
+                        if is_pretrain:
+                            new_targets += [VID_START_ID]
+                        else:
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
+
+                    image_token_length = (
+                        _video_grid_thw[0][0]
+                        * _video_grid_thw[0][1]
+                        * _video_grid_thw[0][2]
+                        // self.spatial_merge_size
+                        // self.spatial_merge_size
+                    )
+                    image_indice_b = torch.zeros(
+                        1, image_token_length, dtype=torch.int64
+                    )  # This will change in collate_fn
+                    image_indice_s = (
+                        torch.arange(len(new_input_ids), len(new_input_ids) + image_token_length)
+                        .unsqueeze(0)
+                        .repeat(1, 1)
+                    )
+                    image_indice_b_s = torch.stack(
+                        [image_indice_b, image_indice_s], dim=0
+                    )  # 2, num_image, image_length
+                    if self.image_processor.vision_resolution_type == "native":
+                        image_indices.append(image_indice_b_s.view(2, -1))
+                    else:
+                        image_indices.append(image_indice_b_s)
+
+                    new_input_ids += [VID_CONTEXT_ID] * image_token_length
+                    if targets is not None:
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
+
+                    new_input_ids += [VID_END_ID]
+                    if targets is not None:
+                        if is_pretrain:
+                            new_targets += [VID_END_ID]
+                        else:
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
+
+                for audio_chunk_frame, audio_second_chunk_frame in zip(audio_chunk_frames, audio_second_chunk_frames):
+                    # add timestamp
+                    timestamp = time.strftime("%H:%M:%S", time.gmtime(round(audio_second_chunk_frame)))
+                    _input_id = tokenizer(timestamp, add_special_tokens=False).input_ids
+                    new_input_ids += _input_id
+                    if targets is not None:
+                        if is_pretrain:
+                            new_targets += _input_id
+                        else:
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
+
+                    new_input_ids += [AUD_START_ID]
+                    if targets is not None:
+                        if is_pretrain:
+                            new_targets += [AUD_START_ID]
+                        else:
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
+
+                    audio_token_length = -(
+                        -audio_token_length_func(len(audio_chunk_frame)) // self.temporal_merge_size
+                    )
+                    assert audio_token_length > 0
+
+                    audio_indice_b = torch.zeros(
+                        1, audio_token_length, dtype=torch.int64
+                    )  # This will change in collate_fn
+                    audio_indice_s = (
+                        torch.arange(len(new_input_ids), len(new_input_ids) + audio_token_length)
+                        .unsqueeze(0)
+                        .repeat(1, 1)
+                    )
+                    audio_indice_b_s = torch.stack(
+                        [audio_indice_b, audio_indice_s], dim=0
+                    )  # 2, num_audio, audio_length
+                    audio_indices.append(audio_indice_b_s)
+
+                    new_input_ids += [AUD_CONTEXT_ID] * audio_token_length
+                    if targets is not None:
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * audio_token_length
+
+                    new_input_ids += [AUD_END_ID]
+                    if targets is not None:
+                        if is_pretrain:
+                            new_targets += [AUD_END_ID]
+                        else:
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
+
+            video_grid_thw.extend(_video_grid_thw)
+            second_per_grids.extend(_second_per_grids)
+
+            video_split.append(
+                (
+                    len(video_grid_thw) - num_images_before,
+                    len(audios) - num_audios_before,
+                )
+            )
+
+            st = vid_pos + 1
+
+        new_input_ids += input_ids[st:]
+        if targets is not None:
+            new_targets += targets[st:]
+
+        input_ids = new_input_ids
+        if targets is not None:
+            targets = new_targets
+
+        video_grid_thw = torch.tensor(video_grid_thw, dtype=torch.long)
+        second_per_grids = torch.tensor(second_per_grids, dtype=torch.long)
+
+        video_split_out = video_split if len(video_split) > 0 else None
+
+        if targets is not None:
+            return (
+                input_ids,
+                images,
+                image_indices,
+                audios,
+                audio_indices,
+                video_grid_thw,
+                second_per_grids,
+                targets,
+                video_split_out,
+            )
+
+        if len(images) == 0:
+            images = None
+            image_indices = None
+        else:
+            images = torch.cat(images, dim=0).contiguous()
+            image_indices = torch.cat(image_indices, dim=1).contiguous()
+
+        if len(audios) == 0:
+            audios = None
+            audio_indices = None
+
+        return (
+            input_ids,
+            images,
+            image_indices,
+            audios,
+            audio_indices,
+            video_grid_thw,
+            second_per_grids,
+            video_split_out,
         )
 
 
