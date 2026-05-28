@@ -378,6 +378,8 @@ class Qwen3VITAFeatureExtractor(SequenceFeatureExtractor):
                         ]
 
                     audio_token_length = -(-audio_token_length_func(len(audio)) // self.temporal_merge_size)
+                    assert audio_token_length > 0
+
                     audio_indice_b = torch.zeros(
                         1, audio_token_length, dtype=torch.int64
                     )  # This will change in collate_fn

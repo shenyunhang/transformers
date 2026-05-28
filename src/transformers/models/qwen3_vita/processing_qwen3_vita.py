@@ -25,7 +25,6 @@ class Qwen3VITAImagesKwargs(ImagesKwargs, total=False):
     discrete_image_idxs: list
     contiguous_image_idxs: list
 
-    vision_resolution_type: str
     vision_normalize_type: str
     image_min_num_tokens: int
     image_max_num_tokens: int
@@ -34,7 +33,6 @@ class Qwen3VITAImagesKwargs(ImagesKwargs, total=False):
 class Qwen3VITAVideosKwargs(VideosKwargs, total=False):
     """ """
 
-    vision_resolution_type: str
     video_min_num_tokens: int
     video_max_num_tokens: int
     video_image_min_num_tokens: int
@@ -64,13 +62,11 @@ class Qwen3VITAProcessorKwargs(ProcessingKwargs, total=False):
             "padding_side": "left",
         },
         "images_kwargs": {
-            # "vision_resolution_type": "native",
             # "vision_normalize_type": "siglip",
             # "image_min_num_tokens": 4,
             # "image_max_num_tokens": 8192,
         },
         "videos_kwargs": {
-            # "vision_resolution_type": "native",
             # "video_min_num_tokens": 64,
             # "video_max_num_tokens": 8192,
             # "video_image_min_num_tokens": 4,
@@ -193,7 +189,6 @@ class Qwen3VITAProcessor(ProcessorMixin):
                 image_grid_thw,
                 second_per_grids,
                 video_split,
-                # ) = self.video_processor.add_video_input_contiguous(
             ) = self.video_processor.add_video_input_discrete_or_contiguous(
                 input_ids,
                 videos,
