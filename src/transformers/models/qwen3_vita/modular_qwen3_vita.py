@@ -3697,7 +3697,8 @@ class MelFilterBankTokenizer:
             sampling_rate=16000,
             return_attention_mask=True,
             return_tensors="pt",
-            padding=True,
+            padding="do_not_pad",
+            truncation=False,
             device=self.device,
         )
         input_features = features["input_features"]
