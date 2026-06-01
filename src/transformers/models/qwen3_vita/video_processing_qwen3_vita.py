@@ -63,6 +63,7 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         temporal_merge_size=1,
         patch_size=14,
         video_key_frame=False,
+        video_omni_fusion=False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -89,6 +90,11 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         self.sampling_rate = 16000
 
         self.video_key_frame = video_key_frame
+        # When ``video_omni_fusion`` is False, ``add_video_input_discrete_or_contiguous``
+        # always returns ``video_split=None`` so upstream code falls back to the
+        # legacy (non-split) flow. When True, the per-video ``(num_images, num_audios)``
+        # tuples are surfaced and the joint-encode path is taken downstream.
+        self.video_omni_fusion = video_omni_fusion
 
     def to_dict(self):
         output = super().to_dict()
@@ -408,6 +414,7 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         use_vision_in_video = kwargs.get("use_vision_in_video", self.use_vision_in_video)
         video_audio_chunk_min_second = kwargs.get("video_audio_chunk_min_second", self.video_audio_chunk_min_second)
         video_audio_chunk_max_second = kwargs.get("video_audio_chunk_max_second", self.video_audio_chunk_max_second)
+        video_omni_fusion = kwargs.get("video_omni_fusion", self.video_omni_fusion)
 
         GLOBAL_CONSTANTS = get_token()
 
@@ -685,8 +692,15 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         second_per_grids = torch.tensor(second_per_grids, dtype=torch.long)
 
         # Per-video split metadata, consumed by the joint-video encoder when
-        # ``video_omni_fusion`` is enabled. ``None`` when no videos.
-        video_split_out = video_split if len(video_split) > 0 else None
+        # ``video_omni_fusion`` is enabled. Returns ``None`` whenever the
+        # omni-fusion toggle is off or no videos were processed; only surfaces
+        # the populated list when both conditions are met. Mirrors the
+        # behaviour of :meth:`VideoProcessor.add_video_input_discrete_or_contiguous`
+        # in ``cognitron_mm/processor/video_processor.py``.
+        if video_omni_fusion and len(video_split) > 0:
+            video_split_out = video_split
+        else:
+            video_split_out = None
 
         if targets is not None:
             return (
