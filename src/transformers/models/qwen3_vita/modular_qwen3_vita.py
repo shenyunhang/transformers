@@ -2270,6 +2270,7 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                 "`video_split` tensor of shape [N_video, 2]."
             )
 
+        logger.debug(f"{video_images.size()=} {video_image_grid_thw.size()=} {[x.shape for x in video_audios]=} {video_split=}")
         device = video_images.device
 
         # 1. Per-modality frontends.
@@ -2495,6 +2496,8 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                 (0, 0, self.config.out_hidden_size)
             )
             audio_lens_after_merge = torch.zeros((0,), dtype=torch.long, device=device)
+
+        logger.debug(f"{vision_output.size()=} {audio_output.size()=} {audio_lens_after_merge=}")
 
         return vision_output, audio_output, audio_lens_after_merge
 
@@ -4563,6 +4566,7 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         temporal_merge_size=1,
         patch_size=14,
         video_key_frame=False,
+        video_omni_fusion=False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -4589,6 +4593,11 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         self.sampling_rate = 16000
 
         self.video_key_frame = video_key_frame
+        # When ``video_omni_fusion`` is False, ``add_video_input_discrete_or_contiguous``
+        # always returns ``video_split=None`` so upstream code falls back to the
+        # legacy (non-split) flow. When True, the per-video ``(num_images, num_audios)``
+        # tuples are surfaced and the joint-encode path is taken downstream.
+        self.video_omni_fusion = video_omni_fusion
 
     def to_dict(self):
         output = super().to_dict()
@@ -4928,6 +4937,7 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         use_vision_in_video = kwargs.get("use_vision_in_video", self.use_vision_in_video)
         video_audio_chunk_min_second = kwargs.get("video_audio_chunk_min_second", self.video_audio_chunk_min_second)
         video_audio_chunk_max_second = kwargs.get("video_audio_chunk_max_second", self.video_audio_chunk_max_second)
+        video_omni_fusion = kwargs.get("video_omni_fusion", self.video_omni_fusion)
 
         GLOBAL_CONSTANTS = get_token()
 
@@ -5225,8 +5235,15 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         second_per_grids = torch.tensor(second_per_grids, dtype=torch.long)
 
         # Per-video split metadata, consumed by the joint-video encoder when
-        # ``video_omni_fusion`` is enabled. ``None`` when no videos.
-        video_split_out = video_split if len(video_split) > 0 else None
+        # ``video_omni_fusion`` is enabled. Returns ``None`` whenever the
+        # omni-fusion toggle is off or no videos were processed; only surfaces
+        # the populated list when both conditions are met. Mirrors the
+        # behaviour of :meth:`VideoProcessor.add_video_input_discrete_or_contiguous`
+        # in ``cognitron_mm/processor/video_processor.py``.
+        if video_omni_fusion and len(video_split) > 0:
+            video_split_out = video_split
+        else:
+            video_split_out = None
 
         if targets is not None:
             return (
@@ -5273,8 +5290,6 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
         image_size=448,
         image_size_discrete=None,
         vision_normalize_type="imagenet",
-        min_tile_grid=1,
-        max_tile_grid=6,
         image_min_num_tokens=4,
         image_max_num_tokens=256,
         temporal_patch_size=1,
@@ -5287,9 +5302,6 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
         super().__init__(**kwargs)
         self.image_size = image_size
         self.image_size_discrete = image_size_discrete
-        self.min_tile_grid = min_tile_grid
-        self.max_tile_grid = max_tile_grid
-        self.tile_image_size = image_size
         self.image_max_num_tokens = image_max_num_tokens
         self.image_min_num_tokens = image_min_num_tokens
 
@@ -5593,7 +5605,6 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
         image_or_paths,
         tokenizer,
         # image_token_length=256,
-        # use_tile=True,
         discrete_image_idxs=[],
         contiguous_image_idxs=[],
         targets=None,
@@ -5954,14 +5965,6 @@ class Qwen3VITAProcessor(ProcessorMixin):
             if (isinstance(videos, (list, tuple)) and all(isinstance(videos_i, (list, tuple)) for videos_i in videos)):
                 videos = [vid for vid_list in videos for vid in vid_list]
 
-            # Joint-encode switch: when True, same-video vision/audio go
-            # through ``Qwen3VITAOmniModel.forward_video`` together. When
-            # False (default), video frames/audio are fed into the
-            # standalone image/audio paths (current behavior).
-            video_omni_fusion = output_kwargs["videos_kwargs"].pop(
-                "video_omni_fusion", False
-            )
-
             (
                 input_ids,
                 _images,
@@ -5987,18 +5990,61 @@ class Qwen3VITAProcessor(ProcessorMixin):
             else:
                 audio_seqlens = [len(x) for x in _audios]
 
-            if video_omni_fusion and _images is not None:
-                # Joint-encode mode: emit dedicated ``video_*`` keys so the
-                # model's joint forward path picks them up. ``video_audios``
-                # / ``video_audio_indices`` keep the list form used by the
-                # standalone audio path.
-                videos_inputs["video_images"] = _images
-                videos_inputs["video_image_grid_thw"] = image_grid_thw
-                videos_inputs["video_image_indices"] = image_indices
-                if _audios is not None:
-                    videos_inputs["video_audios"] = _audios
-                    videos_inputs["video_audio_indices"] = audio_indices
-                videos_inputs["video_split"] = torch.tensor(video_split, dtype=torch.long)
+            # The video processor decides whether to populate ``video_split``
+            # (controlled by its ``video_omni_fusion`` toggle, with optional
+            # per-call override via ``videos_kwargs``). We branch on that
+            # signal --- mirroring the dispatch in
+            # ``cognitron_mm/data/preprocess_common.py``: ``video_split is
+            # None`` means the legacy (non-split) flow; otherwise we route
+            # into the dedicated ``video_*`` buffers consumed by the
+            # omni-fusion joint forward path.
+            if video_split is not None and len(video_split) == len(videos):
+                # Cross-video buffer consistency check, kept structurally
+                # identical to ``cognitron_mm/data/preprocess_common.py``.
+                # ``add_video_input_discrete_or_contiguous`` already
+                # guarantees that ``_images`` is either ``None`` or a single
+                # already-concatenated tensor in the ``targets is None``
+                # branch used by the processor, so ``can_split`` will be
+                # ``True`` whenever there is anything to split. The branch
+                # is preserved so the structure matches the upstream
+                # reference and so a future change to the video processor
+                # output contract (e.g. returning a per-video tensor list)
+                # would still fall back safely.
+                if _images is not None:
+                    total_images = sum(s[0] for s in video_split)
+                    total_audios = sum(s[1] for s in video_split)
+
+                    assert image_grid_thw is None or len(image_grid_thw) == total_images, (
+                        f"video_grid_thw rows mismatch: "
+                        f"{0 if image_grid_thw is None else len(image_grid_thw)} vs {total_images}"
+                    )
+                    if _audios is not None:
+                        assert len(_audios) == total_audios, (
+                            f"audios count mismatch: {len(_audios)} vs {total_audios}"
+                        )
+
+                can_split = torch.is_tensor(_images) if _images is not None else False
+                if can_split:
+                    # Joint-encode mode: emit dedicated ``video_*`` keys so
+                    # the model's joint forward path picks them up.
+                    # ``video_audios`` / ``video_audio_indices`` keep the
+                    # list form used by the standalone audio path.
+                    videos_inputs["video_images"] = _images
+                    videos_inputs["video_image_grid_thw"] = image_grid_thw
+                    videos_inputs["video_image_indices"] = image_indices
+                    if _audios is not None:
+                        videos_inputs["video_audios"] = _audios
+                        videos_inputs["video_audio_indices"] = audio_indices
+                    videos_inputs["video_split"] = torch.tensor(video_split, dtype=torch.long)
+                else:
+                    # Fallback: legacy behaviour. Preserves correctness when
+                    # the video processor cannot produce a single
+                    # concatenable image tensor.
+                    videos_inputs["images"] = _images
+                    videos_inputs["image_indices"] = image_indices
+                    videos_inputs["audios"] = _audios
+                    videos_inputs["audio_indices"] = audio_indices
+                    videos_inputs["image_grid_thw"] = image_grid_thw
             else:
                 # Independent mode (default, current behavior unchanged):
                 # video frames/audio are fed into the standalone image/audio

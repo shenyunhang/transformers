@@ -2358,6 +2358,9 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                 "Qwen3VITAOmniModel.forward_video requires a non-empty `video_split` tensor of shape [N_video, 2]."
             )
 
+        logger.debug(
+            f"{video_images.size()=} {video_image_grid_thw.size()=} {[x.shape for x in video_audios]=} {video_split=}"
+        )
         device = video_images.device
 
         # 1. Per-modality frontends.
@@ -2530,6 +2533,8 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
         else:
             audio_output = encoder_output.new_zeros((0, 0, self.config.out_hidden_size))
             audio_lens_after_merge = torch.zeros((0,), dtype=torch.long, device=device)
+
+        logger.debug(f"{vision_output.size()=} {audio_output.size()=} {audio_lens_after_merge=}")
 
         return vision_output, audio_output, audio_lens_after_merge
 

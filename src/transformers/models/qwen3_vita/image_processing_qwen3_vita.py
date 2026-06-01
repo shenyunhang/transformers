@@ -108,8 +108,6 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
         image_size=448,
         image_size_discrete=None,
         vision_normalize_type="imagenet",
-        min_tile_grid=1,
-        max_tile_grid=6,
         image_min_num_tokens=4,
         image_max_num_tokens=256,
         temporal_patch_size=1,
@@ -122,9 +120,6 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
         super().__init__(**kwargs)
         self.image_size = image_size
         self.image_size_discrete = image_size_discrete
-        self.min_tile_grid = min_tile_grid
-        self.max_tile_grid = max_tile_grid
-        self.tile_image_size = image_size
         self.image_max_num_tokens = image_max_num_tokens
         self.image_min_num_tokens = image_min_num_tokens
 
@@ -426,7 +421,6 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
         image_or_paths,
         tokenizer,
         # image_token_length=256,
-        # use_tile=True,
         discrete_image_idxs=[],
         contiguous_image_idxs=[],
         targets=None,
