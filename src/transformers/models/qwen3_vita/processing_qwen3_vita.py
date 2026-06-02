@@ -193,6 +193,8 @@ class Qwen3VITAProcessor(ProcessorMixin):
                 logger.debug(f"{len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw.size()=}")
             if _audios is not None:
                 logger.debug(f"{len(input_ids)=} {len(_audios)=} {[x.size() for x in _audios]=} {len(audio_indices)=}")
+            if video_split is not None:
+                logger.debug(f"{video_split=} {len(videos)=}")
 
             if _audios is None:
                 audio_seqlens = None

@@ -2086,6 +2086,7 @@ class YoutuVITAOmniFlashAttention2(nn.Module):
                 cu_seqlens,
                 max_seqlen,
                 max_seqlen,
+                causal=self.is_causal,
                 return_lse=True,
             )[0].reshape(seq_length, -1)
         else:
@@ -2097,6 +2098,7 @@ class YoutuVITAOmniFlashAttention2(nn.Module):
                 cu_seqlens,
                 max_seqlen,
                 max_seqlen,
+                causal=self.is_causal,
             ).reshape(seq_length, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output
@@ -2377,6 +2379,8 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         video_image_grid_thw: torch.Tensor,
         video_audios: list | None = None,
         video_split: torch.Tensor | None = None,
+        video_image_indices: torch.Tensor | None = None,
+        video_audio_indices: list | None = None,
     ):
         """Joint video path: vision frames and audio chunks of the same video
         share an attention window inside ``self.encoder`` while remaining
@@ -2398,6 +2402,20 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
                 num_audios)`` deltas. The number of vision patch rows belonging
                 to a video is fully determined by the corresponding rows of
                 ``video_image_grid_thw``.
+            video_image_indices: optional ``[2, total_image_tokens]`` tensor
+                produced by the video processor. ``[1]`` (the seq-position
+                row) is used to recover the real temporal interleave between
+                image frames and audio chunks of the same video, exactly
+                matching the order written into ``input_ids`` by
+                :meth:`YoutuVITAVideoProcessor.add_video_input_discrete_or_contiguous`.
+                When ``None`` the implementation falls back to a ``divmod``
+                heuristic that distributes audio chunks evenly across image
+                frames (legacy behaviour, only correct when each chunk is
+                ``1 image + 1 audio``).
+            video_audio_indices: optional list of ``[2, 1, audio_token_length]``
+                per-segment tensors aligned with ``video_audios``. Used together
+                with ``video_image_indices`` to recover the real interleave
+                order.
 
         Returns:
             tuple ``(video_image_embeddings, video_audio_embeddings,
@@ -2412,7 +2430,38 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
             raise ValueError(
                 "YoutuVITAOmniModel.forward_video requires a non-empty `video_split` tensor of shape [N_video, 2]."
             )
-
+        if video_images is not None:
+            logger.debug(f"{video_images.size()=} {video_image_grid_thw.size()=} {video_split=}")
+        if video_audios is not None:
+            logger.debug(f"{[x.shape for x in video_audios]=} {video_split=}")
+        if video_image_indices is not None:
+            # ``video_image_indices`` is a flat ``[2, total_image_tokens]``
+            # tensor that has lost per-row boundaries. The processor appended
+            # one entry per "row" (each frame is split into
+            # ``T*H/spatial_merge`` rows, each row holding ``W/spatial_merge``
+            # ``IMG_CONTEXT`` tokens). Recover each row's first ``seq_pos`` by
+            # striding through ``[1]`` with that fixed row token length.
+            _spatial_merge = int(self.encoder.spatial_merge_size)
+            _seq_flat = video_image_indices[1].reshape(-1).tolist()
+            _per_row_first_seq = []
+            _cur = 0
+            for t, h, w in video_image_grid_thw.tolist():
+                _rows = int(t * h // _spatial_merge)
+                _row_len = int(w // _spatial_merge)
+                for _ in range(_rows):
+                    if _cur < len(_seq_flat):
+                        _per_row_first_seq.append(_seq_flat[_cur])
+                    _cur += _row_len
+            logger.debug(
+                f"video_image_indices.shape={tuple(video_image_indices.shape)} "
+                f"video_image_per_row_first_seq_pos={_per_row_first_seq}"
+            )
+        if video_audio_indices is not None:
+            logger.debug(
+                f"video_audio_indices_num_segments={len(video_audio_indices)} "
+                f"video_audio_indices_first_seq_pos="
+                f"{[int(x[1, 0, 0].item()) for x in video_audio_indices]}"
+            )
         device = video_images.device
 
         # 1. Per-modality frontends.
@@ -2432,6 +2481,21 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         # 2. Per-video segmentation: split flat per-modality buffers, build
         # rotary embeddings, interleave image / audio chunks in temporal order.
         num_videos = int(video_split.shape[0])
+
+        # Optional source of truth for true temporal interleave:
+        # ``video_image_indices`` is a flat ``[2, total_image_tokens]`` tensor
+        # spanning all videos. We slice it per video using a cumulative token
+        # offset built from ``video_image_grid_thw``. ``video_audio_indices``
+        # is already a per-segment list aligned with ``video_audios``.
+        # ``spatial_merge_size`` lives on the encoder / config, not the omni
+        # model itself, so read it from the encoder (which mirrors the value
+        # used to build vision rotary positions just below).
+        spatial_merge = int(self.encoder.spatial_merge_size)
+        if video_image_indices is not None:
+            image_indices_seq_flat = video_image_indices[1].reshape(-1).tolist()
+        else:
+            image_indices_seq_flat = None
+        image_token_cursor_text = 0  # offset into ``image_indices_seq_flat``
 
         image_cursor = 0
         audio_chunk_cursor = 0
@@ -2483,12 +2547,13 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
             else:
                 audio_feature_chunks, audio_rotary_chunks = [], []
 
-            # ---- interleave I and A in temporal order ----
-            # If both modalities are present, distribute audio chunks across
-            # image chunks: each image is followed by ``audios_per_image`` audio
-            # chunks, the first ``extra_audio_count`` images get one extra
-            # trailing audio chunk. If only one modality is present, keep its
-            # natural order.
+            # ---- interleave I and A in true temporal order ----
+            # Preferred path: read the per-frame / per-segment text-side
+            # ``seq_pos`` from ``video_image_indices`` / ``video_audio_indices``
+            # (which the processor wrote in real temporal order) and sort.
+            # Fallback path (when indices are missing): legacy ``divmod``
+            # heuristic that evenly distributes audio chunks across image
+            # frames; only correct when every chunk is ``1 image + 1 audio``.
             interleaved_features = []
             interleaved_rotary = []
             interleaved_modality_mask = []
@@ -2496,8 +2561,77 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
             num_image_chunks = len(vision_feature_chunks)
             num_audio_chunks_actual = len(audio_feature_chunks)
 
+            # Per-frame token consumption on the text side, used to slice
+            # ``image_indices_seq_flat`` and to find each frame's first
+            # ``seq_pos``. After the spatial merge each frame contributes
+            # ``rows_per_frame * tokens_per_row`` ``IMG_CONTEXT_ID`` tokens.
+            if num_images > 0:
+                rows_per_frame = (video_grid_thw[:, 0] * video_grid_thw[:, 1] // spatial_merge).tolist()
+                tokens_per_row = (video_grid_thw[:, 2] // spatial_merge).tolist()
+                tokens_per_frame_text = [int(rows_per_frame[k]) * int(tokens_per_row[k]) for k in range(num_images)]
+            else:
+                tokens_per_frame_text = []
+
             if num_image_chunks == 0 and num_audio_chunks_actual == 0:
+                # advance the text cursor for any (empty) image tokens of
+                # this video — no-op when ``num_images == 0``.
+                image_token_cursor_text += sum(tokens_per_frame_text)
                 continue
+
+            use_indices = (
+                image_indices_seq_flat is not None
+                and video_audio_indices is not None
+                and num_image_chunks > 0
+                and num_audio_chunks_actual > 0
+            )
+
+            if use_indices:
+                # Per-frame seq-pos (first ``IMG_CONTEXT_ID`` of the frame).
+                image_starts = []
+                cur = image_token_cursor_text
+                for k in range(num_image_chunks):
+                    image_starts.append(image_indices_seq_flat[cur])
+                    cur += tokens_per_frame_text[k]
+
+                # Per-segment seq-pos (first ``AUD_CONTEXT_ID`` of the segment).
+                audio_starts = []
+                for s in range(num_audio_chunks_actual):
+                    seg = video_audio_indices[audio_chunk_cursor - num_audio_chunks_actual + s]
+                    # ``seg`` shape ``[2, 1, audio_token_length]``;
+                    # ``seg[1, 0, 0]`` is the segment's first ``seq_pos``.
+                    audio_starts.append(int(seg.reshape(2, -1)[1, 0].item()))
+
+                # Merge & sort. ``modality_kind`` 0 = vision, 1 = audio.
+                events = [(s, 0, k) for k, s in enumerate(image_starts)] + [
+                    (s, 1, k) for k, s in enumerate(audio_starts)
+                ]
+                events.sort(key=lambda x: x[0])
+                logger.debug(
+                    f"forward_video: video_index={video_index} "
+                    f"image_starts={image_starts} audio_starts={audio_starts} "
+                    f"interleave_order="
+                    + ",".join(("I" if m == 0 else "A") + str(i) + "@" + str(s) for s, m, i in events)
+                )
+
+                for _, modality_kind, idx in events:
+                    if modality_kind == 0:
+                        feat = vision_feature_chunks[idx]
+                        rot = vision_rotary_chunks[idx]
+                        mask_val = True
+                    else:
+                        feat = audio_feature_chunks[idx]
+                        rot = audio_rotary_chunks[idx]
+                        mask_val = False
+                    interleaved_features.append(feat)
+                    interleaved_rotary.append(rot)
+                    interleaved_modality_mask.append(
+                        torch.full(
+                            (feat.size(0),),
+                            mask_val,
+                            dtype=torch.bool,
+                            device=device,
+                        )
+                    )
             elif num_image_chunks == 0:
                 for audio_chunk, audio_rot in zip(audio_feature_chunks, audio_rotary_chunks):
                     interleaved_features.append(audio_chunk)
@@ -2509,6 +2643,14 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
                     interleaved_rotary.append(image_rot)
                     interleaved_modality_mask.append(torch.ones(image_chunk.size(0), dtype=torch.bool, device=device))
             else:
+                # Legacy fallback: divmod heuristic.
+                logger.warning_once(
+                    "YoutuVITAOmniModel.forward_video: `video_image_indices` / "
+                    "`video_audio_indices` not provided; falling back to the "
+                    "divmod heuristic for image/audio interleaving. The "
+                    "resulting temporal alignment is approximate; pass the "
+                    "indices produced by the processor for correct behaviour."
+                )
                 audios_per_image, extra_audio_count = divmod(num_audio_chunks_actual, num_image_chunks)
                 audio_index = 0
                 for image_index in range(num_image_chunks):
@@ -2530,6 +2672,9 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
                 assert audio_index == num_audio_chunks_actual, (
                     f"video {video_index}: distributed {audio_index} audio chunks, expected {num_audio_chunks_actual}"
                 )
+
+            # Advance the text-side cursor over this video's image tokens.
+            image_token_cursor_text += sum(tokens_per_frame_text)
 
             video_segment_features = torch.cat(interleaved_features, dim=0)
             video_segment_rotary = torch.cat(interleaved_rotary, dim=0)
@@ -2586,6 +2731,8 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
             audio_output = encoder_output.new_zeros((0, 0, self.config.out_hidden_size))
             audio_lens_after_merge = torch.zeros((0,), dtype=torch.long, device=device)
 
+        logger.debug(f"{vision_output.size()=} {audio_output.size()=} {audio_lens_after_merge=}")
+
         return vision_output, audio_output, audio_lens_after_merge
 
     # -------------------------------------------------------------- top-level
@@ -2600,6 +2747,8 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         video_image_grid_thw: torch.Tensor | None = None,
         video_audios: list | None = None,
         video_split: torch.Tensor | None = None,
+        video_image_indices: torch.Tensor | None = None,
+        video_audio_indices: list | None = None,
         **kwargs,
     ):
         """Dispatch by modality (mirrors ``MegatronOmniModel.forward``).
@@ -2624,6 +2773,8 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
                 video_image_grid_thw=video_image_grid_thw,
                 video_audios=video_audios,
                 video_split=video_split,
+                video_image_indices=video_image_indices,
+                video_audio_indices=video_audio_indices,
             )
 
         if modality == "vision" or (has_vision and not has_audio):
