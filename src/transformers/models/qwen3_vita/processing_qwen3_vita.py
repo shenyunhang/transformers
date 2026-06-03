@@ -95,11 +95,22 @@ class Qwen3VITAProcessor(ProcessorMixin):
     ):
         super().__init__(image_processor, video_processor, feature_extractor, tokenizer, chat_template=chat_template)
 
-        audio_processor = feature_extractor
-        self.audio_processor = audio_processor
+        # ``feature_extractor`` is the audio frontend; expose it under the
+        # ``audio_processor`` name for symmetry with the call paths below. This
+        # alias lives only on ``self`` and is filtered out by
+        # ``ProcessorMixin.to_dict`` (it is neither in ``__init__`` signature
+        # nor in ``get_attributes()``), so it does not leak into
+        # ``processor_config.json``.
+        self.audio_processor = feature_extractor
 
-        video_processor.image_processor = image_processor
-        video_processor.audio_processor = audio_processor
+        # NOTE: We deliberately do NOT mutate ``video_processor`` to attach
+        # ``image_processor`` / ``audio_processor`` on it. Those would be picked
+        # up by ``BaseVideoProcessor.to_dict`` (which serializes
+        # ``__dict__`` wholesale) and produce duplicate copies of the
+        # image/audio configs nested inside the ``video_processor`` block of
+        # ``processor_config.json``. Instead, the sub-processors are passed
+        # explicitly into ``video_processor.add_video_input_discrete_or_contiguous``
+        # in ``__call__`` below.
 
     def __call__(
         self,
@@ -187,6 +198,8 @@ class Qwen3VITAProcessor(ProcessorMixin):
                 input_ids,
                 videos,
                 self.tokenizer,
+                image_processor=self.image_processor,
+                audio_processor=self.audio_processor,
                 **output_kwargs["videos_kwargs"],
             )
             if _images is not None:

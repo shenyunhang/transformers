@@ -130,6 +130,8 @@ class Qwen3VITAFeatureExtractor(SequenceFeatureExtractor):
         self.audio_chunk_min_second = audio_chunk_min_second
         self.audio_chunk_max_second = audio_chunk_max_second
         self.temporal_merge_size = temporal_merge_size
+        self.audio_tokenizer_path = audio_tokenizer_path
+        self.audio_tokenizer_type = audio_tokenizer_type
 
         # self.load_model()
 

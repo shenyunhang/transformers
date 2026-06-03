@@ -230,6 +230,10 @@ class Qwen3VITAOmniConfig(Qwen3VITATextConfig):
     # Projection to LM hidden size
     merger_hidden_size: int = 4608
     out_hidden_size: int = 4608
+    # If True, each video is further split into ``(I+ A*)`` groups inside the
+    # joint encoder, so attention is restricted to images / audios that belong
+    # to the same group. See :meth:`Qwen3VITAOmniModel.forward_video`.
+    video_group_attention: bool = False
 
 
 class Qwen3VITAConfig(PreTrainedConfig):
@@ -2443,10 +2447,6 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
             # Fallback path (when indices are missing): legacy ``divmod``
             # heuristic that evenly distributes audio chunks across image
             # frames; only correct when every chunk is ``1 image + 1 audio``.
-            interleaved_features = []
-            interleaved_rotary = []
-            interleaved_modality_mask = []
-
             num_image_chunks = len(vision_feature_chunks)
             num_audio_chunks_actual = len(audio_feature_chunks)
 
@@ -2479,6 +2479,12 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                 and num_audio_chunks_actual > 0
             )
 
+            # Build a flat ``ordered_events`` list of ``(modality_kind, idx)``
+            # tuples in true temporal order (modality_kind: 0=vision, 1=audio).
+            # The materialisation into one or more attention groups happens
+            # below so that the four temporal-ordering branches stay simple.
+            ordered_events: list[tuple[int, int]] = []
+
             if use_indices:
                 # Per-frame seq-pos (first ``IMG_CONTEXT_ID`` of the frame).
                 image_starts = []
@@ -2497,6 +2503,27 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                     # ``seg[1, 0, 0]`` is the segment's first ``seq_pos``.
                     audio_starts.append(int(seg.reshape(2, -1)[1, 0].item()))
 
+                # Per-video temporal-order invariant on the audio side: both
+                # ``video_audios`` and ``video_audio_indices`` must be appended
+                # by the processor in real temporal order, otherwise the
+                # post-encoder ``audio_output_packed.split(all_audio_chunk_lens)``
+                # call below would slice with chunk lengths that no longer
+                # match the chunks coming out of the encoder, scattering the
+                # wrong audio embedding to ``input_ids``. Fail loudly here so
+                # contract violations surface immediately rather than as
+                # silent garbage.
+                if any(
+                    audio_starts[i] > audio_starts[i + 1]
+                    for i in range(len(audio_starts) - 1)
+                ):
+                    raise ValueError(
+                        f"forward_video: video_index={video_index}: "
+                        f"`video_audio_indices` is not in temporal order "
+                        f"({audio_starts=}). The audio post-merge split "
+                        f"requires per-video chunks to be appended in "
+                        f"temporal order matching ``video_audios``."
+                    )
+
                 # Merge & sort. ``modality_kind`` 0 = vision, 1 = audio.
                 events = (
                     [(s, 0, k) for k, s in enumerate(image_starts)]
@@ -2511,40 +2538,11 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                         for s, m, i in events
                     )
                 )
-
-                for _, modality_kind, idx in events:
-                    if modality_kind == 0:
-                        feat = vision_feature_chunks[idx]
-                        rot = vision_rotary_chunks[idx]
-                        mask_val = True
-                    else:
-                        feat = audio_feature_chunks[idx]
-                        rot = audio_rotary_chunks[idx]
-                        mask_val = False
-                    interleaved_features.append(feat)
-                    interleaved_rotary.append(rot)
-                    interleaved_modality_mask.append(
-                        torch.full(
-                            (feat.size(0),),
-                            mask_val,
-                            dtype=torch.bool,
-                            device=device,
-                        )
-                    )
+                ordered_events = [(m, i) for _, m, i in events]
             elif num_image_chunks == 0:
-                for audio_chunk, audio_rot in zip(audio_feature_chunks, audio_rotary_chunks):
-                    interleaved_features.append(audio_chunk)
-                    interleaved_rotary.append(audio_rot)
-                    interleaved_modality_mask.append(
-                        torch.zeros(audio_chunk.size(0), dtype=torch.bool, device=device)
-                    )
+                ordered_events = [(1, k) for k in range(num_audio_chunks_actual)]
             elif num_audio_chunks_actual == 0:
-                for image_chunk, image_rot in zip(vision_feature_chunks, vision_rotary_chunks):
-                    interleaved_features.append(image_chunk)
-                    interleaved_rotary.append(image_rot)
-                    interleaved_modality_mask.append(
-                        torch.ones(image_chunk.size(0), dtype=torch.bool, device=device)
-                    )
+                ordered_events = [(0, k) for k in range(num_image_chunks)]
             else:
                 # Legacy fallback: divmod heuristic.
                 logger.warning_once(
@@ -2559,24 +2557,12 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                 )
                 audio_index = 0
                 for image_index in range(num_image_chunks):
-                    image_chunk = vision_feature_chunks[image_index]
-                    image_rot = vision_rotary_chunks[image_index]
-                    interleaved_features.append(image_chunk)
-                    interleaved_rotary.append(image_rot)
-                    interleaved_modality_mask.append(
-                        torch.ones(image_chunk.size(0), dtype=torch.bool, device=device)
-                    )
+                    ordered_events.append((0, image_index))
                     audios_to_take = audios_per_image + (
                         1 if image_index < extra_audio_count else 0
                     )
                     for _ in range(audios_to_take):
-                        audio_chunk = audio_feature_chunks[audio_index]
-                        audio_rot = audio_rotary_chunks[audio_index]
-                        interleaved_features.append(audio_chunk)
-                        interleaved_rotary.append(audio_rot)
-                        interleaved_modality_mask.append(
-                            torch.zeros(audio_chunk.size(0), dtype=torch.bool, device=device)
-                        )
+                        ordered_events.append((1, audio_index))
                         audio_index += 1
                 assert audio_index == num_audio_chunks_actual, (
                     f"video {video_index}: distributed {audio_index} audio chunks, "
@@ -2586,14 +2572,101 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
             # Advance the text-side cursor over this video's image tokens.
             image_token_cursor_text += sum(tokens_per_frame_text)
 
-            video_segment_features = torch.cat(interleaved_features, dim=0)
-            video_segment_rotary = torch.cat(interleaved_rotary, dim=0)
-            video_segment_mask = torch.cat(interleaved_modality_mask, dim=0)
+            # ---- materialise one or more attention groups for this video ----
+            # When ``self.config.video_group_attention`` is True, partition
+            # ``ordered_events`` into groups following the rule:
+            #   * the first group may start with audio(s) (a leading audio
+            #     run is absorbed into the first group);
+            #   * every *subsequent* group starts with image(s);
+            #   * a new group begins whenever an image directly follows an
+            #     audio (i.e. ``A → I`` boundary);
+            #   * a trailing image-only run becomes its own group;
+            #   * if a video has no audio at all, every image is its own
+            #     group;
+            #   * if a video has no image at all, every audio is its own
+            #     group.
+            # When the flag is False (default), the whole video stays in a
+            # single attention segment (the original behaviour).
+            if self.config.video_group_attention:
+                has_image_in_video = any(m == 0 for m, _ in ordered_events)
+                has_audio_in_video = any(m == 1 for m, _ in ordered_events)
+                event_groups: list[list[tuple[int, int]]] = []
+                current_group: list[tuple[int, int]] = []
+                prev_modality: Optional[int] = None
+                for modality_kind, idx in ordered_events:
+                    # Start a new group when one of:
+                    #   * mixed modality: this event is an image and the
+                    #     previous one was an audio (``A → I`` boundary);
+                    #   * pure-image video: this event is an image and not
+                    #     the very first event (one image per group);
+                    #   * pure-audio video: this event is an audio and not
+                    #     the very first event (one audio per group).
+                    start_new_group = (
+                        (modality_kind == 0 and prev_modality == 1)
+                        or (
+                            not has_audio_in_video
+                            and modality_kind == 0
+                            and prev_modality is not None
+                        )
+                        or (
+                            not has_image_in_video
+                            and modality_kind == 1
+                            and prev_modality is not None
+                        )
+                    )
+                    if start_new_group:
+                        event_groups.append(current_group)
+                        current_group = []
+                    current_group.append((modality_kind, idx))
+                    prev_modality = modality_kind
+                if current_group:
+                    event_groups.append(current_group)
+                logger.debug(
+                    f"forward_video: video_index={video_index} "
+                    f"video_group_attention=True num_groups={len(event_groups)} "
+                    f"group_pattern="
+                    + " ".join(
+                        "(" + "".join("I" if m == 0 else "A" for m, _ in g) + ")"
+                        for g in event_groups
+                    )
+                )
+            else:
+                event_groups = [ordered_events]
 
-            segment_features.append(video_segment_features)
-            segment_rotary.append(video_segment_rotary)
-            segment_modality_masks.append(video_segment_mask)
-            segment_lengths.append(video_segment_features.size(0))
+            for group_events in event_groups:
+                if len(group_events) == 0:
+                    continue
+                group_features_list = []
+                group_rotary_list = []
+                group_mask_list = []
+                for modality_kind, idx in group_events:
+                    if modality_kind == 0:
+                        feat = vision_feature_chunks[idx]
+                        rot = vision_rotary_chunks[idx]
+                        mask_val = True
+                    else:
+                        feat = audio_feature_chunks[idx]
+                        rot = audio_rotary_chunks[idx]
+                        mask_val = False
+                    group_features_list.append(feat)
+                    group_rotary_list.append(rot)
+                    group_mask_list.append(
+                        torch.full(
+                            (feat.size(0),),
+                            mask_val,
+                            dtype=torch.bool,
+                            device=device,
+                        )
+                    )
+                group_features_tensor = torch.cat(group_features_list, dim=0)
+                group_rotary_tensor = torch.cat(group_rotary_list, dim=0)
+                group_mask_tensor = torch.cat(group_mask_list, dim=0)
+
+                segment_features.append(group_features_tensor)
+                segment_rotary.append(group_rotary_tensor)
+                segment_modality_masks.append(group_mask_tensor)
+                segment_lengths.append(group_features_tensor.size(0))
+
             per_video_audio_chunk_lens.append(video_audio_chunk_lens)
 
         # 3. Concatenate per-video segments into one packed sequence.
@@ -4363,6 +4436,8 @@ class Qwen3VITAFeatureExtractor(SequenceFeatureExtractor):
         self.audio_chunk_min_second = audio_chunk_min_second
         self.audio_chunk_max_second = audio_chunk_max_second
         self.temporal_merge_size = temporal_merge_size
+        self.audio_tokenizer_path = audio_tokenizer_path
+        self.audio_tokenizer_type = audio_tokenizer_type
 
         # self.load_model()
 
@@ -4728,8 +4803,6 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
 
     def __init__(
         self,
-        image_processor=None,
-        audio_processor=None,
         video_max_num_frames=64,
         video_max_fps=1,
         video_min_num_tokens=64,
@@ -4750,8 +4823,14 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
     ) -> None:
         super().__init__(**kwargs)
 
-        self.image_processor = image_processor
-        self.audio_processor = audio_processor
+        # NOTE: image_processor / audio_processor are intentionally NOT stored on
+        # ``self``. They are owned by ``Qwen3VITAProcessor`` and passed into the
+        # public methods (``process_video`` /
+        # ``add_video_input_discrete_or_contiguous``) on each call. Storing them
+        # here would cause ``BaseVideoProcessor.to_dict`` (which serializes
+        # ``self.__dict__``) to embed full sub-processor configs inside
+        # ``processor_config.json``, duplicating the top-level
+        # ``image_processor``/``feature_extractor`` blocks.
 
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
@@ -4777,15 +4856,6 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         # legacy (non-split) flow. When True, the per-video ``(num_images, num_audios)``
         # tuples are surfaced and the joint-encode path is taken downstream.
         self.video_omni_fusion = video_omni_fusion
-
-    def to_dict(self):
-        output = super().to_dict()
-        # Remove the non-serializable object before returning
-        if "image_processor" in output:
-            del output["image_processor"]
-        if "audio_processor" in output:
-            del output["audio_processor"]
-        return output
 
     def get_video_frames(self, vid_path, video_max_fps=1, video_max_num_frames=8):
         vid = decord.VideoReader(vid_path, num_threads=1)
@@ -4910,7 +4980,15 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
 
         return img_or_path_list, fps, timestamps, (audio, self.sampling_rate), duration_seconds
 
-    def process_video(self, video_file_or_dir, video_max_num_frames=8, video_max_fps=1):
+    def process_video(
+        self,
+        video_file_or_dir,
+        video_max_num_frames=8,
+        video_max_fps=1,
+        *,
+        image_processor,
+        audio_processor,
+    ):
 
         images, fps, timestamps, (audio, sampling_rate), duration_seconds = self.get_image_and_audio(
             video_file_or_dir,
@@ -4940,7 +5018,7 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         max_pixels = min(max_pixels, image_max_pixels)
 
         # print(f"{len(images)=} {min_pixels=} {max_pixels=}")
-        image_data = self.image_processor.process_images(
+        image_data = image_processor.process_images(
             images,
             is_contiguous=True,
             min_pixels=min_pixels,
@@ -4954,7 +5032,7 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
             total_time = len(audio) / sampling_rate
             # print(f"{duration_seconds=} {total_time=}", flush=True)
 
-            audio_dict = self.audio_processor.process_audio(
+            audio_dict = audio_processor.process_audio(
                 (audio, sampling_rate), is_discrete=False, is_contiguous=True
             )
             audio = audio_dict["audio"]
@@ -5108,6 +5186,9 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         discrete_video_idxs=[],
         contiguous_video_idxs=[],
         is_pretrain=False,
+        *,
+        image_processor,
+        audio_processor,
         **kwargs,
     ):
         video_max_num_frames = kwargs.get("video_max_num_frames", self.video_max_num_frames)
@@ -5171,7 +5252,13 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
                 _second_per_grids,
                 second_frames,
                 duration_seconds,
-            ) = self.process_video(video_paths[vid_idx], video_max_num_frames, video_max_fps)
+            ) = self.process_video(
+                video_paths[vid_idx],
+                video_max_num_frames,
+                video_max_fps,
+                image_processor=image_processor,
+                audio_processor=audio_processor,
+            )
 
             if audio_frames is not None:
                 # print(f"{len(image_frames)=} {len(audio_frames)=}")
@@ -5207,7 +5294,7 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
                 images.append(
                     torch.cat(
                         [
-                            self.image_processor.convert_image_to_patches_with_pixel_shuffle(x)
+                            image_processor.convert_image_to_patches_with_pixel_shuffle(x)
                             for x in image_frames
                         ],
                         dim=0,
@@ -5483,6 +5570,9 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
         self.image_size_discrete = image_size_discrete
         self.image_max_num_tokens = image_max_num_tokens
         self.image_min_num_tokens = image_min_num_tokens
+        self.vision_normalize_type = vision_normalize_type
+        self.vision_tokenizer_path = vision_tokenizer_path
+        self.vision_tokenizer_type = vision_tokenizer_type
 
         GLOBAL_CONSTANTS = get_token()
         if vision_normalize_type == "imagenet":
@@ -6069,11 +6159,22 @@ class Qwen3VITAProcessor(ProcessorMixin):
     ):
         super().__init__(image_processor, video_processor, feature_extractor, tokenizer, chat_template=chat_template)
 
-        audio_processor = feature_extractor
-        self.audio_processor = audio_processor
+        # ``feature_extractor`` is the audio frontend; expose it under the
+        # ``audio_processor`` name for symmetry with the call paths below. This
+        # alias lives only on ``self`` and is filtered out by
+        # ``ProcessorMixin.to_dict`` (it is neither in ``__init__`` signature
+        # nor in ``get_attributes()``), so it does not leak into
+        # ``processor_config.json``.
+        self.audio_processor = feature_extractor
 
-        video_processor.image_processor = image_processor
-        video_processor.audio_processor = audio_processor
+        # NOTE: We deliberately do NOT mutate ``video_processor`` to attach
+        # ``image_processor`` / ``audio_processor`` on it. Those would be picked
+        # up by ``BaseVideoProcessor.to_dict`` (which serializes
+        # ``__dict__`` wholesale) and produce duplicate copies of the
+        # image/audio configs nested inside the ``video_processor`` block of
+        # ``processor_config.json``. Instead, the sub-processors are passed
+        # explicitly into ``video_processor.add_video_input_discrete_or_contiguous``
+        # in ``__call__`` below.
 
     def __call__(
         self,
@@ -6157,6 +6258,8 @@ class Qwen3VITAProcessor(ProcessorMixin):
                 input_ids,
                 videos,
                 self.tokenizer,
+                image_processor=self.image_processor,
+                audio_processor=self.audio_processor,
                 **output_kwargs["videos_kwargs"],
             )
             if _images is not None:

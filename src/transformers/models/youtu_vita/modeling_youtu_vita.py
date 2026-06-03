@@ -2554,10 +2554,6 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
             # Fallback path (when indices are missing): legacy ``divmod``
             # heuristic that evenly distributes audio chunks across image
             # frames; only correct when every chunk is ``1 image + 1 audio``.
-            interleaved_features = []
-            interleaved_rotary = []
-            interleaved_modality_mask = []
-
             num_image_chunks = len(vision_feature_chunks)
             num_audio_chunks_actual = len(audio_feature_chunks)
 
@@ -2585,6 +2581,12 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
                 and num_audio_chunks_actual > 0
             )
 
+            # Build a flat ``ordered_events`` list of ``(modality_kind, idx)``
+            # tuples in true temporal order (modality_kind: 0=vision, 1=audio).
+            # The materialisation into one or more attention groups happens
+            # below so that the four temporal-ordering branches stay simple.
+            ordered_events: list[tuple[int, int]] = []
+
             if use_indices:
                 # Per-frame seq-pos (first ``IMG_CONTEXT_ID`` of the frame).
                 image_starts = []
@@ -2601,6 +2603,24 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
                     # ``seg[1, 0, 0]`` is the segment's first ``seq_pos``.
                     audio_starts.append(int(seg.reshape(2, -1)[1, 0].item()))
 
+                # Per-video temporal-order invariant on the audio side: both
+                # ``video_audios`` and ``video_audio_indices`` must be appended
+                # by the processor in real temporal order, otherwise the
+                # post-encoder ``audio_output_packed.split(all_audio_chunk_lens)``
+                # call below would slice with chunk lengths that no longer
+                # match the chunks coming out of the encoder, scattering the
+                # wrong audio embedding to ``input_ids``. Fail loudly here so
+                # contract violations surface immediately rather than as
+                # silent garbage.
+                if any(audio_starts[i] > audio_starts[i + 1] for i in range(len(audio_starts) - 1)):
+                    raise ValueError(
+                        f"forward_video: video_index={video_index}: "
+                        f"`video_audio_indices` is not in temporal order "
+                        f"({audio_starts=}). The audio post-merge split "
+                        f"requires per-video chunks to be appended in "
+                        f"temporal order matching ``video_audios``."
+                    )
+
                 # Merge & sort. ``modality_kind`` 0 = vision, 1 = audio.
                 events = [(s, 0, k) for k, s in enumerate(image_starts)] + [
                     (s, 1, k) for k, s in enumerate(audio_starts)
@@ -2612,36 +2632,11 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
                     f"interleave_order="
                     + ",".join(("I" if m == 0 else "A") + str(i) + "@" + str(s) for s, m, i in events)
                 )
-
-                for _, modality_kind, idx in events:
-                    if modality_kind == 0:
-                        feat = vision_feature_chunks[idx]
-                        rot = vision_rotary_chunks[idx]
-                        mask_val = True
-                    else:
-                        feat = audio_feature_chunks[idx]
-                        rot = audio_rotary_chunks[idx]
-                        mask_val = False
-                    interleaved_features.append(feat)
-                    interleaved_rotary.append(rot)
-                    interleaved_modality_mask.append(
-                        torch.full(
-                            (feat.size(0),),
-                            mask_val,
-                            dtype=torch.bool,
-                            device=device,
-                        )
-                    )
+                ordered_events = [(m, i) for _, m, i in events]
             elif num_image_chunks == 0:
-                for audio_chunk, audio_rot in zip(audio_feature_chunks, audio_rotary_chunks):
-                    interleaved_features.append(audio_chunk)
-                    interleaved_rotary.append(audio_rot)
-                    interleaved_modality_mask.append(torch.zeros(audio_chunk.size(0), dtype=torch.bool, device=device))
+                ordered_events = [(1, k) for k in range(num_audio_chunks_actual)]
             elif num_audio_chunks_actual == 0:
-                for image_chunk, image_rot in zip(vision_feature_chunks, vision_rotary_chunks):
-                    interleaved_features.append(image_chunk)
-                    interleaved_rotary.append(image_rot)
-                    interleaved_modality_mask.append(torch.ones(image_chunk.size(0), dtype=torch.bool, device=device))
+                ordered_events = [(0, k) for k in range(num_image_chunks)]
             else:
                 # Legacy fallback: divmod heuristic.
                 logger.warning_once(
@@ -2654,20 +2649,10 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
                 audios_per_image, extra_audio_count = divmod(num_audio_chunks_actual, num_image_chunks)
                 audio_index = 0
                 for image_index in range(num_image_chunks):
-                    image_chunk = vision_feature_chunks[image_index]
-                    image_rot = vision_rotary_chunks[image_index]
-                    interleaved_features.append(image_chunk)
-                    interleaved_rotary.append(image_rot)
-                    interleaved_modality_mask.append(torch.ones(image_chunk.size(0), dtype=torch.bool, device=device))
+                    ordered_events.append((0, image_index))
                     audios_to_take = audios_per_image + (1 if image_index < extra_audio_count else 0)
                     for _ in range(audios_to_take):
-                        audio_chunk = audio_feature_chunks[audio_index]
-                        audio_rot = audio_rotary_chunks[audio_index]
-                        interleaved_features.append(audio_chunk)
-                        interleaved_rotary.append(audio_rot)
-                        interleaved_modality_mask.append(
-                            torch.zeros(audio_chunk.size(0), dtype=torch.bool, device=device)
-                        )
+                        ordered_events.append((1, audio_index))
                         audio_index += 1
                 assert audio_index == num_audio_chunks_actual, (
                     f"video {video_index}: distributed {audio_index} audio chunks, expected {num_audio_chunks_actual}"
@@ -2676,14 +2661,90 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
             # Advance the text-side cursor over this video's image tokens.
             image_token_cursor_text += sum(tokens_per_frame_text)
 
-            video_segment_features = torch.cat(interleaved_features, dim=0)
-            video_segment_rotary = torch.cat(interleaved_rotary, dim=0)
-            video_segment_mask = torch.cat(interleaved_modality_mask, dim=0)
+            # ---- materialise one or more attention groups for this video ----
+            # When ``self.config.video_group_attention`` is True, partition
+            # ``ordered_events`` into groups following the rule:
+            #   * the first group may start with audio(s) (a leading audio
+            #     run is absorbed into the first group);
+            #   * every *subsequent* group starts with image(s);
+            #   * a new group begins whenever an image directly follows an
+            #     audio (i.e. ``A → I`` boundary);
+            #   * a trailing image-only run becomes its own group;
+            #   * if a video has no audio at all, every image is its own
+            #     group;
+            #   * if a video has no image at all, every audio is its own
+            #     group.
+            # When the flag is False (default), the whole video stays in a
+            # single attention segment (the original behaviour).
+            if self.config.video_group_attention:
+                has_image_in_video = any(m == 0 for m, _ in ordered_events)
+                has_audio_in_video = any(m == 1 for m, _ in ordered_events)
+                event_groups: list[list[tuple[int, int]]] = []
+                current_group: list[tuple[int, int]] = []
+                prev_modality: int | None = None
+                for modality_kind, idx in ordered_events:
+                    # Start a new group when one of:
+                    #   * mixed modality: this event is an image and the
+                    #     previous one was an audio (``A → I`` boundary);
+                    #   * pure-image video: this event is an image and not
+                    #     the very first event (one image per group);
+                    #   * pure-audio video: this event is an audio and not
+                    #     the very first event (one audio per group).
+                    start_new_group = (
+                        (modality_kind == 0 and prev_modality == 1)
+                        or (not has_audio_in_video and modality_kind == 0 and prev_modality is not None)
+                        or (not has_image_in_video and modality_kind == 1 and prev_modality is not None)
+                    )
+                    if start_new_group:
+                        event_groups.append(current_group)
+                        current_group = []
+                    current_group.append((modality_kind, idx))
+                    prev_modality = modality_kind
+                if current_group:
+                    event_groups.append(current_group)
+                logger.debug(
+                    f"forward_video: video_index={video_index} "
+                    f"video_group_attention=True num_groups={len(event_groups)} "
+                    f"group_pattern="
+                    + " ".join("(" + "".join("I" if m == 0 else "A" for m, _ in g) + ")" for g in event_groups)
+                )
+            else:
+                event_groups = [ordered_events]
 
-            segment_features.append(video_segment_features)
-            segment_rotary.append(video_segment_rotary)
-            segment_modality_masks.append(video_segment_mask)
-            segment_lengths.append(video_segment_features.size(0))
+            for group_events in event_groups:
+                if len(group_events) == 0:
+                    continue
+                group_features_list = []
+                group_rotary_list = []
+                group_mask_list = []
+                for modality_kind, idx in group_events:
+                    if modality_kind == 0:
+                        feat = vision_feature_chunks[idx]
+                        rot = vision_rotary_chunks[idx]
+                        mask_val = True
+                    else:
+                        feat = audio_feature_chunks[idx]
+                        rot = audio_rotary_chunks[idx]
+                        mask_val = False
+                    group_features_list.append(feat)
+                    group_rotary_list.append(rot)
+                    group_mask_list.append(
+                        torch.full(
+                            (feat.size(0),),
+                            mask_val,
+                            dtype=torch.bool,
+                            device=device,
+                        )
+                    )
+                group_features_tensor = torch.cat(group_features_list, dim=0)
+                group_rotary_tensor = torch.cat(group_rotary_list, dim=0)
+                group_mask_tensor = torch.cat(group_mask_list, dim=0)
+
+                segment_features.append(group_features_tensor)
+                segment_rotary.append(group_rotary_tensor)
+                segment_modality_masks.append(group_mask_tensor)
+                segment_lengths.append(group_features_tensor.size(0))
+
             per_video_audio_chunk_lens.append(video_audio_chunk_lens)
 
         # 3. Concatenate per-video segments into one packed sequence.
