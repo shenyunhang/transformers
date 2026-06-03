@@ -46,8 +46,6 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
 
     def __init__(
         self,
-        image_processor=None,
-        audio_processor=None,
         video_max_num_frames=64,
         video_max_fps=1,
         video_min_num_tokens=64,
@@ -68,8 +66,14 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
     ) -> None:
         super().__init__(**kwargs)
 
-        self.image_processor = image_processor
-        self.audio_processor = audio_processor
+        # NOTE: image_processor / audio_processor are intentionally NOT stored on
+        # ``self``. They are owned by ``Qwen3VITAProcessor`` and passed into the
+        # public methods (``process_video`` /
+        # ``add_video_input_discrete_or_contiguous``) on each call. Storing them
+        # here would cause ``BaseVideoProcessor.to_dict`` (which serializes
+        # ``self.__dict__``) to embed full sub-processor configs inside
+        # ``processor_config.json``, duplicating the top-level
+        # ``image_processor``/``feature_extractor`` blocks.
 
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
@@ -95,15 +99,6 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         # legacy (non-split) flow. When True, the per-video ``(num_images, num_audios)``
         # tuples are surfaced and the joint-encode path is taken downstream.
         self.video_omni_fusion = video_omni_fusion
-
-    def to_dict(self):
-        output = super().to_dict()
-        # Remove the non-serializable object before returning
-        if "image_processor" in output:
-            del output["image_processor"]
-        if "audio_processor" in output:
-            del output["audio_processor"]
-        return output
 
     def get_video_frames(self, vid_path, video_max_fps=1, video_max_num_frames=8):
         vid = decord.VideoReader(vid_path, num_threads=1)
@@ -222,7 +217,15 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
 
         return img_or_path_list, fps, timestamps, (audio, self.sampling_rate), duration_seconds
 
-    def process_video(self, video_file_or_dir, video_max_num_frames=8, video_max_fps=1):
+    def process_video(
+        self,
+        video_file_or_dir,
+        video_max_num_frames=8,
+        video_max_fps=1,
+        *,
+        image_processor,
+        audio_processor,
+    ):
 
         images, fps, timestamps, (audio, sampling_rate), duration_seconds = self.get_image_and_audio(
             video_file_or_dir,
@@ -240,7 +243,7 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         max_pixels = min(max_pixels, image_max_pixels)
 
         # print(f"{len(images)=} {min_pixels=} {max_pixels=}")
-        image_data = self.image_processor.process_images(
+        image_data = image_processor.process_images(
             images,
             is_contiguous=True,
             min_pixels=min_pixels,
@@ -254,9 +257,7 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
             total_time = len(audio) / sampling_rate
             # print(f"{duration_seconds=} {total_time=}", flush=True)
 
-            audio_dict = self.audio_processor.process_audio(
-                (audio, sampling_rate), is_discrete=False, is_contiguous=True
-            )
+            audio_dict = audio_processor.process_audio((audio, sampling_rate), is_discrete=False, is_contiguous=True)
             audio = audio_dict["audio"]
             audio_token_length_func = audio_dict["audio_token_length_func"]
 
@@ -406,6 +407,9 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
         discrete_video_idxs=[],
         contiguous_video_idxs=[],
         is_pretrain=False,
+        *,
+        image_processor,
+        audio_processor,
         **kwargs,
     ):
         video_max_num_frames = kwargs.get("video_max_num_frames", self.video_max_num_frames)
@@ -469,7 +473,13 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
                 _second_per_grids,
                 second_frames,
                 duration_seconds,
-            ) = self.process_video(video_paths[vid_idx], video_max_num_frames, video_max_fps)
+            ) = self.process_video(
+                video_paths[vid_idx],
+                video_max_num_frames,
+                video_max_fps,
+                image_processor=image_processor,
+                audio_processor=audio_processor,
+            )
 
             if audio_frames is not None:
                 # print(f"{len(image_frames)=} {len(audio_frames)=}")
@@ -504,7 +514,7 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
             if use_vision_in_video:
                 images.append(
                     torch.cat(
-                        [self.image_processor.convert_image_to_patches_with_pixel_shuffle(x) for x in image_frames],
+                        [image_processor.convert_image_to_patches_with_pixel_shuffle(x) for x in image_frames],
                         dim=0,
                     )
                 )

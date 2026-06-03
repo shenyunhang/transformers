@@ -244,6 +244,10 @@ class Qwen3VITAOmniConfig(Qwen3VITATextConfig):
     # Projection to LM hidden size
     merger_hidden_size: int = 4608
     out_hidden_size: int = 4608
+    # If True, each video is further split into ``(I+ A*)`` groups inside the
+    # joint encoder, so attention is restricted to images / audios that belong
+    # to the same group. See :meth:`Qwen3VITAOmniModel.forward_video`.
+    video_group_attention: bool = False
 
 
 class Qwen3VITAConfig(PreTrainedConfig):

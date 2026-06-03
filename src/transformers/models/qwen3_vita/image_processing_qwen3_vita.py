@@ -122,6 +122,9 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
         self.image_size_discrete = image_size_discrete
         self.image_max_num_tokens = image_max_num_tokens
         self.image_min_num_tokens = image_min_num_tokens
+        self.vision_normalize_type = vision_normalize_type
+        self.vision_tokenizer_path = vision_tokenizer_path
+        self.vision_tokenizer_type = vision_tokenizer_type
 
         GLOBAL_CONSTANTS = get_token()
         if vision_normalize_type == "imagenet":
