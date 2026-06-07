@@ -121,7 +121,6 @@ class Qwen3VITAVisionConfig(PreTrainedConfig):
         spatial_merge_size=2,
         out_hidden_size=4608,
         merger_hidden_size=4608,
-        # use_llm=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -139,8 +138,6 @@ class Qwen3VITAVisionConfig(PreTrainedConfig):
         self.spatial_merge_size = spatial_merge_size
         self.out_hidden_size = out_hidden_size
         self.merger_hidden_size = merger_hidden_size
-
-        # self.use_llm = use_llm
 
     def __post_init__(self, **kwargs):
         self.sliding_window = self.sliding_window if self.use_sliding_window else None

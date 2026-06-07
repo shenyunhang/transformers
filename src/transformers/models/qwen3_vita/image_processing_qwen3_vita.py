@@ -467,7 +467,17 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
             if img_idx in discrete_image_idxs:
                 image_data = self.process_image(
                     image_or_paths[img_idx],
+                    is_contiguous=True,
+                    min_pixels=self.min_pixels,
+                    max_pixels=self.max_pixels // (self.spatial_merge_size * self.spatial_merge_size * 8 * 8),
+                )
+                image_height = image_data["image_height"]
+                image_width = image_data["image_width"]
+                image_data = self.process_image(
+                    image_or_paths[img_idx],
                     is_discrete=True,
+                    image_height=image_height,
+                    image_width=image_width,
                 )
                 image_tokens = image_data["image_tokens"]
                 image_height = image_data["image_height"]

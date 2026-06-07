@@ -1554,9 +1554,6 @@ class Qwen3VITAVisionEncoder(nn.Module):
     def __init__(self, config: Qwen3VITAVisionConfig):
         super().__init__()
         self.config = config
-        # if self.config.use_llm:
-        #     self.layers = nn.ModuleList([Qwen3VITATextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        # else:
         self.layers = nn.ModuleList([Qwen3VITAVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
@@ -1565,7 +1562,6 @@ class Qwen3VITAVisionEncoder(nn.Module):
         self.patch_size = config.patch_size
         # self.window_size = self.patch_size * 2 * 8
 
-        # self.rotary_emb = Qwen3VITATextRotaryEmbedding(config=config)
         self.rotary_pos_emb = Qwen3VITAVisionRotaryEmbedding(config.head_dim // 2)
 
     def rot_pos_emb(self, grid_thw):
@@ -1637,19 +1633,9 @@ class Qwen3VITAVisionEncoder(nn.Module):
         # encoder_states = () if output_hidden_states else None
         # all_attentions = () if output_attentions else None
 
-        # if self.config.use_llm and False:
-        #     # position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
-        #     # position_ids = position_ids.unsqueeze(0)
-        #     # position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
-
-        #     rotary_pos_emb = self.rot_pos_emb(grid_thw)
-        #     emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        #     position_embeddings = (emb.cos().unsqueeze(0), emb.sin().unsqueeze(0))
-        # else:
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
-        # print(f"{position_embeddings[0].shape=} {position_embeddings[1].shape=} {inputs_embeds.shape=}")
 
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0,
@@ -1727,8 +1713,6 @@ class Qwen3VITAVisionModel(Qwen3VITAVisionPreTrainedModel):
         # )
 
         hidden_states = self.embeddings(pixel_values, grid_thw)
-        # if self.config.use_llm:
-        #     hidden_states = hidden_states.unsqueeze(0)
 
         if attention_mask is not None and not self._use_flash_attention_2:
             # [batch_size, seq_len] -> [batch_size, 1, tgt_seq_len, src_seq_len]
@@ -1749,9 +1733,6 @@ class Qwen3VITAVisionModel(Qwen3VITAVisionPreTrainedModel):
 
         # pooler_output = self.head(last_hidden_state, attention_mask) if self.use_head else None
         # pooler_output = None
-
-        # if self.config.use_llm:
-        #     last_hidden_state = last_hidden_state.squeeze(0)
 
         assert last_hidden_state.shape[0] == len(pixel_values)
         last_hidden_state = self.merger(last_hidden_state)
@@ -2818,7 +2799,6 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
 class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
     def __init__(self, config: Qwen3VITAConfig):
         super().__init__(config)
-
         self.omni_model = None
         self.vision_model = None
         self.audio_model = None
