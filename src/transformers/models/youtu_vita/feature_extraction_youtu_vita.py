@@ -102,7 +102,7 @@ def get_audio_tokenizer(model_name_or_path_list, audio_tokenizer_type_list, flow
 
 
 class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
-    model_input_names = ["pixel_values", "image_grid_thw"]
+    model_input_names = ["audios", "audio_indices"]
     valid_kwargs = YoutuVITAAudioKwargs
 
     def __init__(
@@ -112,6 +112,8 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         flow_path=None,
         rank=None,
         text_audio_interval_ratio=None,
+        audio_chunk_min_second=2,
+        audio_chunk_max_second=30,
         temporal_merge_size=1,
         **kwargs,
     ) -> None:
@@ -125,7 +127,11 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         )
 
         self.text_audio_interval_ratio = text_audio_interval_ratio
+        self.audio_chunk_min_second = audio_chunk_min_second
+        self.audio_chunk_max_second = audio_chunk_max_second
         self.temporal_merge_size = temporal_merge_size
+        self.audio_tokenizer_path = audio_tokenizer_path
+        self.audio_tokenizer_type = audio_tokenizer_type
 
         # self.load_model()
 
@@ -203,10 +209,11 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         contiguous_audio_idxs=[],
         targets=None,
         is_pretrain=False,
-        audio_chunk_min_second=30,
-        audio_chunk_max_second=30,
         **kwargs,
     ):
+        audio_chunk_min_second = kwargs.get("audio_chunk_min_second", self.audio_chunk_min_second)
+        audio_chunk_max_second = kwargs.get("audio_chunk_max_second", self.audio_chunk_max_second)
+
         GLOBAL_CONSTANTS = get_token()
 
         AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_CONTEXT_TOKEN)
@@ -373,6 +380,8 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                         ]
 
                     audio_token_length = -(-audio_token_length_func(len(audio)) // self.temporal_merge_size)
+                    assert audio_token_length > 0
+
                     audio_indice_b = torch.zeros(
                         1, audio_token_length, dtype=torch.int64
                     )  # This will change in collate_fn

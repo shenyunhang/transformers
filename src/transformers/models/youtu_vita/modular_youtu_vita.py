@@ -30,7 +30,6 @@ from ...video_processing_utils import BaseVideoProcessor
 from ...video_utils import VideoInput
 from ..siglip2.configuration_siglip2 import Siglip2VisionConfig
 from ..youtu.configuration_youtu import YoutuConfig
-from ..qwen3.configuration_qwen3 import Qwen3Config
 from ..youtu.modeling_youtu import (
     YoutuAttention,
     YoutuDecoderLayer,
@@ -40,8 +39,6 @@ from ..youtu.modeling_youtu import (
     YoutuRMSNorm,
     YoutuRotaryEmbedding,
 )
-from ..qwen3_vita.modeling_qwen3_vita import Qwen3VITAOmniModel
-from ..qwen3_vita.configuration_qwen3_vita import Qwen3VITAOmniConfig
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
@@ -129,6 +126,30 @@ class YoutuVITAVisionConfig(PreTrainedConfig):
     model_type = "youtu_vita_vision"
     base_config_key = "vision_config"
 
+    vocab_size: int = 151936
+    hidden_size: int = 4096
+    intermediate_size: int = 22016
+    num_hidden_layers: int = 32
+    num_attention_heads: int = 32
+    num_key_value_heads: int | None = 32
+    head_dim: int = 128
+    hidden_act: str = "silu"
+    max_position_embeddings: int = 32768
+    initializer_range: float = 0.02
+    rms_norm_eps: float = 1e-6
+    use_cache: bool = True
+    tie_word_embeddings: bool = False
+    rope_parameters: RopeParameters | dict | None = None
+    attention_bias: bool = False
+    use_sliding_window: bool = False
+    sliding_window: int | None = 4096
+    max_window_layers: int = 28
+    layer_types: list[str] | None = None
+    attention_dropout: float | int = 0.0
+    pad_token_id: int | None = None
+    bos_token_id: int | None = None
+    eos_token_id: int | list[int] | None = None
+
     def __init__(
         self,
         hidden_size=768,
@@ -161,6 +182,20 @@ class YoutuVITAVisionConfig(PreTrainedConfig):
         self.spatial_merge_size = spatial_merge_size
         self.out_hidden_size = out_hidden_size
         self.merger_hidden_size = merger_hidden_size
+    
+    def __post_init__(self, **kwargs):
+        self.sliding_window = self.sliding_window if self.use_sliding_window else None
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention"
+                if self.sliding_window is not None and i >= self.max_window_layers
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
+        super().__post_init__(**kwargs)
 
 
 class YoutuVITATextConfig(YoutuConfig):
@@ -172,10 +207,30 @@ class YoutuVITATextConfig(YoutuConfig):
     pass
 
 
-class YoutuVITAOmniConfig(Qwen3VITAOmniConfig):
+class YoutuVITAOmniConfig(YoutuVITATextConfig):
 
     model_type = "youtu_vita_omni"
     base_config_key = "omni_config"
+
+    # ---- Omni-specific fields ------------------------------------------------
+    # Vision front-end
+    num_channels: int = 3
+    patch_size: int = 16
+    spatial_merge_size: int = 2
+    # Audio Conv2d front-end (mirrors :class:`YoutuVITACNNAudioEmbeddings`)
+    num_mel_bins: int = 128
+    downsample_hidden_size: int = 512
+    n_window: int = 50
+    n_window_infer: int = 800
+    conv_chunksize: int = 500
+    temporal_merge_size: int = 2
+    # Projection to LM hidden size
+    merger_hidden_size: int = 4608
+    out_hidden_size: int = 4608
+    # If True, each video is further split into ``(I+ A*)`` groups inside the
+    # joint encoder, so attention is restricted to images / audios that belong
+    # to the same group. See :meth:`YoutuVITAOmniModel.forward_video`.
+    video_group_attention: bool = False
 
 
 class YoutuVITAConfig(PreTrainedConfig):
@@ -1286,6 +1341,7 @@ class YoutuVITAVisionAttention(nn.Module):
         """Input shape: Batch x Time x Channel"""
 
         seq_length, embed_dim = hidden_states.shape
+        # _, seq_length, embed_dim = hidden_states.shape
 
         queries = self.q_proj(hidden_states)
         keys = self.k_proj(hidden_states)
@@ -1375,6 +1431,7 @@ class YoutuVITAVisionFlashAttention2(nn.Module):
         """Input shape: Batch x Time x Channel"""
 
         seq_length, embed_dim = hidden_states.shape
+        # _, seq_length, embed_dim = hidden_states.shape
 
         queries = self.q_proj(hidden_states)
         keys = self.k_proj(hidden_states)
@@ -1392,13 +1449,15 @@ class YoutuVITAVisionFlashAttention2(nn.Module):
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         if is_aiter_available:
-            attn_output = flash_attn_varlen_func(queries, keys, values, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, return_lse=True)[0].reshape(
-                seq_length, -1
-            )
+            attn_output = flash_attn_varlen_func(
+                queries, keys, values, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                causal=self.is_causal, return_lse=True,
+            )[0].reshape(seq_length, -1)
         else:
-            attn_output = flash_attn_varlen_func(queries, keys, values, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
-                seq_length, -1
-            )
+            attn_output = flash_attn_varlen_func(
+                queries, keys, values, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                causal=self.is_causal,
+            ).reshape(seq_length, -1)
         attn_output = self.out_proj(attn_output)
         return attn_output, None
 
@@ -1580,7 +1639,7 @@ class YoutuVITAVisionEncoder(nn.Module):
             # if output_hidden_states:
             #     encoder_states = encoder_states + (hidden_states,)
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
+                hidden_states = self._gradient_checkpointing_func(
                     encoder_layer.__call__,
                     hidden_states,
                     attention_mask,
@@ -1589,7 +1648,7 @@ class YoutuVITAVisionEncoder(nn.Module):
                     position_embeddings,
                 )
             else:
-                layer_outputs = encoder_layer(
+                hidden_states = encoder_layer(
                     hidden_states,
                     attention_mask,
                     # output_attentions=output_attentions,
@@ -1690,8 +1749,972 @@ class YoutuVITATextModel(YoutuVITAPreTrainedModel, YoutuModel):
 # ---------------------------------------------------------------------------
 
 
-class YoutuVITAOmniModel(Qwen3VITAOmniModel):
+class YoutuVITAOmniPreTrainedModel(PreTrainedModel):
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    config: YoutuVITAOmniConfig
+
+
+class YoutuVITAOmniRMSNorm(YoutuRMSNorm):
     pass
+
+
+class YoutuVITAOmniRotaryEmbedding(nn.Module):
+    """1D rotary building block shared by vision (2D) and audio (1D) RoPE.
+
+    Mirrors ``_RotaryEmbedding`` in ``vita_megatron/core/models/omni/qwen3_model.py``.
+    """
+
+    def __init__(self, dim: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+
+    def forward(self, seqlen) -> torch.Tensor:
+        # ``seqlen`` may be a python int or a 0-D / 1-D tensor.
+        if isinstance(seqlen, torch.Tensor):
+            device = seqlen.device
+            length = int(seqlen.max().item()) if seqlen.dim() > 0 else int(seqlen.item())
+        else:
+            device = torch.device("cpu")
+            length = int(seqlen)
+        inv_freq = 1.0 / (
+            self.theta
+            ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
+        )
+        seq = torch.arange(length, device=device, dtype=inv_freq.dtype)
+        return torch.outer(seq, inv_freq)
+
+
+class YoutuVITAOmniVisionEmbeddings(YoutuVITAVisionEmbeddings):
+    """Linear patch embedding for already-patchified vision pixel values.
+
+    Identical to :class:`YoutuVITAVisionEmbeddings`; only the config type
+    differs (omni reuses ``hidden_size``/``patch_size``/``num_channels`` from
+    :class:`YoutuVITAOmniConfig`). Mirrors ``LinearVisionEncoder`` in
+    ``vita_megatron/core/models/vision/linear_model.py``.
+    """
+
+    def __init__(self, config: YoutuVITAOmniConfig):
+        super().__init__(config)
+
+
+class YoutuVITAOmniAudioEmbeddings(YoutuVITACNNAudioEmbeddings):
+    """Conv2d audio front-end producing 8x temporally down-sampled features.
+
+    Inherits the three Conv2d stack from :class:`YoutuVITACNNAudioEmbeddings`
+    and adds a final linear projection so the CNN output is aligned with the
+    shared omni transformer ``hidden_size`` (mirrors
+    ``Conv2dAudioEncoderWithProj`` in
+    ``vita_megatron/core/models/audio/cnn_model.py``).
+    """
+
+    def __init__(self, config: YoutuVITAOmniConfig):
+        super().__init__(config)
+        # After three stride-2, padding=1 convolutions the feature axis is
+        # reduced as ``ceil(n / 2)`` at each step.
+        mel_after_cnn = (config.num_mel_bins + 1) // 2
+        mel_after_cnn = (mel_after_cnn + 1) // 2
+        mel_after_cnn = (mel_after_cnn + 1) // 2
+        self.proj_in_features = config.downsample_hidden_size * mel_after_cnn
+        self.linear_proj = nn.Linear(self.proj_in_features, config.hidden_size, bias=False)
+
+    def forward(self, input_features, feature_lens=None):
+        hidden_states, aftercnn_lens = super().forward(input_features, feature_lens)
+        hidden_states = self.linear_proj(hidden_states)
+        return hidden_states, aftercnn_lens
+
+
+class YoutuVITAOmniMLP(YoutuMLP):
+    """SwiGLU MLP (Qwen3 style). Inherits :class:`YoutuMLP` directly."""
+
+    pass
+
+
+class YoutuVITAOmniFlashAttention2(YoutuAttention):
+    """Packed ``thd``-layout Qwen3-style attention (qk-norm, GQA) that takes
+    ``cu_seqlens`` and per-token ``(cos, sin)`` rotary positions.
+
+    Inherits :class:`YoutuAttention` for the projection layers / qk-norm /
+    GQA wiring; only the forward path differs (varlen flash attention with
+    packed sequences instead of the standard causal LM attention).
+    """
+
+    def __init__(self, config: YoutuVITAOmniConfig, layer_idx: int = 0):
+        super().__init__(config, layer_idx=layer_idx)
+        # Encoder use-case: bidirectional attention.
+        self.is_causal = False
+        # Mirror naming used by :class:`YoutuVITAVisionFlashAttention2`.
+        self.dropout = config.attention_dropout
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        # ``hidden_states``: [seq_len, hidden] (packed ``thd``).
+        seq_length = hidden_states.shape[0]
+        num_heads = self.config.num_attention_heads
+        num_key_value_heads = self.config.num_key_value_heads
+
+        queries = self.q_proj(hidden_states).view(seq_length, num_heads, self.head_dim)
+        keys = self.k_proj(hidden_states).view(seq_length, num_key_value_heads, self.head_dim)
+        values = self.v_proj(hidden_states).view(seq_length, num_key_value_heads, self.head_dim)
+
+        queries = self.q_norm(queries)
+        keys = self.k_norm(keys)
+
+        cos, sin = position_embeddings
+        queries, keys = vision_apply_rotary_pos_emb_flashatt(
+            queries.unsqueeze(0), keys.unsqueeze(0), cos, sin
+        )
+        queries = queries.squeeze(0)
+        keys = keys.squeeze(0)
+
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        if is_aiter_available:
+            attn_output = flash_attn_varlen_func(
+                queries, keys, values,
+                cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                causal=self.is_causal,
+                return_lse=True,
+            )[0].reshape(seq_length, -1)
+        else:
+            attn_output = flash_attn_varlen_func(
+                queries, keys, values,
+                cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                causal=self.is_causal,
+            ).reshape(seq_length, -1)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+
+class YoutuVITAOmniEncoderLayer(nn.Module):
+    """Qwen3-style transformer block (pre-norm, SwiGLU, qk-norm)."""
+
+    def __init__(self, config: YoutuVITAOmniConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.input_layernorm = YoutuVITAOmniRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = YoutuVITAOmniFlashAttention2(config)
+        self.post_attention_layernorm = YoutuVITAOmniRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = YoutuVITAOmniMLP(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
+    """Shared Qwen3 transformer body used by both vision and audio inputs.
+
+    Equivalent of ``Qwen3Model`` in
+    ``vita_megatron/core/models/omni/qwen3_model.py``. Consumes already-projected
+    features of shape ``[seq_len, hidden]`` together with packed-sequence
+    metadata (``cu_seqlens``, per-token ``(cos, sin)`` rotary positions).
+    """
+
+    config: YoutuVITAOmniConfig
+    _no_split_modules = ["YoutuVITAOmniEncoderLayer"]
+
+    def __init__(self, config: YoutuVITAOmniConfig):
+        super().__init__(config)
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.spatial_merge_size = int(config.spatial_merge_size)
+        self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
+
+        # Rotary building block. ``head_dim // 2`` matches the megatron reference
+        # (``kv_channels // 2``) — vision concatenates ``(h, w)`` pos so the
+        # final freqs dim equals ``head_dim``, audio duplicates to match.
+        self.rotary_pos_emb = YoutuVITAOmniRotaryEmbedding(config.head_dim // 2)
+
+        self.layers = nn.ModuleList(
+            [YoutuVITAOmniEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+        self.gradient_checkpointing = False
+
+        self.post_init()
+
+    # ------------------------------------------------------------------ RoPE
+    def vision_rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        """2D rotary positions for Qwen-VL ``grid_thw``."""
+        pos_ids = []
+        for t, h, w in grid_thw:
+            t, h, w = int(t), int(h), int(w)
+            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+            hpos_ids = hpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            hpos_ids = hpos_ids.permute(0, 2, 1, 3).flatten()
+
+            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            wpos_ids = wpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            wpos_ids = wpos_ids.permute(0, 2, 1, 3).flatten()
+            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+        pos_ids = torch.cat(pos_ids, dim=0)
+        max_grid_size = grid_thw[:, 1:].max()
+        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+        return rotary_pos_emb
+
+    def audio_rot_pos_emb(self, lens: torch.Tensor) -> torch.Tensor:
+        """1D rotary positions for packed audio sequences."""
+        max_len = int(lens.max().item())
+        rotary_pos_emb_full = self.rotary_pos_emb(max_len)  # [max_len, dim/2]
+        out = []
+        for length in lens.tolist():
+            out.append(rotary_pos_emb_full[: int(length)])
+        rotary_pos_emb = torch.cat(out, dim=0)
+        # Duplicate along feature axis so we can reuse the same (cos, sin)
+        # application as the 2D vision path.
+        rotary_pos_emb = torch.cat([rotary_pos_emb, rotary_pos_emb], dim=-1)
+        return rotary_pos_emb
+
+    # ---------------------------------------------------------------- forward
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+    ) -> BaseModelOutput:
+        """Run the transformer body on packed features.
+
+        Args:
+            hidden_states: ``[seq_len, hidden]`` already-projected features.
+            cu_seqlens: cumulative sequence lengths (``thd`` varlen format).
+            rotary_pos_emb: ``[seq_len, head_dim]`` rotary positions (already
+                concatenated for both ``h`` and ``w`` / duplicated for audio).
+        """
+        hidden_states = hidden_states.contiguous()
+
+        # Per-token (cos, sin) used by ``vision_apply_rotary_pos_emb_flashatt``.
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+
+        for layer in self.layers:
+            if self.gradient_checkpointing and self.training:
+                hidden_states = self._gradient_checkpointing_func(
+                    layer.__call__,
+                    hidden_states,
+                    cu_seqlens,
+                    position_embeddings,
+                )
+            else:
+                hidden_states = layer(
+                    hidden_states=hidden_states,
+                    cu_seqlens=cu_seqlens,
+                    position_embeddings=position_embeddings,
+                )
+
+        return BaseModelOutput(last_hidden_state=hidden_states)
+
+
+class YoutuVITAOmniVisionPatchMerger(YoutuVITAVisionPatchMerger):
+    """2x2 spatial merge (4x token reduction) + MLP projection to
+    ``out_hidden_size``. Inherits :class:`YoutuVITAVisionPatchMerger`; only the
+    config type differs (omni reuses ``hidden_size`` / ``spatial_merge_size``
+    / ``merger_hidden_size`` / ``out_hidden_size`` from
+    :class:`YoutuVITAOmniConfig`).
+    """
+
+    def __init__(self, config: YoutuVITAOmniConfig) -> None:
+        super().__init__(config)
+
+
+class YoutuVITAOmniAudioPatchMerger(YoutuVITAAudioPatchMerger):
+    """2x temporal merge + MLP projection to ``out_hidden_size``. Inherits
+    :class:`YoutuVITAAudioPatchMerger`; only the config type differs.
+    """
+
+    def __init__(self, config: YoutuVITAOmniConfig) -> None:
+        super().__init__(config)
+
+
+class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
+    """Top-level omni encoder: shared Qwen3 transformer + modality-specific
+    front-ends and mergers. Mirrors :class:`MegatronOmniModel`.
+
+    Forward dispatch by modality:
+
+    * ``modality == "vision"`` or only vision inputs given → returns
+      ``image_embeddings`` of shape ``[N, out_hidden_size]``.
+    * ``modality == "audio"`` or only audio inputs given → returns
+      ``(audio_embeddings, audio_lengths)``.
+    * Both given → returns ``{"vision": ..., "audio": (..., ...)}``.
+    """
+
+    config: YoutuVITAOmniConfig
+    _input_embed_layer = "patch_embedding"
+
+    def __init__(self, config: YoutuVITAOmniConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+        self.config = config
+
+        # Modality front-ends.
+        self.vision_embeddings = YoutuVITAOmniVisionEmbeddings(config)
+        self.audio_embeddings = YoutuVITAOmniAudioEmbeddings(config)
+
+        # Shared Qwen3 transformer body.
+        self.encoder = YoutuVITAOmniEncoder(config)
+
+        # Modality-specific post-encoder mergers + projectors.
+        self.vision_merger = YoutuVITAOmniVisionPatchMerger(config)
+        self.audio_merger = YoutuVITAOmniAudioPatchMerger(config)
+
+        self.post_init()
+
+    # ------------------------------------------------------------------ vision
+    def forward_vision(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vision path: patch linear → shared encoder (2D RoPE, packed) → 2x2
+        spatial merge → projector. Returns ``[N, out_hidden_size]``."""
+        hidden_states = self.vision_embeddings(pixel_values, image_grid_thw)
+
+        rotary_pos_emb = self.encoder.vision_rot_pos_emb(image_grid_thw).to(hidden_states.device)
+        cu_seqlens = torch.repeat_interleave(
+            image_grid_thw[:, 1] * image_grid_thw[:, 2],
+            image_grid_thw[:, 0],
+        ).cumsum(
+            dim=0,
+            dtype=image_grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+        )
+        cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0), value=0)
+
+        hidden_states = self.encoder(
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=rotary_pos_emb,
+        ).last_hidden_state
+
+        hidden_states = self.vision_merger(hidden_states)
+        return hidden_states
+
+    # ------------------------------------------------------------------- audio
+    def forward_audio(
+        self,
+        audios,
+    ):
+        """Audio path: Conv2d front-end (8x down-sample) → shared encoder
+        (1D RoPE, packed) → 2x temporal merge → projector.
+
+        Args:
+            audios: a list of ``[T_i, num_mel_bins]`` tensors (the same input
+                convention used by :class:`YoutuVITACNNAudio` elsewhere in this
+                file).
+
+        Returns:
+            A tuple ``(features, feature_lens)`` where ``features`` has shape
+            ``[B, S_out, out_hidden_size]`` and ``feature_lens`` holds the
+            valid length per sample after temporal merge.
+        """
+        audio_lengths = torch.as_tensor([len(x) for x in audios])
+        stacked = torch.cat(audios, dim=0).transpose(1, 0)  # [num_mel, total_T]
+        hidden_states, feature_lens = self.audio_embeddings(stacked, audio_lengths)
+
+        # Packed 1D rotary positions + cu_seqlens.
+        feature_lens = feature_lens.to(hidden_states.device)
+        cu_seqlens = torch.nn.functional.pad(
+            feature_lens.cumsum(dim=0, dtype=torch.int32), (1, 0), value=0
+        )
+        rotary_pos_emb = self.encoder.audio_rot_pos_emb(feature_lens).to(hidden_states.device)
+
+        hidden_states = self.encoder(
+            hidden_states=hidden_states,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=rotary_pos_emb,
+        ).last_hidden_state
+
+        # Re-batch to ``[B, S, H]`` and apply temporal merge + projector.
+        features = hidden_states.split(feature_lens.tolist(), dim=0)
+        features = torch.nn.utils.rnn.pad_sequence(features, batch_first=True, padding_value=0.0)
+        features = self.audio_merger(features)
+
+        merged_lens = -(-feature_lens // int(self.config.temporal_merge_size))
+        return features, merged_lens
+
+    # ------------------------------------------------------------------ video
+    def forward_video(
+        self,
+        video_images: torch.Tensor,
+        video_image_grid_thw: torch.Tensor,
+        video_audios: Optional[list] = None,
+        video_split: Optional[torch.Tensor] = None,
+        video_image_indices: Optional[torch.Tensor] = None,
+        video_audio_indices: Optional[list] = None,
+    ):
+        """Joint video path: vision frames and audio chunks of the same video
+        share an attention window inside ``self.encoder`` while remaining
+        attention-isolated from other videos in the batch.
+
+        Mirrors :meth:`MegatronOmniModel.forward_video` in
+        ``vita_megatron/core/models/omni/omni_model.py``.
+
+        Args:
+            video_images: ``[N_patch_rows, 3 * patch_dim ** 2]`` -- all video
+                frames concatenated along dim 0.
+            video_image_grid_thw: ``[N_grid_rows, 3]`` -- per-frame
+                ``(T, H, W)`` rows. Multiple rows may belong to the same video.
+            video_audios: list of ``[T_i, num_mel_bins]`` per audio-chunk
+                tensors (same convention as :meth:`forward_audio`); multiple
+                chunks may belong to the same video. ``None`` or empty list
+                if no audio.
+            video_split: ``[N_video, 2]`` -- per-video ``(num_images,
+                num_audios)`` deltas. The number of vision patch rows belonging
+                to a video is fully determined by the corresponding rows of
+                ``video_image_grid_thw``.
+            video_image_indices: optional ``[2, total_image_tokens]`` tensor
+                produced by the video processor. ``[1]`` (the seq-position
+                row) is used to recover the real temporal interleave between
+                image frames and audio chunks of the same video, exactly
+                matching the order written into ``input_ids`` by
+                :meth:`YoutuVITAVideoProcessor.add_video_input_discrete_or_contiguous`.
+                When ``None`` the implementation falls back to a ``divmod``
+                heuristic that distributes audio chunks evenly across image
+                frames (legacy behaviour, only correct when each chunk is
+                ``1 image + 1 audio``).
+            video_audio_indices: optional list of ``[2, 1, audio_token_length]``
+                per-segment tensors aligned with ``video_audios``. Used together
+                with ``video_image_indices`` to recover the real interleave
+                order.
+
+        Returns:
+            tuple ``(video_image_embeddings, video_audio_embeddings,
+            video_audio_lens_after_merge)``:
+
+            * ``video_image_embeddings``: ``[N_v_after_merge, out_hidden_size]``
+            * ``video_audio_embeddings``: ``[N_audios, max_S_after_merge,
+              out_hidden_size]``
+            * ``video_audio_lens_after_merge``: ``[N_audios]``
+        """
+        if video_split is None or video_split.numel() == 0:
+            raise ValueError(
+                "YoutuVITAOmniModel.forward_video requires a non-empty "
+                "`video_split` tensor of shape [N_video, 2]."
+            )
+        if video_images is not None:
+            logger.debug(f"{video_images.size()=} {video_image_grid_thw.size()=} {video_split=}")
+        if video_audios is not None:
+            logger.debug(f"{[x.shape for x in video_audios]=} {video_split=}")
+        if video_image_indices is not None:
+            # ``video_image_indices`` is a flat ``[2, total_image_tokens]``
+            # tensor that has lost per-row boundaries. The processor appended
+            # one entry per "row" (each frame is split into
+            # ``T*H/spatial_merge`` rows, each row holding ``W/spatial_merge``
+            # ``IMG_CONTEXT`` tokens). Recover each row's first ``seq_pos`` by
+            # striding through ``[1]`` with that fixed row token length.
+            _spatial_merge = int(self.encoder.spatial_merge_size)
+            _seq_flat = video_image_indices[1].reshape(-1).tolist()
+            _per_row_first_seq = []
+            _cur = 0
+            for t, h, w in video_image_grid_thw.tolist():
+                _rows = int(t * h // _spatial_merge)
+                _row_len = int(w // _spatial_merge)
+                for _ in range(_rows):
+                    if _cur < len(_seq_flat):
+                        _per_row_first_seq.append(_seq_flat[_cur])
+                    _cur += _row_len
+            logger.debug(
+                f"video_image_indices.shape={tuple(video_image_indices.shape)} "
+                f"video_image_per_row_first_seq_pos={_per_row_first_seq}"
+            )
+        if video_audio_indices is not None:
+            logger.debug(
+                f"video_audio_indices_num_segments={len(video_audio_indices)} "
+                f"video_audio_indices_first_seq_pos="
+                f"{[int(x[1, 0, 0].item()) for x in video_audio_indices]}"
+            )
+        device = video_images.device
+
+        # 1. Per-modality frontends.
+        vision_features = self.vision_embeddings(video_images, video_image_grid_thw)
+
+        has_audio = video_audios is not None and len(video_audios) > 0
+        if has_audio:
+            video_audio_lens = torch.as_tensor(
+                [x.shape[0] for x in video_audios], dtype=torch.long, device=device
+            )
+            packed_audio = torch.cat(list(video_audios), dim=0).transpose(1, 0)
+            audio_features, audio_token_lens = self.audio_embeddings(
+                packed_audio, video_audio_lens
+            )
+            audio_token_lens = audio_token_lens.to(device)
+        else:
+            video_audio_lens = torch.zeros((0,), dtype=torch.long, device=device)
+            audio_features = vision_features.new_zeros((0, vision_features.size(-1)))
+            audio_token_lens = torch.zeros((0,), dtype=torch.long, device=device)
+
+        # 2. Per-video segmentation: split flat per-modality buffers, build
+        # rotary embeddings, interleave image / audio chunks in temporal order.
+        num_videos = int(video_split.shape[0])
+
+        # Optional source of truth for true temporal interleave:
+        # ``video_image_indices`` is a flat ``[2, total_image_tokens]`` tensor
+        # spanning all videos. We slice it per video using a cumulative token
+        # offset built from ``video_image_grid_thw``. ``video_audio_indices``
+        # is already a per-segment list aligned with ``video_audios``.
+        # ``spatial_merge_size`` lives on the encoder / config, not the omni
+        # model itself, so read it from the encoder (which mirrors the value
+        # used to build vision rotary positions just below).
+        spatial_merge = int(self.encoder.spatial_merge_size)
+        if video_image_indices is not None:
+            image_indices_seq_flat = video_image_indices[1].reshape(-1).tolist()
+        else:
+            image_indices_seq_flat = None
+        image_token_cursor_text = 0  # offset into ``image_indices_seq_flat``
+
+        image_cursor = 0
+        audio_chunk_cursor = 0
+        vision_patch_cursor = 0
+        audio_token_cursor = 0
+
+        segment_features = []
+        segment_rotary = []
+        segment_lengths = []
+        segment_modality_masks = []  # True = vision, False = audio
+        per_video_audio_chunk_lens = []
+
+        for video_index in range(num_videos):
+            num_images = int(video_split[video_index, 0].item())
+            num_audio_chunks = int(video_split[video_index, 1].item())
+
+            # ---- vision slice ----
+            video_grid_thw = video_image_grid_thw[
+                image_cursor : image_cursor + num_images
+            ]
+            if num_images > 0:
+                num_patch_rows = int(
+                    (video_grid_thw[:, 0] * video_grid_thw[:, 1] * video_grid_thw[:, 2])
+                    .sum()
+                    .item()
+                )
+            else:
+                num_patch_rows = 0
+            video_vision_features = vision_features[
+                vision_patch_cursor : vision_patch_cursor + num_patch_rows
+            ]
+            image_cursor += num_images
+            vision_patch_cursor += num_patch_rows
+
+            # ---- audio slice ----
+            video_audio_chunk_lens = audio_token_lens[
+                audio_chunk_cursor : audio_chunk_cursor + num_audio_chunks
+            ]
+            video_audio_total_tokens = (
+                int(video_audio_chunk_lens.sum().item()) if num_audio_chunks > 0 else 0
+            )
+            video_audio_features = audio_features[
+                audio_token_cursor : audio_token_cursor + video_audio_total_tokens
+            ]
+            audio_chunk_cursor += num_audio_chunks
+            audio_token_cursor += video_audio_total_tokens
+
+            # ---- per-frame vision rotary ----
+            if num_images > 0:
+                video_vision_rotary = self.encoder.vision_rot_pos_emb(video_grid_thw).to(device)
+                tokens_per_frame = (
+                    video_grid_thw[:, 0] * video_grid_thw[:, 1] * video_grid_thw[:, 2]
+                ).tolist()
+                vision_feature_chunks = list(
+                    video_vision_features.split(tokens_per_frame, dim=0)
+                )
+                vision_rotary_chunks = list(
+                    video_vision_rotary.split(tokens_per_frame, dim=0)
+                )
+            else:
+                vision_feature_chunks, vision_rotary_chunks = [], []
+
+            # ---- per-chunk audio rotary ----
+            if num_audio_chunks > 0:
+                video_audio_rotary = self.encoder.audio_rot_pos_emb(
+                    video_audio_chunk_lens
+                ).to(device)
+                tokens_per_audio_chunk = video_audio_chunk_lens.tolist()
+                audio_feature_chunks = list(
+                    video_audio_features.split(tokens_per_audio_chunk, dim=0)
+                )
+                audio_rotary_chunks = list(
+                    video_audio_rotary.split(tokens_per_audio_chunk, dim=0)
+                )
+            else:
+                audio_feature_chunks, audio_rotary_chunks = [], []
+
+            # ---- interleave I and A in true temporal order ----
+            # Preferred path: read the per-frame / per-segment text-side
+            # ``seq_pos`` from ``video_image_indices`` / ``video_audio_indices``
+            # (which the processor wrote in real temporal order) and sort.
+            # Fallback path (when indices are missing): legacy ``divmod``
+            # heuristic that evenly distributes audio chunks across image
+            # frames; only correct when every chunk is ``1 image + 1 audio``.
+            num_image_chunks = len(vision_feature_chunks)
+            num_audio_chunks_actual = len(audio_feature_chunks)
+
+            # Per-frame token consumption on the text side, used to slice
+            # ``image_indices_seq_flat`` and to find each frame's first
+            # ``seq_pos``. After the spatial merge each frame contributes
+            # ``rows_per_frame * tokens_per_row`` ``IMG_CONTEXT_ID`` tokens.
+            if num_images > 0:
+                rows_per_frame = (
+                    video_grid_thw[:, 0] * video_grid_thw[:, 1] // spatial_merge
+                ).tolist()
+                tokens_per_row = (video_grid_thw[:, 2] // spatial_merge).tolist()
+                tokens_per_frame_text = [
+                    int(rows_per_frame[k]) * int(tokens_per_row[k])
+                    for k in range(num_images)
+                ]
+            else:
+                tokens_per_frame_text = []
+
+            if num_image_chunks == 0 and num_audio_chunks_actual == 0:
+                # advance the text cursor for any (empty) image tokens of
+                # this video — no-op when ``num_images == 0``.
+                image_token_cursor_text += sum(tokens_per_frame_text)
+                continue
+
+            use_indices = (
+                image_indices_seq_flat is not None
+                and video_audio_indices is not None
+                and num_image_chunks > 0
+                and num_audio_chunks_actual > 0
+            )
+
+            # Build a flat ``ordered_events`` list of ``(modality_kind, idx)``
+            # tuples in true temporal order (modality_kind: 0=vision, 1=audio).
+            # The materialisation into one or more attention groups happens
+            # below so that the four temporal-ordering branches stay simple.
+            ordered_events: list[tuple[int, int]] = []
+
+            if use_indices:
+                # Per-frame seq-pos (first ``IMG_CONTEXT_ID`` of the frame).
+                image_starts = []
+                cur = image_token_cursor_text
+                for k in range(num_image_chunks):
+                    image_starts.append(image_indices_seq_flat[cur])
+                    cur += tokens_per_frame_text[k]
+
+                # Per-segment seq-pos (first ``AUD_CONTEXT_ID`` of the segment).
+                audio_starts = []
+                for s in range(num_audio_chunks_actual):
+                    seg = video_audio_indices[
+                        audio_chunk_cursor - num_audio_chunks_actual + s
+                    ]
+                    # ``seg`` shape ``[2, 1, audio_token_length]``;
+                    # ``seg[1, 0, 0]`` is the segment's first ``seq_pos``.
+                    audio_starts.append(int(seg.reshape(2, -1)[1, 0].item()))
+
+                # Per-video temporal-order invariant on the audio side: both
+                # ``video_audios`` and ``video_audio_indices`` must be appended
+                # by the processor in real temporal order, otherwise the
+                # post-encoder ``audio_output_packed.split(all_audio_chunk_lens)``
+                # call below would slice with chunk lengths that no longer
+                # match the chunks coming out of the encoder, scattering the
+                # wrong audio embedding to ``input_ids``. Fail loudly here so
+                # contract violations surface immediately rather than as
+                # silent garbage.
+                if any(
+                    audio_starts[i] > audio_starts[i + 1]
+                    for i in range(len(audio_starts) - 1)
+                ):
+                    raise ValueError(
+                        f"forward_video: video_index={video_index}: "
+                        f"`video_audio_indices` is not in temporal order "
+                        f"({audio_starts=}). The audio post-merge split "
+                        f"requires per-video chunks to be appended in "
+                        f"temporal order matching ``video_audios``."
+                    )
+
+                # Merge & sort. ``modality_kind`` 0 = vision, 1 = audio.
+                events = (
+                    [(s, 0, k) for k, s in enumerate(image_starts)]
+                    + [(s, 1, k) for k, s in enumerate(audio_starts)]
+                )
+                events.sort(key=lambda x: x[0])
+                logger.debug(
+                    f"forward_video: video_index={video_index} "
+                    f"image_starts={image_starts} audio_starts={audio_starts} "
+                    f"interleave_order=" + ",".join(
+                        ("I" if m == 0 else "A") + str(i) + "@" + str(s)
+                        for s, m, i in events
+                    )
+                )
+                ordered_events = [(m, i) for _, m, i in events]
+            elif num_image_chunks == 0:
+                ordered_events = [(1, k) for k in range(num_audio_chunks_actual)]
+            elif num_audio_chunks_actual == 0:
+                ordered_events = [(0, k) for k in range(num_image_chunks)]
+            else:
+                # Legacy fallback: divmod heuristic.
+                logger.warning_once(
+                    "YoutuVITAOmniModel.forward_video: `video_image_indices` / "
+                    "`video_audio_indices` not provided; falling back to the "
+                    "divmod heuristic for image/audio interleaving. The "
+                    "resulting temporal alignment is approximate; pass the "
+                    "indices produced by the processor for correct behaviour."
+                )
+                audios_per_image, extra_audio_count = divmod(
+                    num_audio_chunks_actual, num_image_chunks
+                )
+                audio_index = 0
+                for image_index in range(num_image_chunks):
+                    ordered_events.append((0, image_index))
+                    audios_to_take = audios_per_image + (
+                        1 if image_index < extra_audio_count else 0
+                    )
+                    for _ in range(audios_to_take):
+                        ordered_events.append((1, audio_index))
+                        audio_index += 1
+                assert audio_index == num_audio_chunks_actual, (
+                    f"video {video_index}: distributed {audio_index} audio chunks, "
+                    f"expected {num_audio_chunks_actual}"
+                )
+
+            # Advance the text-side cursor over this video's image tokens.
+            image_token_cursor_text += sum(tokens_per_frame_text)
+
+            # ---- materialise one or more attention groups for this video ----
+            # When ``self.config.video_group_attention`` is True, partition
+            # ``ordered_events`` into groups following the rule:
+            #   * the first group may start with audio(s) (a leading audio
+            #     run is absorbed into the first group);
+            #   * every *subsequent* group starts with image(s);
+            #   * a new group begins whenever an image directly follows an
+            #     audio (i.e. ``A → I`` boundary);
+            #   * a trailing image-only run becomes its own group;
+            #   * if a video has no audio at all, every image is its own
+            #     group;
+            #   * if a video has no image at all, every audio is its own
+            #     group.
+            # When the flag is False (default), the whole video stays in a
+            # single attention segment (the original behaviour).
+            if self.config.video_group_attention:
+                has_image_in_video = any(m == 0 for m, _ in ordered_events)
+                has_audio_in_video = any(m == 1 for m, _ in ordered_events)
+                event_groups: list[list[tuple[int, int]]] = []
+                current_group: list[tuple[int, int]] = []
+                prev_modality: Optional[int] = None
+                for modality_kind, idx in ordered_events:
+                    # Start a new group when one of:
+                    #   * mixed modality: this event is an image and the
+                    #     previous one was an audio (``A → I`` boundary);
+                    #   * pure-image video: this event is an image and not
+                    #     the very first event (one image per group);
+                    #   * pure-audio video: this event is an audio and not
+                    #     the very first event (one audio per group).
+                    start_new_group = (
+                        (modality_kind == 0 and prev_modality == 1)
+                        or (
+                            not has_audio_in_video
+                            and modality_kind == 0
+                            and prev_modality is not None
+                        )
+                        or (
+                            not has_image_in_video
+                            and modality_kind == 1
+                            and prev_modality is not None
+                        )
+                    )
+                    if start_new_group:
+                        event_groups.append(current_group)
+                        current_group = []
+                    current_group.append((modality_kind, idx))
+                    prev_modality = modality_kind
+                if current_group:
+                    event_groups.append(current_group)
+                logger.debug(
+                    f"forward_video: video_index={video_index} "
+                    f"video_group_attention=True num_groups={len(event_groups)} "
+                    f"group_pattern="
+                    + " ".join(
+                        "(" + "".join("I" if m == 0 else "A" for m, _ in g) + ")"
+                        for g in event_groups
+                    )
+                )
+            else:
+                event_groups = [ordered_events]
+
+            for group_events in event_groups:
+                if len(group_events) == 0:
+                    continue
+                group_features_list = []
+                group_rotary_list = []
+                group_mask_list = []
+                for modality_kind, idx in group_events:
+                    if modality_kind == 0:
+                        feat = vision_feature_chunks[idx]
+                        rot = vision_rotary_chunks[idx]
+                        mask_val = True
+                    else:
+                        feat = audio_feature_chunks[idx]
+                        rot = audio_rotary_chunks[idx]
+                        mask_val = False
+                    group_features_list.append(feat)
+                    group_rotary_list.append(rot)
+                    group_mask_list.append(
+                        torch.full(
+                            (feat.size(0),),
+                            mask_val,
+                            dtype=torch.bool,
+                            device=device,
+                        )
+                    )
+                group_features_tensor = torch.cat(group_features_list, dim=0)
+                group_rotary_tensor = torch.cat(group_rotary_list, dim=0)
+                group_mask_tensor = torch.cat(group_mask_list, dim=0)
+
+                segment_features.append(group_features_tensor)
+                segment_rotary.append(group_rotary_tensor)
+                segment_modality_masks.append(group_mask_tensor)
+                segment_lengths.append(group_features_tensor.size(0))
+
+            per_video_audio_chunk_lens.append(video_audio_chunk_lens)
+
+        # 3. Concatenate per-video segments into one packed sequence.
+        if len(segment_features) == 0:
+            empty_vision = vision_features.new_zeros(
+                (0, self.config.out_hidden_size)
+            )
+            empty_audio = vision_features.new_zeros((0, 0, self.config.out_hidden_size))
+            empty_lens = torch.zeros((0,), dtype=torch.long, device=device)
+            return empty_vision, empty_audio, empty_lens
+
+        packed_features = torch.cat(segment_features, dim=0)
+        packed_rotary = torch.cat(segment_rotary, dim=0)
+        packed_modality_mask = torch.cat(segment_modality_masks, dim=0)
+
+        cu_seqlens = torch.nn.functional.pad(
+            torch.tensor(segment_lengths, dtype=torch.int32, device=device).cumsum(
+                dim=0, dtype=torch.int32
+            ),
+            (1, 0),
+            value=0,
+        )
+
+        # 4. Run the shared transformer once over the packed sequence.
+        encoder_output = self.encoder(
+            hidden_states=packed_features,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb=packed_rotary,
+        ).last_hidden_state
+
+        # 5. Split encoder output back via ``packed_modality_mask``.
+        vision_output = encoder_output[packed_modality_mask]
+        audio_output_packed = encoder_output[~packed_modality_mask]
+
+        # ---- Vision post-processing ----
+        if vision_output.size(0) > 0:
+            vision_output = self.vision_merger(vision_output)
+        else:
+            vision_output = encoder_output.new_zeros((0, self.config.out_hidden_size))
+
+        # ---- Audio post-processing ----
+        if audio_output_packed.size(0) > 0 and len(per_video_audio_chunk_lens) > 0:
+            all_audio_chunk_lens = torch.cat(per_video_audio_chunk_lens, dim=0)
+            audio_chunks_split = audio_output_packed.split(
+                all_audio_chunk_lens.tolist(), dim=0
+            )
+            audio_output = torch.nn.utils.rnn.pad_sequence(
+                audio_chunks_split, batch_first=True, padding_value=0.0
+            )
+            audio_output = self.audio_merger(audio_output)
+            audio_lens_after_merge = -(
+                -all_audio_chunk_lens // int(self.config.temporal_merge_size)
+            )
+        else:
+            audio_output = encoder_output.new_zeros(
+                (0, 0, self.config.out_hidden_size)
+            )
+            audio_lens_after_merge = torch.zeros((0,), dtype=torch.long, device=device)
+
+        logger.debug(f"{vision_output.size()=} {audio_output.size()=} {audio_lens_after_merge=}")
+
+        return vision_output, audio_output, audio_lens_after_merge
+
+    # -------------------------------------------------------------- top-level
+    def forward(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        audios: Optional[Any] = None,
+        modality: Optional[str] = None,
+        # video_omni_fusion joint path
+        video_images: Optional[torch.Tensor] = None,
+        video_image_grid_thw: Optional[torch.Tensor] = None,
+        video_audios: Optional[list] = None,
+        video_split: Optional[torch.Tensor] = None,
+        video_image_indices: Optional[torch.Tensor] = None,
+        video_audio_indices: Optional[list] = None,
+        **kwargs,
+    ):
+        """Dispatch by modality (mirrors ``MegatronOmniModel.forward``).
+
+        * ``modality == "vision"`` or only vision inputs → ``image_embeddings``
+          of shape ``[N, out_hidden_size]``.
+        * ``modality == "audio"`` or only audio inputs → ``(audio_embeddings,
+          audio_lengths)``.
+        * ``modality == "video"`` or ``video_split`` is given → joint encode,
+          returns ``(video_image_embeddings, video_audio_embeddings,
+          video_audio_lens_after_merge)``.
+        * Both vision and audio (legacy independent dual call) → ``{"vision":
+          ..., "audio": (..., ...)}``.
+        """
+        has_vision = pixel_values is not None and image_grid_thw is not None
+        has_audio = audios is not None
+        has_video = video_split is not None and video_split.numel() > 0
+
+        if modality == "video" or (has_video and modality is None):
+            return self.forward_video(
+                video_images=video_images,
+                video_image_grid_thw=video_image_grid_thw,
+                video_audios=video_audios,
+                video_split=video_split,
+                video_image_indices=video_image_indices,
+                video_audio_indices=video_audio_indices,
+            )
+
+        if modality == "vision" or (has_vision and not has_audio):
+            return self.forward_vision(pixel_values, image_grid_thw)
+
+        if modality == "audio" or (has_audio and not has_vision):
+            return self.forward_audio(audios)
+
+        if has_vision and has_audio:
+            v = self.forward_vision(pixel_values, image_grid_thw)
+            a, a_len = self.forward_audio(audios)
+            return {"vision": v, "audio": (a, a_len)}
+
+        raise ValueError(
+            "YoutuVITAOmniModel.forward requires at least one of (pixel_values, image_grid_thw), "
+            "(audios,), or (video_images, video_image_grid_thw, video_split)."
+        )
 
 
 class YoutuVITAModel(YoutuVITAPreTrainedModel):
@@ -1741,6 +2764,46 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
             return self.omni_model(modality="audio", audios=audios)
         return self.audio_model(audios)
 
+    def _encode_video(
+        self,
+        video_images,
+        video_image_grid_thw,
+        video_audios,
+        video_split,
+        video_image_indices=None,
+        video_audio_indices=None,
+    ):
+        """Joint video encode: same-video vision/audio share an attention
+        window inside the omni encoder. Mirrors
+        ``GPTMMModel._preprocess`` joint-video branch in
+        ``vita_megatron/core/models/multimodal/gpt_mm_model.py``.
+
+        ``video_image_indices`` / ``video_audio_indices`` are the same scatter
+        indices already produced by the processor for writing encoder outputs
+        back into ``inputs_embeds``. Forwarding them to the omni encoder lets
+        :meth:`YoutuVITAOmniModel.forward_video` recover the real temporal
+        interleave order between image frames and audio chunks of the same
+        video (the order written into ``input_ids`` by the processor),
+        replacing the legacy ``divmod`` heuristic.
+
+        Returns ``(video_image_embeds, video_audio_embeds, video_audio_lens)``.
+        """
+        if self.omni_model is None:
+            raise ValueError(
+                "YoutuVITAModel: video joint encoding requires `omni_model`, "
+                "but it is not configured. Either disable `video_omni_fusion` "
+                "in the processor or load a checkpoint with `omni_config`."
+            )
+        return self.omni_model(
+            modality="video",
+            video_images=video_images,
+            video_image_grid_thw=video_image_grid_thw,
+            video_audios=video_audios,
+            video_split=video_split,
+            video_image_indices=video_image_indices,
+            video_audio_indices=video_audio_indices,
+        )
+
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -1750,6 +2813,13 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
         image_grid_thw: torch.LongTensor | None = None,
         audios: torch.FloatTensor | None = None,
         audio_indices: torch.LongTensor | None = None,
+        # video_omni_fusion joint path
+        video_images: torch.FloatTensor | None = None,
+        video_image_grid_thw: torch.LongTensor | None = None,
+        video_image_indices: torch.LongTensor | None = None,
+        video_audios: list | None = None,
+        video_audio_indices: list | None = None,
+        video_split: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
@@ -1888,6 +2958,54 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
                 inputs_embeds[indices_b.view(-1), indices_s.view(-1)] = audio_embeds_.view(-1, audio_embeds_.shape[-1])
             # inputs_embeds = inputs_embeds + audio_embeds.mean() * 0.0
 
+        # ------------------------------------------------------------------
+        # Joint video path: same-video vision/audio go through the shared
+        # omni encoder together (mirrors ``GPTMMModel._preprocess`` joint
+        # branch and ``LanguageModelEmbedding.forward`` independent
+        # ``video_*`` scatter in
+        # ``vita_megatron/core/models/common/embeddings/language_model_embedding.py``).
+        # ------------------------------------------------------------------
+        if video_split is not None and video_split.numel() > 0:
+            device = inputs_embeds.device
+            dtype = inputs_embeds.dtype
+            video_images = video_images.to(dtype).to(device)
+            video_image_grid_thw = video_image_grid_thw.to(device)
+            if video_audios is not None:
+                video_audios = [x.to(dtype).to(device) for x in video_audios]
+            video_split_dev = video_split.to(device)
+
+            # Forward the scatter indices to the omni encoder so the joint
+            # forward path can recover the real temporal interleave between
+            # image frames and audio chunks (matching the processor's
+            # ``input_ids`` write order). Indices are kept on CPU here; the
+            # encoder only reads ``[1, ...]`` (seq positions).
+            video_image_embeds, video_audio_embeds, video_audio_lens = self._encode_video(
+                video_images=video_images,
+                video_image_grid_thw=video_image_grid_thw,
+                video_audios=video_audios,
+                video_split=video_split_dev,
+                video_image_indices=video_image_indices,
+                video_audio_indices=video_audio_indices,
+            )
+
+            # Independent scatter for video vision tokens.
+            if video_image_indices is not None and video_image_indices.numel() > 0 and video_image_embeds.numel() > 0:
+                inputs_embeds = inputs_embeds.clone()
+                video_image_embeds = video_image_embeds.to(inputs_embeds.device)
+                v_idx = video_image_indices.to(inputs_embeds.device)
+                v_indices_b, v_indices_s = v_idx.unbind(dim=0)
+                inputs_embeds[v_indices_b.view(-1), v_indices_s.view(-1)] = video_image_embeds.view(-1, video_image_embeds.shape[-1])
+
+            # Independent scatter for video audio tokens.
+            if video_audio_indices is not None and len(video_audio_indices) > 0 and video_audio_embeds.numel() > 0:
+                inputs_embeds = inputs_embeds.clone()
+                for v_aud_emb, v_aud_len, v_aud_idx in zip(
+                    video_audio_embeds, video_audio_lens, video_audio_indices
+                ):
+                    v_aud_emb = v_aud_emb[: int(v_aud_len), ...].to(inputs_embeds.device)
+                    indices_b, indices_s = v_aud_idx.to(inputs_embeds.device).unbind(dim=0)
+                    inputs_embeds[indices_b.view(-1), indices_s.view(-1)] = v_aud_emb.view(-1, v_aud_emb.shape[-1])
+
         return self.language_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1924,6 +3042,13 @@ class YoutuVITAForCausalLM(YoutuVITAPreTrainedModel, GenerationMixin):
         image_grid_thw: torch.LongTensor | None = None,
         audios: torch.FloatTensor | None = None,
         audio_indices: torch.LongTensor | None = None,
+        # video_omni_fusion joint path
+        video_images: torch.FloatTensor | None = None,
+        video_image_grid_thw: torch.LongTensor | None = None,
+        video_image_indices: torch.LongTensor | None = None,
+        video_audios: list | None = None,
+        video_audio_indices: list | None = None,
+        video_split: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
@@ -1958,6 +3083,12 @@ class YoutuVITAForCausalLM(YoutuVITAPreTrainedModel, GenerationMixin):
             image_grid_thw=image_grid_thw,
             audios=audios,
             audio_indices=audio_indices,
+            video_images=video_images,
+            video_image_grid_thw=video_image_grid_thw,
+            video_image_indices=video_image_indices,
+            video_audios=video_audios,
+            video_audio_indices=video_audio_indices,
+            video_split=video_split,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
@@ -1990,34 +3121,65 @@ class YoutuVITAForCausalLM(YoutuVITAPreTrainedModel, GenerationMixin):
         attention_mask: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         cache_position: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         images: torch.FloatTensor | None = None,
         image_indices: torch.LongTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         audios: torch.FloatTensor | None = None,
         audio_indices: torch.LongTensor | None = None,
+        video_images: torch.FloatTensor | None = None,
+        video_image_grid_thw: torch.LongTensor | None = None,
+        video_image_indices: torch.LongTensor | None = None,
+        video_audios: list | None = None,
+        video_audio_indices: list | None = None,
+        video_split: torch.LongTensor | None = None,
         is_first_iteration: bool | None = False,
         **kwargs,
     ):
+        # Overwritten -- in specific circumstances we don't want to forward image/audio/video inputs to the model
+
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
+            position_ids=position_ids,
             use_cache=use_cache,
             images=images,
             image_indices=image_indices,
             image_grid_thw=image_grid_thw,
             audios=audios,
             audio_indices=audio_indices,
+            video_images=video_images,
+            video_image_grid_thw=video_image_grid_thw,
+            video_image_indices=video_image_indices,
+            video_audios=video_audios,
+            video_audio_indices=video_audio_indices,
+            video_split=video_split,
             is_first_iteration=is_first_iteration,
             **kwargs,
         )
 
+        # After the prefill step the multimodal features have been written into the KV cache,
+        # so during decode steps we must clear ALL multimodal tensors (raw inputs, scatter
+        # indices and grid metadata) to avoid re-encoding and mismatched scatter writes.
         if not is_first_iteration and use_cache:
-            model_inputs["images"] = None
-            model_inputs["audios"] = None
+            for key in (
+                "images",
+                "image_indices",
+                "image_grid_thw",
+                "audios",
+                "audio_indices",
+                "video_images",
+                "video_image_grid_thw",
+                "video_image_indices",
+                "video_audios",
+                "video_audio_indices",
+                "video_split",
+            ):
+                model_inputs[key] = None
 
         return model_inputs
 
@@ -2158,7 +3320,6 @@ class Youtu_VITA_TOKEN_bus1(DEFAULT_TOKEN):
                 self.AUD_END_TOKEN,
             ]
         )
-
 
 
 class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
@@ -2717,7 +3878,8 @@ class MelFilterBankTokenizer:
             sampling_rate=16000,
             return_attention_mask=True,
             return_tensors="pt",
-            padding=True,
+            padding="do_not_pad",
+            truncation=False,
             device=self.device,
         )
         input_features = features["input_features"]
@@ -3096,7 +4258,6 @@ class YoutuVITAImagesKwargs(ImagesKwargs, total=False):
     discrete_image_idxs: list
     contiguous_image_idxs: list
 
-    vision_resolution_type: str
     vision_normalize_type: str
     image_min_num_tokens: int
     image_max_num_tokens: int
@@ -3116,7 +4277,6 @@ class YoutuVITAAudioKwargs(AudioKwargs, total=False):
 class YoutuVITAVideosKwargs(VideosKwargs, total=False):
     """
     """
-    vision_resolution_type: str
     video_min_num_tokens: int
     video_max_num_tokens: int
     video_image_min_num_tokens: int
@@ -3128,6 +4288,11 @@ class YoutuVITAVideosKwargs(VideosKwargs, total=False):
     video_key_frame: bool
     use_audio_in_video: bool
     use_vision_in_video: bool
+    # When True, video frames+audio of the same video are jointly encoded by
+    # ``YoutuVITAOmniModel.forward_video`` so they can attend to each other.
+    # When False (default), video frames/audio fall back to the standalone
+    # image/audio paths.
+    video_omni_fusion: bool
 
 
 class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
@@ -3141,24 +4306,23 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
             "padding_side": "left",
         },
         "images_kwargs": {
-            "vision_resolution_type": "native",
-            "vision_normalize_type": "siglip",
-            "image_min_num_tokens": 4,
-            "image_max_num_tokens": 8192,
+            # "vision_normalize_type": "siglip",
+            # "image_min_num_tokens": 4,
+            # "image_max_num_tokens": 8192,
         },
         "videos_kwargs": {
-            "vision_resolution_type": "native",
-            "video_min_num_tokens": 64,
-            "video_max_num_tokens": 8192,
-            "video_image_min_num_tokens": 4,
-            "video_image_max_num_tokens": 256,
-            "video_max_num_frames": 64,
-            "temporal_patch_size": 1,
-            "spatial_merge_size": 2,
-            "patch_size":16,
-            "video_key_frame": False,
-            "use_audio_in_video": True,
-            "use_vision_in_video": True,
+            # "video_min_num_tokens": 64,
+            # "video_max_num_tokens": 8192,
+            # "video_image_min_num_tokens": 4,
+            # "video_image_max_num_tokens": 256,
+            # "video_max_num_frames": 64,
+            # "temporal_patch_size": 1,
+            # "spatial_merge_size": 2,
+            # "patch_size":16,
+            # "video_key_frame": False,
+            # "use_audio_in_video": True,
+            # "use_vision_in_video": True,
+            # "video_omni_fusion": False,
         },
         "audio_kwargs": {
             "sampling_rate": 16000,
@@ -3170,7 +4334,7 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
 
 
 class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
-    model_input_names = ["pixel_values", "image_grid_thw"]
+    model_input_names = ["audios", "audio_indices"]
     valid_kwargs = YoutuVITAAudioKwargs
 
     def __init__(
@@ -3180,6 +4344,8 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         flow_path=None,
         rank=None,
         text_audio_interval_ratio=None,
+        audio_chunk_min_second=2,
+        audio_chunk_max_second=30,
         temporal_merge_size=1,
         **kwargs,
     ) -> None:
@@ -3193,7 +4359,11 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         )
 
         self.text_audio_interval_ratio = text_audio_interval_ratio
+        self.audio_chunk_min_second = audio_chunk_min_second
+        self.audio_chunk_max_second = audio_chunk_max_second
         self.temporal_merge_size = temporal_merge_size
+        self.audio_tokenizer_path = audio_tokenizer_path
+        self.audio_tokenizer_type = audio_tokenizer_type
 
         # self.load_model()
 
@@ -3276,10 +4446,11 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
         contiguous_audio_idxs=[],
         targets=None,
         is_pretrain=False,
-        audio_chunk_min_second=30,
-        audio_chunk_max_second=30,
         **kwargs,
     ):
+        audio_chunk_min_second = kwargs.get("audio_chunk_min_second", self.audio_chunk_min_second)
+        audio_chunk_max_second = kwargs.get("audio_chunk_max_second", self.audio_chunk_max_second)
+
         GLOBAL_CONSTANTS = get_token()
 
         AUD_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.AUD_CONTEXT_TOKEN)
@@ -3483,6 +4654,8 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                     audio_token_length = -(
                         -audio_token_length_func(len(audio)) // self.temporal_merge_size
                     )
+                    assert audio_token_length > 0
+
                     audio_indice_b = torch.zeros(
                         1, audio_token_length, dtype=torch.int64
                     )  # This will change in collate_fn
@@ -3556,9 +4729,6 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
     def __init__(
         self,
-        image_processor=None,
-        audio_processor=None,
-        vision_resolution_type=None,
         video_max_num_frames=64,
         video_max_fps=1,
         video_min_num_tokens=64,
@@ -3574,14 +4744,20 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         temporal_merge_size=1,
         patch_size=14,
         video_key_frame=False,
+        video_omni_fusion=False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
 
-        self.image_processor = image_processor
-        self.audio_processor = audio_processor
+        # NOTE: image_processor / audio_processor are intentionally NOT stored on
+        # ``self``. They are owned by ``YoutuVITAProcessor`` and passed into the
+        # public methods (``process_video`` /
+        # ``add_video_input_discrete_or_contiguous``) on each call. Storing them
+        # here would cause ``BaseVideoProcessor.to_dict`` (which serializes
+        # ``self.__dict__``) to embed full sub-processor configs inside
+        # ``processor_config.json``, duplicating the top-level
+        # ``image_processor``/``feature_extractor`` blocks.
 
-        self.vision_resolution_type = vision_resolution_type
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
         self.temporal_merge_size = temporal_merge_size
@@ -3601,15 +4777,11 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         self.sampling_rate = 16000
 
         self.video_key_frame = video_key_frame
-
-    def to_dict(self):
-        output = super().to_dict()
-        # Remove the non-serializable object before returning
-        if "image_processor" in output:
-            del output["image_processor"]
-        if "audio_processor" in output:
-            del output["audio_processor"]
-        return output
+        # When ``video_omni_fusion`` is False, ``add_video_input_discrete_or_contiguous``
+        # always returns ``video_split=None`` so upstream code falls back to the
+        # legacy (non-split) flow. When True, the per-video ``(num_images, num_audios)``
+        # tuples are surfaced and the joint-encode path is taken downstream.
+        self.video_omni_fusion = video_omni_fusion
 
     def get_video_frames(self, vid_path, video_max_fps=1, video_max_num_frames=8):
         vid = decord.VideoReader(vid_path, num_threads=1)
@@ -3734,7 +4906,15 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
         return img_or_path_list, fps, timestamps, (audio, self.sampling_rate), duration_seconds
 
-    def process_video(self, video_file_or_dir, video_max_num_frames=8, video_max_fps=1):
+    def process_video(
+        self,
+        video_file_or_dir,
+        video_max_num_frames=8,
+        video_max_fps=1,
+        *,
+        image_processor,
+        audio_processor,
+    ):
 
         images, fps, timestamps, (audio, sampling_rate), duration_seconds = self.get_image_and_audio(
             video_file_or_dir,
@@ -3742,52 +4922,43 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             video_max_fps=video_max_fps,
         )
 
-        if self.vision_resolution_type == "native":
-            min_pixels = (
-                (self.patch_size * self.spatial_merge_size) ** 2
-                * self.video_min_num_tokens
-                // len(images)
-            )
-            max_pixels = (
-                (self.patch_size * self.spatial_merge_size) ** 2
-                * self.video_max_num_tokens
-                // len(images)
-            )
+        min_pixels = (
+            (self.patch_size * self.spatial_merge_size) ** 2
+            * self.video_min_num_tokens
+            // len(images)
+        )
+        max_pixels = (
+            (self.patch_size * self.spatial_merge_size) ** 2
+            * self.video_max_num_tokens
+            // len(images)
+        )
 
-            image_min_pixels = (
-                self.patch_size * self.spatial_merge_size
-            ) ** 2 * self.video_image_min_num_tokens
-            image_max_pixels = (
-                self.patch_size * self.spatial_merge_size
-            ) ** 2 * self.video_image_max_num_tokens
+        image_min_pixels = (
+            self.patch_size * self.spatial_merge_size
+        ) ** 2 * self.video_image_min_num_tokens
+        image_max_pixels = (
+            self.patch_size * self.spatial_merge_size
+        ) ** 2 * self.video_image_max_num_tokens
 
-            min_pixels = max(min_pixels, image_min_pixels)
-            max_pixels = min(max_pixels, image_max_pixels)
+        min_pixels = max(min_pixels, image_min_pixels)
+        max_pixels = min(max_pixels, image_max_pixels)
 
-            # print(f"{len(images)=} {min_pixels=} {max_pixels=}")
-            image_data = self.image_processor.process_images(
-                images,
-                is_contiguous=True,
-                vision_resolution_type=self.vision_resolution_type,
-                min_pixels=min_pixels,
-                max_pixels=max_pixels,
-            )
-            image_frames = image_data["images"]
-            best_height = image_data["image_height"]
-            best_width = image_data["image_width"]
-        else:
-            image_data = self.image_processor.process_images_to_tensor(
-                images
-            )
-            image_frames = image_data["images"]
-            best_height = image_data["image_height"]
-            best_width = image_data["image_width"]
+        # print(f"{len(images)=} {min_pixels=} {max_pixels=}")
+        image_data = image_processor.process_images(
+            images,
+            is_contiguous=True,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+        image_frames = image_data["images"]
+        best_height = image_data["image_height"]
+        best_width = image_data["image_width"]
 
         if audio is not None:
             total_time = len(audio) / sampling_rate
             # print(f"{duration_seconds=} {total_time=}", flush=True)
 
-            audio_dict = self.audio_processor.process_audio(
+            audio_dict = audio_processor.process_audio(
                 (audio, sampling_rate), is_discrete=False, is_contiguous=True
             )
             audio = audio_dict["audio"]
@@ -3835,6 +5006,102 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             duration_seconds,
         )
 
+    @staticmethod
+    def _chunk_audio_video_frames(
+        image_frames,
+        audio_frames,
+        second_frames,
+        duration_seconds,
+        video_audio_chunk_min_second,
+        video_audio_chunk_max_second,
+    ):
+        """Split image/audio frames into time-aligned chunks based on audio
+        duration limits. Mirrors :meth:`VideoProcessor._chunk_audio_video_frames`
+        in ``cognitron_mm/processor/video_processor.py``.
+
+        Returns:
+            ``(image_chunks, image_second_chunks, audio_chunks, audio_second_chunks)``
+        """
+        if audio_frames is None:
+            return [image_frames], [second_frames], [[]], [[]]
+
+        second_per_audio = 1.0 * duration_seconds / sum(len(x) for x in audio_frames)
+
+        image_chunks = []
+        image_second_chunks = []
+        audio_chunks = []
+        audio_second_chunks = []
+
+        image_chunk = []
+        image_second_chunk = []
+        audio_chunk = []
+        audio_second_chunk = []
+
+        for image_frame, audio_frame, second_frame in zip(
+            image_frames, audio_frames, second_frames
+        ):
+            audio_second = len(audio_frame) * second_per_audio
+            audio_chunk_second = sum(len(x) * second_per_audio for x in audio_chunk)
+
+            if audio_second + audio_chunk_second < video_audio_chunk_min_second:
+                image_chunk.append(image_frame)
+                image_second_chunk.append(second_frame)
+                audio_chunk.append(audio_frame)
+                audio_second_chunk.append(second_frame)
+
+            elif audio_second + audio_chunk_second <= video_audio_chunk_max_second:
+                image_chunk.append(image_frame)
+                image_second_chunk.append(second_frame)
+                audio_chunk.append(audio_frame)
+                audio_second_chunk.append(second_frame)
+
+                image_chunks.append(image_chunk)
+                image_second_chunks.append(image_second_chunk)
+
+                audio_chunk = [torch.cat(audio_chunk, dim=0)]
+                audio_second_chunk = [audio_second_chunk[0]]
+                audio_chunks.append(audio_chunk)
+                audio_second_chunks.append(audio_second_chunk)
+
+                image_chunk = []
+                image_second_chunk = []
+                audio_chunk = []
+                audio_second_chunk = []
+
+            else:
+                assert audio_chunk_second == 0
+
+                image_chunk.append(image_frame)
+                image_second_chunk.append(second_frame)
+
+                audio_chunk_size = int(video_audio_chunk_max_second / second_per_audio)
+                audio_chunk = torch.split(audio_frame, audio_chunk_size)
+                cur_second = second_frame
+                for x in audio_chunk:
+                    audio_second_chunk.append(cur_second)
+                    cur_second += len(x) * second_per_audio
+
+                image_chunks.append(image_chunk)
+                image_second_chunks.append(image_second_chunk)
+
+                audio_chunks.append(audio_chunk)
+                audio_second_chunks.append(audio_second_chunk)
+
+                image_chunk = []
+                image_second_chunk = []
+                audio_chunk = []
+                audio_second_chunk = []
+
+        if len(image_chunk) > 0:
+            image_chunks.append(image_chunk)
+            image_second_chunks.append(image_second_chunk)
+
+            audio_chunk = [torch.cat(audio_chunk, dim=0)]
+            audio_second_chunk = [audio_second_chunk[0]]
+            audio_chunks.append(audio_chunk)
+            audio_second_chunks.append(audio_second_chunk)
+
+        return image_chunks, image_second_chunks, audio_chunks, audio_second_chunks
 
     def add_video_input_discrete_or_contiguous(
         self,
@@ -3845,14 +5112,18 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         discrete_video_idxs=[],
         contiguous_video_idxs=[],
         is_pretrain=False,
+        *,
+        image_processor,
+        audio_processor,
         **kwargs,
     ):
         video_max_num_frames = kwargs.get("video_max_num_frames", self.video_max_num_frames)
         video_max_fps = kwargs.get("video_max_fps", self.video_max_fps)
         use_audio_in_video = kwargs.get("use_audio_in_video", self.use_audio_in_video)
         use_vision_in_video = kwargs.get("use_vision_in_video", self.use_vision_in_video)
-        video_audio_chunk_min_second = kwargs.get("video_audio_chuk_min_second", self.video_audio_chunk_min_second)
-        video_audio_chunk_max_second = kwargs.get("video_audio_chuk_max_second", self.video_audio_chunk_max_second)
+        video_audio_chunk_min_second = kwargs.get("video_audio_chunk_min_second", self.video_audio_chunk_min_second)
+        video_audio_chunk_max_second = kwargs.get("video_audio_chunk_max_second", self.video_audio_chunk_max_second)
+        video_omni_fusion = kwargs.get("video_omni_fusion", self.video_omni_fusion)
 
         GLOBAL_CONSTANTS = get_token()
 
@@ -3886,11 +5157,19 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         audio_indices = []
         video_grid_thw = []
         second_per_grids = []
+        # Per-video splits ``(num_images, num_audios)``, consumed downstream
+        # by the ``video_omni_fusion`` joint-encode path. Mirrors
+        # :meth:`VideoProcessor.add_video_input_contiguous` in
+        # ``cognitron_mm/processor/video_processor.py``.
+        video_split = []
 
         new_input_ids = []
         new_targets = []
         st = 0
         for vid_idx, vid_pos in enumerate(vid_positions):
+            # Snapshot per-video accounting before processing this video.
+            num_images_before = len(video_grid_thw)
+            num_audios_before = len(audios)
             (
                 image_frames,
                 audio_frames,
@@ -3899,7 +5178,13 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                 _second_per_grids,
                 second_frames,
                 duration_seconds,
-            ) = self.process_video(video_paths[vid_idx], video_max_num_frames, video_max_fps)
+            ) = self.process_video(
+                video_paths[vid_idx],
+                video_max_num_frames,
+                video_max_fps,
+                image_processor=image_processor,
+                audio_processor=audio_processor,
+            )
 
             if audio_frames is not None:
                 # print(f"{len(image_frames)=} {len(audio_frames)=}")
@@ -3914,109 +5199,33 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             if targets is not None:
                 new_targets += targets[st:vid_pos]
 
-            if audio_frames is not None:
-                second_per_audio = 1.0 * duration_seconds / sum([len(x) for x in audio_frames])
-
-                image_chunks = []
-                image_second_chunks = []
-                audio_chunks = []
-                audio_second_chunks = []
-
-                image_chunk = []
-                image_second_chunk = []
-                audio_chunk = []
-                audio_second_chunk = []
-                for image_frame, audio_frame, second_frame in zip(
-                    image_frames, audio_frames, second_frames
-                ):
-                    audio_second = len(audio_frame) * second_per_audio
-                    audio_chunk_second = sum([len(x) * second_per_audio for x in audio_chunk])
-
-                    if audio_second + audio_chunk_second < video_audio_chunk_min_second:
-                        image_chunk.append(image_frame)
-                        image_second_chunk.append(second_frame)
-
-                        audio_chunk.append(audio_frame)
-                        audio_second_chunk.append(second_frame)
-
-                    elif audio_second + audio_chunk_second <= video_audio_chunk_max_second:
-                        image_chunk.append(image_frame)
-                        image_second_chunk.append(second_frame)
-
-                        audio_chunk.append(audio_frame)
-                        audio_second_chunk.append(second_frame)
-
-                        image_chunks.append(image_chunk)
-                        image_second_chunks.append(image_second_chunk)
-
-                        audio_chunk = [torch.cat(audio_chunk, dim=0)]
-                        audio_second_chunk = [audio_second_chunk[0]]
-                        audio_chunks.append(audio_chunk)
-                        audio_second_chunks.append(audio_second_chunk)
-
-                        image_chunk = []
-                        image_second_chunk = []
-
-                        audio_chunk = []
-                        audio_second_chunk = []
-
-                    else:
-                        assert audio_chunk_second == 0
-
-                        image_chunk.append(image_frame)
-                        image_second_chunk.append(second_frame)
-
-                        audio_chunk_size = int(video_audio_chunk_max_second / second_per_audio)
-                        audio_chunk = torch.split(audio_frame, audio_chunk_size)
-                        cur_second = second_frame
-                        for x in audio_chunk:
-                            audio_second_chunk.append(cur_second)
-                            cur_second += len(x) * second_per_audio
-
-                        image_chunks.append(image_chunk)
-                        image_second_chunks.append(image_second_chunk)
-
-                        audio_chunks.append(audio_chunk)
-                        audio_second_chunks.append(audio_second_chunk)
-
-                        image_chunk = []
-                        image_second_chunk = []
-
-                        audio_chunk = []
-                        audio_second_chunk = []
-
-                if len(image_chunk) > 0:
-                    image_chunks.append(image_chunk)
-                    image_second_chunks.append(image_second_chunk)
-
-                    audio_chunk = [torch.cat(audio_chunk, dim=0)]
-                    audio_second_chunk = [audio_second_chunk[0]]
-                    audio_chunks.append(audio_chunk)
-                    audio_second_chunks.append(audio_second_chunk)
-
-            else:
-                image_chunks = [image_frames]
-                image_second_chunks = [second_frames]
-                audio_chunks = [[]]
-                audio_second_chunks = [[]]
+            (
+                image_chunks,
+                image_second_chunks,
+                audio_chunks,
+                audio_second_chunks,
+            ) = self._chunk_audio_video_frames(
+                image_frames,
+                audio_frames,
+                second_frames,
+                duration_seconds,
+                video_audio_chunk_min_second,
+                video_audio_chunk_max_second,
+            )
 
             assert len(image_frames) == sum([len(x) for x in image_chunks])
             # assert len(audio_frames) == sum([len(x) for x in audio_chunks])
 
             if use_vision_in_video:
-                if self.image_processor.vision_resolution_type == "native":
-                    images.append(
-                        torch.cat(
-                            [
-                                self.image_processor.convert_image_to_patches_with_pixel_shuffle(x)
-                                for x in image_frames
-                            ],
-                            dim=0,
-                        )
+                images.append(
+                    torch.cat(
+                        [
+                            image_processor.convert_image_to_patches_with_pixel_shuffle(x)
+                            for x in image_frames
+                        ],
+                        dim=0,
                     )
-
-                else:
-                    images.append(image_frames)
+                )
 
             if use_audio_in_video and audio_frames is not None:
                 # audios.extend(audio_frames)
@@ -4072,62 +5281,23 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             else:
                                 new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
-                        if self.image_processor.vision_resolution_type == "native":
-                            resolution = f"{_video_grid_thw[0][1] * self.patch_size}*{_video_grid_thw[0][2] * self.patch_size}"
-                            _input_id = tokenizer(resolution, add_special_tokens=False).input_ids
-                            new_input_ids += _input_id
-                            if targets is not None:
-                                if is_pretrain:
-                                    # new_targets += _input_id
-                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
-                                else:
-                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
+                        resolution = f"{_video_grid_thw[0][1] * self.patch_size}*{_video_grid_thw[0][2] * self.patch_size}"
+                        _input_id = tokenizer(resolution, add_special_tokens=False).input_ids
+                        new_input_ids += _input_id
+                        if targets is not None:
+                            if is_pretrain:
+                                # new_targets += _input_id
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
+                            else:
+                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(_input_id)
 
-                            for _ in range(
-                                _video_grid_thw[0][0]
-                                * _video_grid_thw[0][1]
-                                // self.spatial_merge_size
-                            ):
-                                image_token_length = (
-                                    _video_grid_thw[0][2] // self.spatial_merge_size
-                                )
-                                image_indice_b = torch.zeros(
-                                    1, image_token_length, dtype=torch.int64
-                                )  # This will change in collate_fn
-                                image_indice_s = (
-                                    torch.arange(
-                                        len(new_input_ids), len(new_input_ids) + image_token_length
-                                    )
-                                    .unsqueeze(0)
-                                    .repeat(1, 1)
-                                )
-                                image_indice_b_s = torch.stack(
-                                    [image_indice_b, image_indice_s], dim=0
-                                )  # 2, num_image, image_length
-                                image_indices.append(image_indice_b_s.view(2, -1))
-
-                                new_input_ids += [IMG_CONTEXT_ID] * image_token_length
-                                if targets is not None:
-                                    new_targets += [
-                                        GLOBAL_CONSTANTS.IGNORE_TOKEN_ID
-                                    ] * image_token_length
-
-                                new_input_ids += nl_tokens
-                                if targets is not None:
-                                    if is_pretrain:
-                                        new_targets += nl_tokens
-                                    else:
-                                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(
-                                            nl_tokens
-                                        )
-
-                        else:
+                        for _ in range(
+                            _video_grid_thw[0][0]
+                            * _video_grid_thw[0][1]
+                            // self.spatial_merge_size
+                        ):
                             image_token_length = (
-                                _video_grid_thw[0][0]
-                                * _video_grid_thw[0][1]
-                                * _video_grid_thw[0][2]
-                                // self.spatial_merge_size
-                                // self.spatial_merge_size
+                                _video_grid_thw[0][2] // self.spatial_merge_size
                             )
                             image_indice_b = torch.zeros(
                                 1, image_token_length, dtype=torch.int64
@@ -4142,11 +5312,22 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             image_indice_b_s = torch.stack(
                                 [image_indice_b, image_indice_s], dim=0
                             )  # 2, num_image, image_length
-                            image_indices.append(image_indice_b_s)
+                            image_indices.append(image_indice_b_s.view(2, -1))
 
                             new_input_ids += [IMG_CONTEXT_ID] * image_token_length
                             if targets is not None:
-                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
+                                new_targets += [
+                                    GLOBAL_CONSTANTS.IGNORE_TOKEN_ID
+                                ] * image_token_length
+
+                            new_input_ids += nl_tokens
+                            if targets is not None:
+                                if is_pretrain:
+                                    new_targets += nl_tokens
+                                else:
+                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(
+                                        nl_tokens
+                                    )
 
                         new_input_ids += [IMG_END_ID]
                         if targets is not None:
@@ -4184,6 +5365,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                                 new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
                         audio_token_length = -(-audio_token_length_func(len(audio_chunk_frame)) // self.temporal_merge_size)
+                        assert audio_token_length > 0
                         audio_indice_b = torch.zeros(
                             1, audio_token_length, dtype=torch.int64
                         )  # This will change in collate_fn
@@ -4223,6 +5405,14 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             video_grid_thw.extend(_video_grid_thw)
             second_per_grids.extend(_second_per_grids)
 
+            # Record per-video split delta after processing this video.
+            video_split.append(
+                (
+                    len(video_grid_thw) - num_images_before,
+                    len(audios) - num_audios_before,
+                )
+            )
+
             st = vid_pos + 1
 
         new_input_ids += input_ids[st:]
@@ -4236,6 +5426,17 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         video_grid_thw = torch.tensor(video_grid_thw, dtype=torch.long)
         second_per_grids = torch.tensor(second_per_grids, dtype=torch.long)
 
+        # Per-video split metadata, consumed by the joint-video encoder when
+        # ``video_omni_fusion`` is enabled. Returns ``None`` whenever the
+        # omni-fusion toggle is off or no videos were processed; only surfaces
+        # the populated list when both conditions are met. Mirrors the
+        # behaviour of :meth:`VideoProcessor.add_video_input_discrete_or_contiguous`
+        # in ``cognitron_mm/processor/video_processor.py``.
+        if video_omni_fusion and len(video_split) > 0:
+            video_split_out = video_split
+        else:
+            video_split_out = None
+
         if targets is not None:
             return (
                 input_ids,
@@ -4246,30 +5447,15 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                 video_grid_thw,
                 second_per_grids,
                 targets,
+                video_split_out,
             )
 
         if len(images) == 0:
             images = None
             image_indices = None
-
         else:
-            images = torch.cat(images, dim=0)
-            image_indices = torch.cat(image_indices, dim=1)
-
-            image_indices = image_indices.contiguous().to(torch.cuda.current_device())
-            if True:
-                images = (
-                    torch.tensor(images, dtype=torch.float32)
-                    .contiguous()
-                    .to(torch.cuda.current_device())
-                )
-
-            else:
-                images = (
-                    torch.tensor(images, dtype=torch.float16)
-                    .contiguous()
-                    .to(torch.cuda.current_device())
-                )
+            images = torch.cat(images, dim=0).contiguous()
+            image_indices = torch.cat(image_indices, dim=1).contiguous()
 
         if len(audios) == 0:
             audios = None
@@ -4283,9 +5469,8 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
             audio_indices,
             video_grid_thw,
             second_per_grids,
+            video_split_out,
         )
-
-
 
 
 class YoutuVITAImageProcessor(BaseImageProcessor):
@@ -4297,9 +5482,6 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         image_size=448,
         image_size_discrete=None,
         vision_normalize_type="imagenet",
-        vision_resolution_type="native",
-        min_tile_grid=1,
-        max_tile_grid=6,
         image_min_num_tokens=4,
         image_max_num_tokens=256,
         temporal_patch_size=1,
@@ -4312,12 +5494,11 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         super().__init__(**kwargs)
         self.image_size = image_size
         self.image_size_discrete = image_size_discrete
-        self.vision_resolution_type = vision_resolution_type
-        self.min_tile_grid = min_tile_grid
-        self.max_tile_grid = max_tile_grid
-        self.tile_image_size = image_size
         self.image_max_num_tokens = image_max_num_tokens
         self.image_min_num_tokens = image_min_num_tokens
+        self.vision_normalize_type = vision_normalize_type
+        self.vision_tokenizer_path = vision_tokenizer_path
+        self.vision_tokenizer_type = vision_tokenizer_type
 
         GLOBAL_CONSTANTS = get_token()
         if vision_normalize_type == "imagenet":
@@ -4331,41 +5512,9 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         self.mean = MEAN
         self.std = STD
 
-        if self.vision_resolution_type == "anyres":
-            raise NotImplemented
-            self.grid_pinpoints = [
-                (i, j)
-                for i in range(min_tile_grid, max_tile_grid + 1)
-                for j in range(min_tile_grid, max_tile_grid + 1)
-            ]
-            self.possible_resolutions = [
-                [dim * self.tile_image_size for dim in pair] for pair in self.grid_pinpoints
-            ]
-            logger.info(f"{self.grid_pinpoints=}")
-            logger.info(f"{self.possible_resolutions=}")
-
-        if self.vision_resolution_type == "dynamic":
-            max_num = self.max_tile_grid
-            min_num = self.min_tile_grid
-            # calculate the existing image aspect ratio
-            target_ratios = set(
-                (i, j)
-                for n in range(min_num, max_num + 1)
-                for i in range(1, n + 1)
-                for j in range(1, n + 1)
-                if i * j <= max_num and i * j >= min_num
-            )
-            self.target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
-            self.possible_resolutions = [
-                [dim * self.tile_image_size for dim in pair] for pair in self.target_ratios
-            ]
-            logger.info(f"{self.target_ratios=}")
-            logger.info(f"{self.possible_resolutions=}")
-
-        if self.vision_resolution_type == "native":
-            self.min_pixels = (patch_size * spatial_merge_size) ** 2 * image_min_num_tokens
-            self.max_pixels = (patch_size * spatial_merge_size) ** 2 * image_max_num_tokens
-            logger.info(f"{self.min_pixels=} {self.max_pixels=}")
+        self.min_pixels = (patch_size * spatial_merge_size) ** 2 * image_min_num_tokens
+        self.max_pixels = (patch_size * spatial_merge_size) ** 2 * image_max_num_tokens
+        logger.info(f"{self.min_pixels=} {self.max_pixels=}")
 
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
@@ -4451,23 +5600,6 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
 
         return image
 
-    def process_image_to_tiles(self, image_or_path, **kwargs):
-        if self.vision_resolution_type == "anyres":
-            return self.process_anyres(image_or_path)
-        if self.vision_resolution_type == "dynamic":
-            return self.process_dynamic(image_or_path)
-        if self.vision_resolution_type == "native":
-            return self.process_native(image_or_path, **kwargs)
-
-        if isinstance(image_or_path, str):
-            image = PIL.Image.open(image_or_path).convert("RGB")
-        elif isinstance(image_or_path, PIL.Image.Image):
-            image = image_or_path.convert("RGB")
-        else:
-            image = image_or_path
-
-        return self.process_images_to_tensor([image])
-
     def process_image(self, image_or_path, is_discrete=False, is_contiguous=False, **kwargs):
 
         assert not (is_discrete and is_contiguous)
@@ -4506,22 +5638,7 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             return image_data
 
         if is_contiguous:
-            vision_resolution_type = kwargs.get("vision_resolution_type", self.vision_resolution_type)
-            if self.vision_resolution_type == "anyres":
-                return self.process_anyres(image_or_path)
-            if self.vision_resolution_type == "dynamic":
-                return self.process_dynamic(image_or_path)
-            if self.vision_resolution_type == "native":
-                return self.process_native(image_or_path, **kwargs)
-
-            if isinstance(image_or_path, str):
-                image = PIL.Image.open(image_or_path).convert("RGB")
-            elif isinstance(image_or_path, PIL.Image.Image):
-                image = image_or_path.convert("RGB")
-            else:
-                image = image_or_path
-
-            return self.process_images_to_tensor([image])
+            return self.process_native(image_or_path, **kwargs)
 
     def process_images(self, image_or_paths, is_discrete=False, is_contiguous=False, **kwargs):
         images = []
@@ -4547,62 +5664,6 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
     def process_token_to_image(self, image_tokens, **kwargs):
         image_data = self.vision_tokenizer.decode(image_tokens, **kwargs)
         return image_data
-
-    def process_anyres(self, image_or_path):
-        if isinstance(image_or_path, str):
-            image = PIL.Image.open(image_or_path).convert("RGB")
-        elif isinstance(image_or_path, PIL.Image.Image):
-            image = image_or_path.convert("RGB")
-        else:
-            image = image_or_path
-
-        best_resolution = select_best_resolution(image.size, self.possible_resolutions)
-        image_padded = resize_and_pad_image(image, best_resolution)
-        patches = divide_to_patches(image_padded, self.tile_image_size)
-
-        if best_resolution == (self.tile_image_size, self.tile_image_size):
-            image_patches = [image]
-        else:
-            image_patches = [image] + patches
-
-        image_patches, _ = self.process_images_to_tensor(image_patches)
-
-        # print(f"image {image.size} best_resolution {best_resolution} image_padded {image_padded.size} patches {len(patches)} image_patches {image_patches.size()}")
-        return {
-            "images": image_patches,
-            "image_height": best_resolution[1],
-            "image_width": best_resolution[0],
-        }
-
-        return image_patches, best_resolution
-
-    def process_dynamic(self, image_or_path):
-        if isinstance(image_or_path, str):
-            image = PIL.Image.open(image_or_path).convert("RGB")
-        elif isinstance(image_or_path, PIL.Image.Image):
-            image = image_or_path.convert("RGB")
-        else:
-            image = image_or_path
-
-        image_patches, best_resolution = dynamic_preprocess(
-            image,
-            min_num=self.min_tile_grid,
-            max_num=self.max_tile_grid,
-            image_size=self.tile_image_size,
-            use_thumbnail=True,
-        )
-
-        image_data = self.process_images_to_tensor(image_patches)
-        image_patches = image_data["images"]
-
-        # print(f"{image.size()=} {best_resolution=} {image_patches.size()=}")
-        return {
-            "images": image_patches,
-            "image_height": best_resolution[1],
-            "image_width": best_resolution[0],
-        }
-
-        return image_patches, best_resolution
 
     def process_native(self, image_or_path, **kwargs):
         if isinstance(image_or_path, str):
@@ -4739,7 +5800,6 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         image_or_paths,
         tokenizer,
         # image_token_length=256,
-        # use_tile=True,
         discrete_image_idxs=[],
         contiguous_image_idxs=[],
         targets=None,
@@ -4753,13 +5813,6 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
         IMG_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_START_TOKEN)
         IMG_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_END_TOKEN)
         IMG_TAG_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.IMG_TAG_TOKEN)
-
-        if self.vision_resolution_type == "native":
-            pass
-        else:
-            PATCH_CONTEXT_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.PATCH_CONTEXT_TOKEN)
-            PATCH_START_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.PATCH_START_TOKEN)
-            PATCH_END_ID = tokenizer.convert_tokens_to_ids(GLOBAL_CONSTANTS.PATCH_END_TOKEN)
 
         if self.vision_tokenizer.first_vision_token is not None:
             IMG_FIRST_ID = tokenizer.convert_tokens_to_ids(self.vision_tokenizer.first_vision_token)
@@ -4789,7 +5842,6 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
             # --------------------------------------------------------------------------
             # add discrete
             if img_idx in discrete_image_idxs:
-                assert self.vision_resolution_type == "native"
                 image_data = self.process_image(
                     image_or_paths[img_idx],
                     is_contiguous=True,
@@ -4848,18 +5900,15 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                 _image_grid_thw = self.get_image_grid_thw(image_patches)
                 image_grid_thw.extend(_image_grid_thw)
 
-                if self.vision_resolution_type == "native":
-                    images.append(
-                        torch.cat(
-                            [
-                                self.convert_image_to_patches_with_pixel_shuffle(x)
-                                for x in image_patches
-                            ],
-                            dim=0,
-                        )
+                images.append(
+                    torch.cat(
+                        [
+                            self.convert_image_to_patches_with_pixel_shuffle(x)
+                            for x in image_patches
+                        ],
+                        dim=0,
                     )
-                else:
-                    images.append(image_patches)
+                )
 
                 new_input_ids += [IMG_START_ID]
                 if targets is not None:
@@ -4868,78 +5917,49 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                     else:
                         new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
-                if self.vision_resolution_type == "native":
-                    resolution = f"{_image_grid_thw[0][1] * self.patch_size}*{_image_grid_thw[0][2] * self.patch_size}"
-                    size_input_id = tokenizer(resolution, add_special_tokens=False).input_ids
-                    new_input_ids += size_input_id
-                    if targets is not None:
-                        if is_pretrain:
-                            # new_targets += size_input_id
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(size_input_id)
-                        else:
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(size_input_id)
+                resolution = f"{_image_grid_thw[0][1] * self.patch_size}*{_image_grid_thw[0][2] * self.patch_size}"
+                size_input_id = tokenizer(resolution, add_special_tokens=False).input_ids
+                new_input_ids += size_input_id
+                if targets is not None:
+                    if is_pretrain:
+                        # new_targets += size_input_id
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(size_input_id)
+                    else:
+                        new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(size_input_id)
 
-                    new_input_ids += nl_tokens
-                    if targets is not None:
-                        if is_pretrain:
-                            new_targets += [IMG_EOL_ID]
-                        else:
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
+                new_input_ids += nl_tokens
+                if targets is not None:
+                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
 
-                    for _h in range(
-                        _image_grid_thw[0][0] * _image_grid_thw[0][1] // self.spatial_merge_size
-                    ):
-                        image_token_length = _image_grid_thw[0][2] // self.spatial_merge_size
-                        image_indice_b = torch.zeros(
-                            1, image_token_length, dtype=torch.int64
-                        )  # This will change in collate_fn
-                        image_indice_s = (
-                            torch.arange(
-                                len(new_input_ids), len(new_input_ids) + image_token_length
-                            )
-                            .unsqueeze(0)
-                            .repeat(1, 1)
-                        )
-                        image_indice_b_s = torch.stack(
-                            [image_indice_b, image_indice_s], dim=0
-                        )  # 2, num_image, image_length
-                        image_indices.append(image_indice_b_s.view(2, -1))
-
-                        new_input_ids += [IMG_CONTEXT_ID] * image_token_length
-                        if targets is not None:
-                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
-
-                        new_input_ids += nl_tokens
-                        if targets is not None:
-                            if is_pretrain:
-                                new_targets += nl_tokens
-                            else:
-                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
-
-                else:
-                    image_token_length = (
-                        _image_grid_thw[0][0]
-                        * _image_grid_thw[0][1]
-                        * _image_grid_thw[0][2]
-                        // self.spatial_merge_size
-                        // self.spatial_merge_size
-                    )
+                for _h in range(
+                    _image_grid_thw[0][0] * _image_grid_thw[0][1] // self.spatial_merge_size
+                ):
+                    image_token_length = _image_grid_thw[0][2] // self.spatial_merge_size
                     image_indice_b = torch.zeros(
                         1, image_token_length, dtype=torch.int64
                     )  # This will change in collate_fn
                     image_indice_s = (
-                        torch.arange(len(new_input_ids), len(new_input_ids) + image_token_length)
+                        torch.arange(
+                            len(new_input_ids), len(new_input_ids) + image_token_length
+                        )
                         .unsqueeze(0)
                         .repeat(1, 1)
                     )
                     image_indice_b_s = torch.stack(
                         [image_indice_b, image_indice_s], dim=0
                     )  # 2, num_image, image_length
-                    image_indices.append(image_indice_b_s)
+                    image_indices.append(image_indice_b_s.view(2, -1))
 
                     new_input_ids += [IMG_CONTEXT_ID] * image_token_length
                     if targets is not None:
                         new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
+
+                    new_input_ids += nl_tokens
+                    if targets is not None:
+                        if is_pretrain:
+                            new_targets += nl_tokens
+                        else:
+                            new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
 
                 new_input_ids += [IMG_END_ID]
                 if targets is not None:
@@ -4947,49 +5967,6 @@ class YoutuVITAImageProcessor(BaseImageProcessor):
                         new_targets += [IMG_END_ID]
                     else:
                         new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
-
-                if len(image_patches) > 1:
-                    for _ in range(0, best_height, self.tile_image_size):
-                        new_input_ids += nl_tokens
-                        if targets is not None:
-                            if is_pretrain:
-                                new_targets += nl_tokens
-                            else:
-                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * len(nl_tokens)
-
-                        for _ in range(0, best_width, self.tile_image_size):
-                            new_input_ids += [PATCH_START_ID]
-                            if targets is not None:
-                                if is_pretrain:
-                                    new_targets += [PATCH_START_ID]
-                                else:
-                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
-
-                            image_indice_b = torch.zeros(
-                                1, image_token_length, dtype=torch.int64
-                            )  # This will change in collate_fn
-                            image_indice_s = (
-                                torch.arange(
-                                    len(new_input_ids), len(new_input_ids) + image_token_length
-                                )
-                                .unsqueeze(0)
-                                .repeat(1, 1)
-                            )
-                            image_indice_b_s = torch.stack(
-                                [image_indice_b, image_indice_s], dim=0
-                            )  # 2, num_image, image_length
-                            image_indices.append(image_indice_b_s)
-
-                            new_input_ids += [PATCH_CONTEXT_ID] * image_token_length
-                            if targets is not None:
-                                new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID] * image_token_length
-
-                            new_input_ids += [PATCH_END_ID]
-                            if targets is not None:
-                                if is_pretrain:
-                                    new_targets += [PATCH_END_ID]
-                                else:
-                                    new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
             st = img_pos + 1
 
@@ -5118,11 +6095,22 @@ class YoutuVITAProcessor(ProcessorMixin):
     ):
         super().__init__(image_processor, video_processor, feature_extractor, tokenizer, chat_template=chat_template)
 
-        audio_processor = feature_extractor
-        self.audio_processor = audio_processor
+        # ``feature_extractor`` is the audio frontend; expose it under the
+        # ``audio_processor`` name for symmetry with the call paths below. This
+        # alias lives only on ``self`` and is filtered out by
+        # ``ProcessorMixin.to_dict`` (it is neither in ``__init__`` signature
+        # nor in ``get_attributes()``), so it does not leak into
+        # ``processor_config.json``.
+        self.audio_processor = feature_extractor
 
-        video_processor.image_processor = image_processor
-        video_processor.audio_processor = audio_processor
+        # NOTE: We deliberately do NOT mutate ``video_processor`` to attach
+        # ``image_processor`` / ``audio_processor`` on it. Those would be picked
+        # up by ``BaseVideoProcessor.to_dict`` (which serializes
+        # ``__dict__`` wholesale) and produce duplicate copies of the
+        # image/audio configs nested inside the ``video_processor`` block of
+        # ``processor_config.json``. Instead, the sub-processors are passed
+        # explicitly into ``video_processor.add_video_input_discrete_or_contiguous``
+        # in ``__call__`` below.
 
     def __call__(
         self,
@@ -5192,6 +6180,7 @@ class YoutuVITAProcessor(ProcessorMixin):
         if videos:
             if (isinstance(videos, (list, tuple)) and all(isinstance(videos_i, (list, tuple)) for videos_i in videos)):
                 videos = [vid for vid_list in videos for vid in vid_list]
+
             (
                 input_ids,
                 _images,
@@ -5200,28 +6189,92 @@ class YoutuVITAProcessor(ProcessorMixin):
                 audio_indices,
                 image_grid_thw,
                 second_per_grids,
-                # ) = self.video_processor.add_video_input_contiguous(
+                video_split,
             ) = self.video_processor.add_video_input_discrete_or_contiguous(
                 input_ids,
                 videos,
                 self.tokenizer,
+                image_processor=self.image_processor,
+                audio_processor=self.audio_processor,
                 **output_kwargs["videos_kwargs"],
             )
             if _images is not None:
                 logger.debug(f"{len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw.size()=}")
             if _audios is not None:
                 logger.debug(f"{len(input_ids)=} {len(_audios)=} {[x.size() for x in _audios]=} {len(audio_indices)=}")
+            if video_split is not None:
+                logger.debug(f"{video_split=} {len(videos)=}")
 
             if _audios is None:
                 audio_seqlens = None
             else:
                 audio_seqlens = [len(x) for x in _audios]
-            videos_inputs["images"] = _images
-            videos_inputs["image_indices"] = image_indices
-            videos_inputs["audios"] = _audios
-            videos_inputs["audio_indices"] = audio_indices
-            videos_inputs["image_grid_thw"] = image_grid_thw
-            # videos_inputs["second_per_grids"] = second_per_grids
+
+            # The video processor decides whether to populate ``video_split``
+            # (controlled by its ``video_omni_fusion`` toggle, with optional
+            # per-call override via ``videos_kwargs``). We branch on that
+            # signal --- mirroring the dispatch in
+            # ``cognitron_mm/data/preprocess_common.py``: ``video_split is
+            # None`` means the legacy (non-split) flow; otherwise we route
+            # into the dedicated ``video_*`` buffers consumed by the
+            # omni-fusion joint forward path.
+            if video_split is not None and len(video_split) == len(videos):
+                # Cross-video buffer consistency check, kept structurally
+                # identical to ``cognitron_mm/data/preprocess_common.py``.
+                # ``add_video_input_discrete_or_contiguous`` already
+                # guarantees that ``_images`` is either ``None`` or a single
+                # already-concatenated tensor in the ``targets is None``
+                # branch used by the processor, so ``can_split`` will be
+                # ``True`` whenever there is anything to split. The branch
+                # is preserved so the structure matches the upstream
+                # reference and so a future change to the video processor
+                # output contract (e.g. returning a per-video tensor list)
+                # would still fall back safely.
+                if _images is not None:
+                    total_images = sum(s[0] for s in video_split)
+                    total_audios = sum(s[1] for s in video_split)
+
+                    assert image_grid_thw is None or len(image_grid_thw) == total_images, (
+                        f"video_grid_thw rows mismatch: "
+                        f"{0 if image_grid_thw is None else len(image_grid_thw)} vs {total_images}"
+                    )
+                    if _audios is not None:
+                        assert len(_audios) == total_audios, (
+                            f"audios count mismatch: {len(_audios)} vs {total_audios}"
+                        )
+
+                can_split = torch.is_tensor(_images) if _images is not None else False
+                if can_split:
+                    # Joint-encode mode: emit dedicated ``video_*`` keys so
+                    # the model's joint forward path picks them up.
+                    # ``video_audios`` / ``video_audio_indices`` keep the
+                    # list form used by the standalone audio path.
+                    videos_inputs["video_images"] = _images
+                    videos_inputs["video_image_grid_thw"] = image_grid_thw
+                    videos_inputs["video_image_indices"] = image_indices
+                    if _audios is not None:
+                        videos_inputs["video_audios"] = _audios
+                        videos_inputs["video_audio_indices"] = audio_indices
+                    videos_inputs["video_split"] = torch.tensor(video_split, dtype=torch.long)
+                else:
+                    # Fallback: legacy behaviour. Preserves correctness when
+                    # the video processor cannot produce a single
+                    # concatenable image tensor.
+                    videos_inputs["images"] = _images
+                    videos_inputs["image_indices"] = image_indices
+                    videos_inputs["audios"] = _audios
+                    videos_inputs["audio_indices"] = audio_indices
+                    videos_inputs["image_grid_thw"] = image_grid_thw
+            else:
+                # Independent mode (default, current behavior unchanged):
+                # video frames/audio are fed into the standalone image/audio
+                # paths via the ``images`` / ``audios`` keys.
+                videos_inputs["images"] = _images
+                videos_inputs["image_indices"] = image_indices
+                videos_inputs["audios"] = _audios
+                videos_inputs["audio_indices"] = audio_indices
+                videos_inputs["image_grid_thw"] = image_grid_thw
+                # videos_inputs["second_per_grids"] = second_per_grids
 
         input_ids = torch.tensor([input_ids], dtype=torch.long)
         texts_inputs["input_ids"] = input_ids
@@ -5263,9 +6316,13 @@ class YoutuVITAProcessor(ProcessorMixin):
 
 __all__ = [
     "YoutuVITAConfig",
+    "YoutuVITAOmniConfig",
     "YoutuVITAPreTrainedModel",
     "YoutuVITAModel",
     "YoutuVITAForCausalLM",
+    "YoutuVITAOmniPreTrainedModel",
+    "YoutuVITAOmniEncoder",
+    "YoutuVITAOmniModel",
     "YoutuVITAProcessor",
     "YoutuVITAImageProcessor",
     "YoutuVITAVideoProcessor",

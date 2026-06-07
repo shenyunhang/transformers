@@ -18,7 +18,7 @@ from ... import initialization as init
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
-from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
+from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub
 from ...masking_utils import create_causal_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import GradientCheckpointingLayer
@@ -1412,6 +1412,7 @@ class YoutuVITAVisionAttention(nn.Module):
         """Input shape: Batch x Time x Channel"""
 
         seq_length, embed_dim = hidden_states.shape
+        # _, seq_length, embed_dim = hidden_states.shape
 
         queries = self.q_proj(hidden_states)
         keys = self.k_proj(hidden_states)
@@ -1514,6 +1515,7 @@ class YoutuVITAVisionFlashAttention2(nn.Module):
         """Input shape: Batch x Time x Channel"""
 
         seq_length, embed_dim = hidden_states.shape
+        # _, seq_length, embed_dim = hidden_states.shape
 
         queries = self.q_proj(hidden_states)
         keys = self.k_proj(hidden_states)
@@ -1532,11 +1534,26 @@ class YoutuVITAVisionFlashAttention2(nn.Module):
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         if is_aiter_available:
             attn_output = flash_attn_varlen_func(
-                queries, keys, values, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, return_lse=True
+                queries,
+                keys,
+                values,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                causal=self.is_causal,
+                return_lse=True,
             )[0].reshape(seq_length, -1)
         else:
             attn_output = flash_attn_varlen_func(
-                queries, keys, values, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
+                queries,
+                keys,
+                values,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                causal=self.is_causal,
             ).reshape(seq_length, -1)
         attn_output = self.out_proj(attn_output)
         return attn_output, None
@@ -1719,7 +1736,7 @@ class YoutuVITAVisionEncoder(nn.Module):
             # if output_hidden_states:
             #     encoder_states = encoder_states + (hidden_states,)
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
+                hidden_states = self._gradient_checkpointing_func(
                     encoder_layer.__call__,
                     hidden_states,
                     attention_mask,
@@ -1728,7 +1745,7 @@ class YoutuVITAVisionEncoder(nn.Module):
                     position_embeddings,
                 )
             else:
-                layer_outputs = encoder_layer(
+                hidden_states = encoder_layer(
                     hidden_states,
                     attention_mask,
                     # output_attentions=output_attentions,
@@ -1992,7 +2009,7 @@ class YoutuVITAOmniAudioEmbeddings(YoutuVITACNNAudioEmbeddings):
 
 
 class YoutuVITAOmniMLP(nn.Module):
-    """SwiGLU MLP (Qwen3 style). Inherits :class:`Qwen3MLP` directly."""
+    """SwiGLU MLP (Qwen3 style). Inherits :class:`YoutuMLP` directly."""
 
     def __init__(self, config):
         super().__init__()
@@ -2009,47 +2026,63 @@ class YoutuVITAOmniMLP(nn.Module):
         return down_proj
 
 
-@use_kernelized_func(apply_rotary_pos_emb)
 class YoutuVITAOmniFlashAttention2(nn.Module):
     """Packed ``thd``-layout Qwen3-style attention (qk-norm, GQA) that takes
     ``cu_seqlens`` and per-token ``(cos, sin)`` rotary positions.
 
-    Inherits :class:`Qwen3Attention` for the projection layers / qk-norm /
+    Inherits :class:`YoutuAttention` for the projection layers / qk-norm /
     GQA wiring; only the forward path differs (varlen flash attention with
     packed sequences instead of the standard causal LM attention).
     """
 
     def __init__(self, config: YoutuVITAOmniConfig, layer_idx: int = 0):
         super().__init__()
-        self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
+        self.num_heads = config.num_attention_heads
+
+        self.q_lora_rank = config.q_lora_rank
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
+        self.v_head_dim = config.v_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_head_dim = config.qk_head_dim
         # Encoder use-case: bidirectional attention.
         self.is_causal = False
+        if self.q_lora_rank is None:
+            self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
+        else:
+            self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
+            self.q_a_layernorm = YoutuVITATextRMSNorm(config.q_lora_rank)
+            self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        self.kv_a_proj_with_mqa = nn.Linear(
+            config.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=config.attention_bias,
         )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        self.kv_a_layernorm = YoutuVITATextRMSNorm(self.kv_lora_rank)
+        self.kv_b_proj = nn.Linear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
         )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
+
         self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            self.num_heads * self.v_head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
         )
-        self.q_norm = YoutuVITATextRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )  # unlike olmo, only on the head dim!
-        self.k_norm = YoutuVITATextRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )  # thus post q_norm does not need reshape
-        self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+
+        self.scaling = self.qk_head_dim ** (-0.5)
+        if self.config.rope_parameters.get("rope_type", "default") != "default":
+            mscale_all_dim = self.config.rope_parameters.get("mscale_all_dim", 0)
+            scaling_factor = self.config.rope_parameters["factor"]
+            if mscale_all_dim:
+                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
+                self.scaling = self.scaling * mscale * mscale
         # Mirror naming used by :class:`YoutuVITAVisionFlashAttention2`.
         self.dropout = config.attention_dropout
 
@@ -2902,6 +2935,46 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
             return self.omni_model(modality="audio", audios=audios)
         return self.audio_model(audios)
 
+    def _encode_video(
+        self,
+        video_images,
+        video_image_grid_thw,
+        video_audios,
+        video_split,
+        video_image_indices=None,
+        video_audio_indices=None,
+    ):
+        """Joint video encode: same-video vision/audio share an attention
+        window inside the omni encoder. Mirrors
+        ``GPTMMModel._preprocess`` joint-video branch in
+        ``vita_megatron/core/models/multimodal/gpt_mm_model.py``.
+
+        ``video_image_indices`` / ``video_audio_indices`` are the same scatter
+        indices already produced by the processor for writing encoder outputs
+        back into ``inputs_embeds``. Forwarding them to the omni encoder lets
+        :meth:`YoutuVITAOmniModel.forward_video` recover the real temporal
+        interleave order between image frames and audio chunks of the same
+        video (the order written into ``input_ids`` by the processor),
+        replacing the legacy ``divmod`` heuristic.
+
+        Returns ``(video_image_embeds, video_audio_embeds, video_audio_lens)``.
+        """
+        if self.omni_model is None:
+            raise ValueError(
+                "YoutuVITAModel: video joint encoding requires `omni_model`, "
+                "but it is not configured. Either disable `video_omni_fusion` "
+                "in the processor or load a checkpoint with `omni_config`."
+            )
+        return self.omni_model(
+            modality="video",
+            video_images=video_images,
+            video_image_grid_thw=video_image_grid_thw,
+            video_audios=video_audios,
+            video_split=video_split,
+            video_image_indices=video_image_indices,
+            video_audio_indices=video_audio_indices,
+        )
+
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -2911,6 +2984,13 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
         image_grid_thw: torch.LongTensor | None = None,
         audios: torch.FloatTensor | None = None,
         audio_indices: torch.LongTensor | None = None,
+        # video_omni_fusion joint path
+        video_images: torch.FloatTensor | None = None,
+        video_image_grid_thw: torch.LongTensor | None = None,
+        video_image_indices: torch.LongTensor | None = None,
+        video_audios: list | None = None,
+        video_audio_indices: list | None = None,
+        video_split: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
@@ -3066,6 +3146,54 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
                 inputs_embeds[indices_b.view(-1), indices_s.view(-1)] = audio_embeds_.view(-1, audio_embeds_.shape[-1])
             # inputs_embeds = inputs_embeds + audio_embeds.mean() * 0.0
 
+        # ------------------------------------------------------------------
+        # Joint video path: same-video vision/audio go through the shared
+        # omni encoder together (mirrors ``GPTMMModel._preprocess`` joint
+        # branch and ``LanguageModelEmbedding.forward`` independent
+        # ``video_*`` scatter in
+        # ``vita_megatron/core/models/common/embeddings/language_model_embedding.py``).
+        # ------------------------------------------------------------------
+        if video_split is not None and video_split.numel() > 0:
+            device = inputs_embeds.device
+            dtype = inputs_embeds.dtype
+            video_images = video_images.to(dtype).to(device)
+            video_image_grid_thw = video_image_grid_thw.to(device)
+            if video_audios is not None:
+                video_audios = [x.to(dtype).to(device) for x in video_audios]
+            video_split_dev = video_split.to(device)
+
+            # Forward the scatter indices to the omni encoder so the joint
+            # forward path can recover the real temporal interleave between
+            # image frames and audio chunks (matching the processor's
+            # ``input_ids`` write order). Indices are kept on CPU here; the
+            # encoder only reads ``[1, ...]`` (seq positions).
+            video_image_embeds, video_audio_embeds, video_audio_lens = self._encode_video(
+                video_images=video_images,
+                video_image_grid_thw=video_image_grid_thw,
+                video_audios=video_audios,
+                video_split=video_split_dev,
+                video_image_indices=video_image_indices,
+                video_audio_indices=video_audio_indices,
+            )
+
+            # Independent scatter for video vision tokens.
+            if video_image_indices is not None and video_image_indices.numel() > 0 and video_image_embeds.numel() > 0:
+                inputs_embeds = inputs_embeds.clone()
+                video_image_embeds = video_image_embeds.to(inputs_embeds.device)
+                v_idx = video_image_indices.to(inputs_embeds.device)
+                v_indices_b, v_indices_s = v_idx.unbind(dim=0)
+                inputs_embeds[v_indices_b.view(-1), v_indices_s.view(-1)] = video_image_embeds.view(
+                    -1, video_image_embeds.shape[-1]
+                )
+
+            # Independent scatter for video audio tokens.
+            if video_audio_indices is not None and len(video_audio_indices) > 0 and video_audio_embeds.numel() > 0:
+                inputs_embeds = inputs_embeds.clone()
+                for v_aud_emb, v_aud_len, v_aud_idx in zip(video_audio_embeds, video_audio_lens, video_audio_indices):
+                    v_aud_emb = v_aud_emb[: int(v_aud_len), ...].to(inputs_embeds.device)
+                    indices_b, indices_s = v_aud_idx.to(inputs_embeds.device).unbind(dim=0)
+                    inputs_embeds[indices_b.view(-1), indices_s.view(-1)] = v_aud_emb.view(-1, v_aud_emb.shape[-1])
+
         return self.language_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -3101,6 +3229,13 @@ class YoutuVITAForCausalLM(YoutuVITAPreTrainedModel, GenerationMixin):
         image_grid_thw: torch.LongTensor | None = None,
         audios: torch.FloatTensor | None = None,
         audio_indices: torch.LongTensor | None = None,
+        # video_omni_fusion joint path
+        video_images: torch.FloatTensor | None = None,
+        video_image_grid_thw: torch.LongTensor | None = None,
+        video_image_indices: torch.LongTensor | None = None,
+        video_audios: list | None = None,
+        video_audio_indices: list | None = None,
+        video_split: torch.LongTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
@@ -3135,6 +3270,12 @@ class YoutuVITAForCausalLM(YoutuVITAPreTrainedModel, GenerationMixin):
             image_grid_thw=image_grid_thw,
             audios=audios,
             audio_indices=audio_indices,
+            video_images=video_images,
+            video_image_grid_thw=video_image_grid_thw,
+            video_image_indices=video_image_indices,
+            video_audios=video_audios,
+            video_audio_indices=video_audio_indices,
+            video_split=video_split,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
@@ -3169,34 +3310,65 @@ class YoutuVITAForCausalLM(YoutuVITAPreTrainedModel, GenerationMixin):
         attention_mask: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         cache_position: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         images: torch.FloatTensor | None = None,
         image_indices: torch.LongTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         audios: torch.FloatTensor | None = None,
         audio_indices: torch.LongTensor | None = None,
+        video_images: torch.FloatTensor | None = None,
+        video_image_grid_thw: torch.LongTensor | None = None,
+        video_image_indices: torch.LongTensor | None = None,
+        video_audios: list | None = None,
+        video_audio_indices: list | None = None,
+        video_split: torch.LongTensor | None = None,
         is_first_iteration: bool | None = False,
         **kwargs,
     ):
+        # Overwritten -- in specific circumstances we don't want to forward image/audio/video inputs to the model
+
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
+            position_ids=position_ids,
             use_cache=use_cache,
             images=images,
             image_indices=image_indices,
             image_grid_thw=image_grid_thw,
             audios=audios,
             audio_indices=audio_indices,
+            video_images=video_images,
+            video_image_grid_thw=video_image_grid_thw,
+            video_image_indices=video_image_indices,
+            video_audios=video_audios,
+            video_audio_indices=video_audio_indices,
+            video_split=video_split,
             is_first_iteration=is_first_iteration,
             **kwargs,
         )
 
+        # After the prefill step the multimodal features have been written into the KV cache,
+        # so during decode steps we must clear ALL multimodal tensors (raw inputs, scatter
+        # indices and grid metadata) to avoid re-encoding and mismatched scatter writes.
         if not is_first_iteration and use_cache:
-            model_inputs["images"] = None
-            model_inputs["audios"] = None
+            for key in (
+                "images",
+                "image_indices",
+                "image_grid_thw",
+                "audios",
+                "audio_indices",
+                "video_images",
+                "video_image_grid_thw",
+                "video_image_indices",
+                "video_audios",
+                "video_audio_indices",
+                "video_split",
+            ):
+                model_inputs[key] = None
 
         return model_inputs
 
@@ -3474,4 +3646,11 @@ class YoutuVITAAudioKwargs(AudioKwargs, total=False):
     # audio_tokenizer_path: str
 
 
-__all__ = ["YoutuVITAPreTrainedModel", "YoutuVITAModel", "YoutuVITAForCausalLM"]
+__all__ = [
+    "YoutuVITAPreTrainedModel",
+    "YoutuVITAModel",
+    "YoutuVITAForCausalLM",
+    "YoutuVITAOmniPreTrainedModel",
+    "YoutuVITAOmniEncoder",
+    "YoutuVITAOmniModel",
+]

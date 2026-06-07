@@ -25,7 +25,6 @@ class YoutuVITAImagesKwargs(ImagesKwargs, total=False):
     discrete_image_idxs: list
     contiguous_image_idxs: list
 
-    vision_resolution_type: str
     vision_normalize_type: str
     image_min_num_tokens: int
     image_max_num_tokens: int
@@ -34,7 +33,6 @@ class YoutuVITAImagesKwargs(ImagesKwargs, total=False):
 class YoutuVITAVideosKwargs(VideosKwargs, total=False):
     """ """
 
-    vision_resolution_type: str
     video_min_num_tokens: int
     video_max_num_tokens: int
     video_image_min_num_tokens: int
@@ -46,6 +44,11 @@ class YoutuVITAVideosKwargs(VideosKwargs, total=False):
     video_key_frame: bool
     use_audio_in_video: bool
     use_vision_in_video: bool
+    # When True, video frames+audio of the same video are jointly encoded by
+    # ``YoutuVITAOmniModel.forward_video`` so they can attend to each other.
+    # When False (default), video frames/audio fall back to the standalone
+    # image/audio paths.
+    video_omni_fusion: bool
 
 
 class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
@@ -59,24 +62,23 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
             "padding_side": "left",
         },
         "images_kwargs": {
-            "vision_resolution_type": "native",
-            "vision_normalize_type": "siglip",
-            "image_min_num_tokens": 4,
-            "image_max_num_tokens": 8192,
+            # "vision_normalize_type": "siglip",
+            # "image_min_num_tokens": 4,
+            # "image_max_num_tokens": 8192,
         },
         "videos_kwargs": {
-            "vision_resolution_type": "native",
-            "video_min_num_tokens": 64,
-            "video_max_num_tokens": 8192,
-            "video_image_min_num_tokens": 4,
-            "video_image_max_num_tokens": 256,
-            "video_max_num_frames": 64,
-            "temporal_patch_size": 1,
-            "spatial_merge_size": 2,
-            "patch_size": 16,
-            "video_key_frame": False,
-            "use_audio_in_video": True,
-            "use_vision_in_video": True,
+            # "video_min_num_tokens": 64,
+            # "video_max_num_tokens": 8192,
+            # "video_image_min_num_tokens": 4,
+            # "video_image_max_num_tokens": 256,
+            # "video_max_num_frames": 64,
+            # "temporal_patch_size": 1,
+            # "spatial_merge_size": 2,
+            # "patch_size":16,
+            # "video_key_frame": False,
+            # "use_audio_in_video": True,
+            # "use_vision_in_video": True,
+            # "video_omni_fusion": False,
         },
         "audio_kwargs": {
             "sampling_rate": 16000,
@@ -93,11 +95,22 @@ class YoutuVITAProcessor(ProcessorMixin):
     ):
         super().__init__(image_processor, video_processor, feature_extractor, tokenizer, chat_template=chat_template)
 
-        audio_processor = feature_extractor
-        self.audio_processor = audio_processor
+        # ``feature_extractor`` is the audio frontend; expose it under the
+        # ``audio_processor`` name for symmetry with the call paths below. This
+        # alias lives only on ``self`` and is filtered out by
+        # ``ProcessorMixin.to_dict`` (it is neither in ``__init__`` signature
+        # nor in ``get_attributes()``), so it does not leak into
+        # ``processor_config.json``.
+        self.audio_processor = feature_extractor
 
-        video_processor.image_processor = image_processor
-        video_processor.audio_processor = audio_processor
+        # NOTE: We deliberately do NOT mutate ``video_processor`` to attach
+        # ``image_processor`` / ``audio_processor`` on it. Those would be picked
+        # up by ``BaseVideoProcessor.to_dict`` (which serializes
+        # ``__dict__`` wholesale) and produce duplicate copies of the
+        # image/audio configs nested inside the ``video_processor`` block of
+        # ``processor_config.json``. Instead, the sub-processors are passed
+        # explicitly into ``video_processor.add_video_input_discrete_or_contiguous``
+        # in ``__call__`` below.
 
     def __call__(
         self,
@@ -171,6 +184,7 @@ class YoutuVITAProcessor(ProcessorMixin):
         if videos:
             if isinstance(videos, (list, tuple)) and all(isinstance(videos_i, (list, tuple)) for videos_i in videos):
                 videos = [vid for vid_list in videos for vid in vid_list]
+
             (
                 input_ids,
                 _images,
@@ -179,28 +193,90 @@ class YoutuVITAProcessor(ProcessorMixin):
                 audio_indices,
                 image_grid_thw,
                 second_per_grids,
-                # ) = self.video_processor.add_video_input_contiguous(
+                video_split,
             ) = self.video_processor.add_video_input_discrete_or_contiguous(
                 input_ids,
                 videos,
                 self.tokenizer,
+                image_processor=self.image_processor,
+                audio_processor=self.audio_processor,
                 **output_kwargs["videos_kwargs"],
             )
             if _images is not None:
                 logger.debug(f"{len(input_ids)=} {_images.size()=} {image_indices.size()=} {image_grid_thw.size()=}")
             if _audios is not None:
                 logger.debug(f"{len(input_ids)=} {len(_audios)=} {[x.size() for x in _audios]=} {len(audio_indices)=}")
+            if video_split is not None:
+                logger.debug(f"{video_split=} {len(videos)=}")
 
             if _audios is None:
                 audio_seqlens = None
             else:
                 audio_seqlens = [len(x) for x in _audios]
-            videos_inputs["images"] = _images
-            videos_inputs["image_indices"] = image_indices
-            videos_inputs["audios"] = _audios
-            videos_inputs["audio_indices"] = audio_indices
-            videos_inputs["image_grid_thw"] = image_grid_thw
-            # videos_inputs["second_per_grids"] = second_per_grids
+
+            # The video processor decides whether to populate ``video_split``
+            # (controlled by its ``video_omni_fusion`` toggle, with optional
+            # per-call override via ``videos_kwargs``). We branch on that
+            # signal --- mirroring the dispatch in
+            # ``cognitron_mm/data/preprocess_common.py``: ``video_split is
+            # None`` means the legacy (non-split) flow; otherwise we route
+            # into the dedicated ``video_*`` buffers consumed by the
+            # omni-fusion joint forward path.
+            if video_split is not None and len(video_split) == len(videos):
+                # Cross-video buffer consistency check, kept structurally
+                # identical to ``cognitron_mm/data/preprocess_common.py``.
+                # ``add_video_input_discrete_or_contiguous`` already
+                # guarantees that ``_images`` is either ``None`` or a single
+                # already-concatenated tensor in the ``targets is None``
+                # branch used by the processor, so ``can_split`` will be
+                # ``True`` whenever there is anything to split. The branch
+                # is preserved so the structure matches the upstream
+                # reference and so a future change to the video processor
+                # output contract (e.g. returning a per-video tensor list)
+                # would still fall back safely.
+                if _images is not None:
+                    total_images = sum(s[0] for s in video_split)
+                    total_audios = sum(s[1] for s in video_split)
+
+                    assert image_grid_thw is None or len(image_grid_thw) == total_images, (
+                        f"video_grid_thw rows mismatch: "
+                        f"{0 if image_grid_thw is None else len(image_grid_thw)} vs {total_images}"
+                    )
+                    if _audios is not None:
+                        assert len(_audios) == total_audios, f"audios count mismatch: {len(_audios)} vs {total_audios}"
+
+                can_split = torch.is_tensor(_images) if _images is not None else False
+                if can_split:
+                    # Joint-encode mode: emit dedicated ``video_*`` keys so
+                    # the model's joint forward path picks them up.
+                    # ``video_audios`` / ``video_audio_indices`` keep the
+                    # list form used by the standalone audio path.
+                    videos_inputs["video_images"] = _images
+                    videos_inputs["video_image_grid_thw"] = image_grid_thw
+                    videos_inputs["video_image_indices"] = image_indices
+                    if _audios is not None:
+                        videos_inputs["video_audios"] = _audios
+                        videos_inputs["video_audio_indices"] = audio_indices
+                    videos_inputs["video_split"] = torch.tensor(video_split, dtype=torch.long)
+                else:
+                    # Fallback: legacy behaviour. Preserves correctness when
+                    # the video processor cannot produce a single
+                    # concatenable image tensor.
+                    videos_inputs["images"] = _images
+                    videos_inputs["image_indices"] = image_indices
+                    videos_inputs["audios"] = _audios
+                    videos_inputs["audio_indices"] = audio_indices
+                    videos_inputs["image_grid_thw"] = image_grid_thw
+            else:
+                # Independent mode (default, current behavior unchanged):
+                # video frames/audio are fed into the standalone image/audio
+                # paths via the ``images`` / ``audios`` keys.
+                videos_inputs["images"] = _images
+                videos_inputs["image_indices"] = image_indices
+                videos_inputs["audios"] = _audios
+                videos_inputs["audio_indices"] = audio_indices
+                videos_inputs["image_grid_thw"] = image_grid_thw
+                # videos_inputs["second_per_grids"] = second_per_grids
 
         input_ids = torch.tensor([input_ids], dtype=torch.long)
         texts_inputs["input_ids"] = input_ids
