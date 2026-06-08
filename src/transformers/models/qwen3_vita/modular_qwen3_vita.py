@@ -2551,48 +2551,39 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
             image_token_cursor_text += sum(tokens_per_frame_text)
 
             # ---- materialise one or more attention groups for this video ----
-            # When ``self.config.video_group_attention`` is True, partition
-            # ``ordered_events`` into groups following the rule:
-            #   * the first group may start with audio(s) (a leading audio
-            #     run is absorbed into the first group);
+            # When ``self.config.video_group_attention`` is True AND the video
+            # contains BOTH image and audio events, partition ``ordered_events``
+            # into groups by the modality-boundary rule:
+            #   * the first group may start with audio(s); a leading audio run
+            #     is absorbed into the first group (it stays one contiguous
+            #     group, not split per chunk);
             #   * every *subsequent* group starts with image(s);
             #   * a new group begins whenever an image directly follows an
             #     audio (i.e. ``A → I`` boundary);
-            #   * a trailing image-only run becomes its own group;
-            #   * if a video has no audio at all, every image is its own
-            #     group;
-            #   * if a video has no image at all, every audio is its own
-            #     group.
-            # When the flag is False (default), the whole video stays in a
-            # single attention segment (the original behaviour).
-            if self.config.video_group_attention:
-                has_image_in_video = any(m == 0 for m, _ in ordered_events)
-                has_audio_in_video = any(m == 1 for m, _ in ordered_events)
+            #   * a trailing image-only run becomes its own group.
+            # When the flag is False (default) — or when the video is
+            # single-modality (image-only or audio-only) — the whole video
+            # stays in a single attention segment. Single-modality videos do
+            # not have any modality boundary to split at, so the
+            # boundary-based rule is undefined for them; falling back to a
+            # single group preserves intra-modality global context (matching
+            # ``video_group_attention=False`` for those videos).
+            has_image_in_video = any(m == 0 for m, _ in ordered_events)
+            has_audio_in_video = any(m == 1 for m, _ in ordered_events)
+            if (
+                self.config.video_group_attention
+                and has_image_in_video
+                and has_audio_in_video
+            ):
                 event_groups: list[list[tuple[int, int]]] = []
                 current_group: list[tuple[int, int]] = []
                 prev_modality: Optional[int] = None
                 for modality_kind, idx in ordered_events:
-                    # Start a new group when one of:
-                    #   * mixed modality: this event is an image and the
-                    #     previous one was an audio (``A → I`` boundary);
-                    #   * pure-image video: this event is an image and not
-                    #     the very first event (one image per group);
-                    #   * pure-audio video: this event is an audio and not
-                    #     the very first event (one audio per group).
-                    start_new_group = (
-                        (modality_kind == 0 and prev_modality == 1)
-                        or (
-                            not has_audio_in_video
-                            and modality_kind == 0
-                            and prev_modality is not None
-                        )
-                        or (
-                            not has_image_in_video
-                            and modality_kind == 1
-                            and prev_modality is not None
-                        )
-                    )
-                    if start_new_group:
+                    # Start a new group at every ``A → I`` boundary (image
+                    # directly following an audio chunk). All other adjacent
+                    # transitions (``I → I``, ``I → A``, ``A → A``) keep
+                    # accumulating into the current group.
+                    if modality_kind == 0 and prev_modality == 1:
                         event_groups.append(current_group)
                         current_group = []
                     current_group.append((modality_kind, idx))
@@ -2740,7 +2731,7 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
         has_audio = audios is not None
         has_video = video_split is not None and video_split.numel() > 0
 
-        if modality == "video" or (has_video and modality is None):
+        if modality == "video":
             return self.forward_video(
                 video_images=video_images,
                 video_image_grid_thw=video_image_grid_thw,
@@ -2749,21 +2740,20 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                 video_image_indices=video_image_indices,
                 video_audio_indices=video_audio_indices,
             )
+        
+        # if modality == "video":
+        #     v = self.forward_vision(video_images, video_image_grid_thw)
+        #     a, a_len = self.forward_audio(video_audios)
+        #     return v, a, a_len
 
-        if modality == "vision" or (has_vision and not has_audio):
+        elif modality == "vision":
             return self.forward_vision(pixel_values, image_grid_thw)
 
-        if modality == "audio" or (has_audio and not has_vision):
+        elif modality == "audio":
             return self.forward_audio(audios)
 
-        if has_vision and has_audio:
-            v = self.forward_vision(pixel_values, image_grid_thw)
-            a, a_len = self.forward_audio(audios)
-            return {"vision": v, "audio": (a, a_len)}
-
         raise ValueError(
-            "Qwen3VITAOmniModel.forward requires at least one of (pixel_values, image_grid_thw), "
-            "(audios,), or (video_images, video_image_grid_thw, video_split)."
+            "Qwen3VITAOmniModel.forward could not dispatch for {modality=}."
         )
 
 
