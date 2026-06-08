@@ -2154,7 +2154,7 @@ class Qwen3VITAOmniEncoder(Qwen3VITAOmniPreTrainedModel):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens,
         rotary_pos_emb: torch.Tensor,
     ) -> BaseModelOutput:
         """Run the transformer body on packed features.
@@ -2162,6 +2162,13 @@ class Qwen3VITAOmniEncoder(Qwen3VITAOmniPreTrainedModel):
         Args:
             hidden_states: ``[seq_len, hidden]`` already-projected features.
             cu_seqlens: cumulative sequence lengths (``thd`` varlen format).
+                Either a single ``Tensor`` shared across every transformer
+                layer, or a ``list`` of length ``num_hidden_layers`` with
+                one ``Tensor`` per layer (mirrors the megatron
+                ``patch_per_layer_packed_seq_params`` dispatch). Used by
+                :meth:`Qwen3VITAOmniModel.forward_video` to apply
+                different fusion / non-fusion segmentations on different
+                layers via ``video_fusion_layer_freq``.
             rotary_pos_emb: ``[seq_len, head_dim]`` rotary positions (already
                 concatenated for both ``h`` and ``w`` / duplicated for audio).
         """
@@ -2171,18 +2178,23 @@ class Qwen3VITAOmniEncoder(Qwen3VITAOmniPreTrainedModel):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
-        for layer in self.layers:
+        per_layer_cu_seqlens = isinstance(cu_seqlens, list)
+        if per_layer_cu_seqlens and len(cu_seqlens) != len(self.layers):
+            raise ValueError(f"per-layer cu_seqlens length {len(cu_seqlens)} != num_hidden_layers {len(self.layers)}")
+
+        for layer_idx, layer in enumerate(self.layers):
+            layer_cu_seqlens = cu_seqlens[layer_idx] if per_layer_cu_seqlens else cu_seqlens
             if self.gradient_checkpointing and self.training:
                 hidden_states = self._gradient_checkpointing_func(
                     layer.__call__,
                     hidden_states,
-                    cu_seqlens,
+                    layer_cu_seqlens,
                     position_embeddings,
                 )
             else:
                 hidden_states = layer(
                     hidden_states=hidden_states,
-                    cu_seqlens=cu_seqlens,
+                    cu_seqlens=layer_cu_seqlens,
                     position_embeddings=position_embeddings,
                 )
 
@@ -2208,6 +2220,45 @@ class Qwen3VITAOmniAudioPatchMerger(Qwen3VITAAudioPatchMerger):
 
     def __init__(self, config: Qwen3VITAOmniConfig) -> None:
         super().__init__(config)
+
+
+def _normalize_video_fusion_layer_pattern(video_fusion_layer_freq, num_layers: int) -> list:
+    """Normalize ``Qwen3VITAOmniConfig.video_fusion_layer_freq`` into a
+    ``list[bool]`` of length ``num_layers``. Mirrors the parsing used on
+    the megatron side (see ``MegatronOmniModel.__init__``).
+
+    Accepted ``video_fusion_layer_freq`` shapes:
+        * ``None``     -> all-fusion (legacy behaviour).
+        * ``int N``    -> moe-style 1:N ratio (layer ``i`` is fusion iff
+                          ``i % N == 0``); ``N <= 0`` is treated as 1.
+        * ``list[int]`` of length ``num_layers`` -> explicit 0/1 mask.
+
+    Raises ``ValueError`` on length mismatch or invalid entries so config
+    bugs surface immediately rather than silently misaligning the
+    per-layer attention windows.
+    """
+    if video_fusion_layer_freq is None:
+        return [True] * num_layers
+    if isinstance(video_fusion_layer_freq, bool):
+        # ``bool`` is a subclass of ``int``; reject so that
+        # ``video_fusion_layer_freq=True`` does not silently turn into 1.
+        raise ValueError(f"video_fusion_layer_freq must be int / list / None, got bool {video_fusion_layer_freq!r}")
+    if isinstance(video_fusion_layer_freq, int):
+        n = max(int(video_fusion_layer_freq), 1)
+        return [(i % n == 0) for i in range(num_layers)]
+    if isinstance(video_fusion_layer_freq, (list, tuple)):
+        if len(video_fusion_layer_freq) != num_layers:
+            raise ValueError(
+                f"video_fusion_layer_freq length {len(video_fusion_layer_freq)} != "
+                f"omni encoder num_hidden_layers {num_layers}"
+            )
+        for v in video_fusion_layer_freq:
+            if v not in (0, 1, True, False):
+                raise ValueError(f"video_fusion_layer_freq entries must be 0/1, got {v!r}")
+        return [bool(v) for v in video_fusion_layer_freq]
+    raise ValueError(
+        f"video_fusion_layer_freq must be int / list / None, got {type(video_fusion_layer_freq).__name__}"
+    )
 
 
 class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
@@ -2240,6 +2291,22 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
         # Modality-specific post-encoder mergers + projectors.
         self.vision_merger = Qwen3VITAOmniVisionPatchMerger(config)
         self.audio_merger = Qwen3VITAOmniAudioPatchMerger(config)
+
+        # Per-layer video fusion mask. Mirrors the megatron-side
+        # ``--video-fusion-layer-freq`` (parsed in
+        # ``MegatronOmniModel.__init__``). Normalize the raw config value
+        # (``None`` / ``int`` / ``list``) into a ``list[bool]`` of length
+        # ``num_hidden_layers`` once. ``True`` = fusion layer (image+audio
+        # share an attention window; segmentation follows
+        # ``config.video_group_attention``); ``False`` = non-fusion layer
+        # (each image / audio chunk is its own attention window).
+        self._video_fusion_layer_pattern = _normalize_video_fusion_layer_pattern(
+            config.video_fusion_layer_freq,
+            int(config.num_hidden_layers),
+        )
+        # Fast-path flag: when every layer is a fusion layer, ``forward_video``
+        # can fall back to a single ``cu_seqlens`` tensor (legacy path).
+        self._has_nofusion_layer = not all(self._video_fusion_layer_pattern)
 
         self.post_init()
 
@@ -2366,6 +2433,28 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
             * ``video_audio_embeddings``: ``[N_audios, max_S_after_merge,
               out_hidden_size]``
             * ``video_audio_lens_after_merge``: ``[N_audios]``
+
+        Notes:
+            Per-layer fusion mask
+            ~~~~~~~~~~~~~~~~~~~~~
+            ``self.config.video_fusion_layer_freq`` (parsed in
+            ``__init__`` into ``self._video_fusion_layer_pattern``)
+            controls the segmentation used by each transformer layer of
+            the omni encoder:
+
+            * Fusion layer (mask entry ``1``, default): each video
+              produces one or more attention segments according to
+              ``self.config.video_group_attention``. Image and audio
+              tokens of the same video can attend to each other within
+              the same segment.
+            * Non-fusion layer (mask entry ``0``): each image-chunk and
+              each audio-chunk becomes its own attention segment, so
+              attention is fully isolated per chunk regardless of
+              ``video_group_attention``.
+
+            Both segmentations are built once over the same packed
+            feature sequence and then dispatched per-layer inside
+            :meth:`Qwen3VITAOmniEncoder.forward`.
         """
         if video_split is None or video_split.numel() == 0:
             raise ValueError(
@@ -2446,6 +2535,13 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
         segment_features = []
         segment_rotary = []
         segment_lengths = []
+        # Per-event segment lengths (one entry per image-chunk / audio-chunk)
+        # in the same order as ``segment_features`` rows. Used to build the
+        # *non-fusion* ``cu_seqlens`` for layers where each image / audio
+        # chunk must be its own attention window. Populated regardless of
+        # the per-layer fusion pattern so the loop stays branch-free; only
+        # consumed when at least one layer is non-fusion.
+        nofusion_segment_lengths = []
         segment_modality_masks = []  # True = vision, False = audio
         per_video_audio_chunk_lens = []
 
@@ -2672,6 +2768,11 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                             device=device,
                         )
                     )
+                    # Each event is its own attention window in the
+                    # non-fusion path; record its length here -- the
+                    # iteration order matches the packed feature row
+                    # order regardless of how events were grouped.
+                    nofusion_segment_lengths.append(int(feat.size(0)))
                 group_features_tensor = torch.cat(group_features_list, dim=0)
                 group_rotary_tensor = torch.cat(group_rotary_list, dim=0)
                 group_mask_tensor = torch.cat(group_mask_list, dim=0)
@@ -2694,11 +2795,35 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
         packed_rotary = torch.cat(segment_rotary, dim=0)
         packed_modality_mask = torch.cat(segment_modality_masks, dim=0)
 
-        cu_seqlens = torch.nn.functional.pad(
+        cu_seqlens_fusion = torch.nn.functional.pad(
             torch.tensor(segment_lengths, dtype=torch.int32, device=device).cumsum(dim=0, dtype=torch.int32),
             (1, 0),
             value=0,
         )
+
+        # Per-layer fusion mask. When at least one layer is non-fusion we
+        # also build a separate ``cu_seqlens`` that splits each image /
+        # audio chunk into its own attention window, then assemble a list
+        # of length ``num_hidden_layers`` to feed
+        # :meth:`Qwen3VITAOmniEncoder.forward` (resolved per-layer in the
+        # encoder's own loop). When every layer is fusion (the common
+        # case / legacy behaviour), pass a single tensor so no extra
+        # dispatch overhead is incurred. Mirrors
+        # ``MegatronOmniModel.forward_video`` in
+        # ``vita_megatron/core/models/omni/omni_model.py``.
+        if self._has_nofusion_layer:
+            cu_seqlens_nofusion = torch.nn.functional.pad(
+                torch.tensor(nofusion_segment_lengths, dtype=torch.int32, device=device).cumsum(
+                    dim=0, dtype=torch.int32
+                ),
+                (1, 0),
+                value=0,
+            )
+            cu_seqlens = [
+                cu_seqlens_fusion if fusion else cu_seqlens_nofusion for fusion in self._video_fusion_layer_pattern
+            ]
+        else:
+            cu_seqlens = cu_seqlens_fusion
 
         # 4. Run the shared transformer once over the packed sequence.
         encoder_output = self.encoder(

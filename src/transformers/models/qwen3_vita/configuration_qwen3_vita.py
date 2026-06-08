@@ -5,6 +5,7 @@
 #                          modular_qwen3_vita.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 
+
 from huggingface_hub.dataclasses import strict
 
 from ...configuration_utils import PreTrainedConfig
@@ -245,6 +246,21 @@ class Qwen3VITAOmniConfig(Qwen3VITATextConfig):
     # joint encoder, so attention is restricted to images / audios that belong
     # to the same group. See :meth:`Qwen3VITAOmniModel.forward_video`.
     video_group_attention: bool = False
+    # Per-omni-encoder-layer mask controlling which layers apply video fusion
+    # attention. Mirrors the megatron-side ``--video-fusion-layer-freq`` arg.
+    # Accepted values:
+    #   * ``None`` (default) -- every layer is a fusion layer (legacy
+    #     behaviour: image + audio of the same video share an attention
+    #     window inside every layer).
+    #   * ``int N`` -- moe-style 1:N ratio, layer ``i`` is fusion iff
+    #     ``i % N == 0``.
+    #   * ``list[int]`` of length ``num_hidden_layers`` -- explicit 0/1
+    #     mask. ``1`` = fusion layer (segmentation follows
+    #     ``video_group_attention``); ``0`` = non-fusion layer (each image
+    #     and each audio chunk is its own attention window).
+    # Only used by :meth:`Qwen3VITAOmniModel.forward_video`; non-video
+    # paths already encode each image / audio independently.
+    video_fusion_layer_freq: int | list | None = None
 
 
 class Qwen3VITAConfig(PreTrainedConfig):
