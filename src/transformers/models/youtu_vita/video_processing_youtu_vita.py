@@ -61,7 +61,6 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         temporal_merge_size=1,
         patch_size=14,
         video_key_frame=False,
-        video_omni_fusion=False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -94,11 +93,6 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         self.sampling_rate = 16000
 
         self.video_key_frame = video_key_frame
-        # When ``video_omni_fusion`` is False, ``add_video_input_discrete_or_contiguous``
-        # always returns ``video_split=None`` so upstream code falls back to the
-        # legacy (non-split) flow. When True, the per-video ``(num_images, num_audios)``
-        # tuples are surfaced and the joint-encode path is taken downstream.
-        self.video_omni_fusion = video_omni_fusion
 
     def get_video_frames(self, vid_path, video_max_fps=1, video_max_num_frames=8):
         vid = decord.VideoReader(vid_path, num_threads=1)
@@ -418,7 +412,6 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         use_vision_in_video = kwargs.get("use_vision_in_video", self.use_vision_in_video)
         video_audio_chunk_min_second = kwargs.get("video_audio_chunk_min_second", self.video_audio_chunk_min_second)
         video_audio_chunk_max_second = kwargs.get("video_audio_chunk_max_second", self.video_audio_chunk_max_second)
-        video_omni_fusion = kwargs.get("video_omni_fusion", self.video_omni_fusion)
 
         GLOBAL_CONSTANTS = get_token()
 
@@ -453,7 +446,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         video_grid_thw = []
         second_per_grids = []
         # Per-video splits ``(num_images, num_audios)``, consumed downstream
-        # by the ``video_omni_fusion`` joint-encode path. Mirrors
+        # by the model-side video omni-fusion path. Mirrors
         # :meth:`VideoProcessor.add_video_input_contiguous` in
         # ``cognitron_mm/processor/video_processor.py``.
         video_split = []
@@ -701,13 +694,13 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         video_grid_thw = torch.tensor(video_grid_thw, dtype=torch.long)
         second_per_grids = torch.tensor(second_per_grids, dtype=torch.long)
 
-        # Per-video split metadata, consumed by the joint-video encoder when
-        # ``video_omni_fusion`` is enabled. Returns ``None`` whenever the
-        # omni-fusion toggle is off or no videos were processed; only surfaces
-        # the populated list when both conditions are met. Mirrors the
-        # behaviour of :meth:`VideoProcessor.add_video_input_discrete_or_contiguous`
+        # Per-video split metadata, consumed by upstream code (model-side
+        # video omni-fusion path). Surfaced whenever any per-video split was
+        # recorded; the model decides whether to take the joint forward path
+        # based on its own flag. Mirrors the behaviour of
+        # :meth:`VideoProcessor.add_video_input_discrete_or_contiguous`
         # in ``cognitron_mm/processor/video_processor.py``.
-        if video_omni_fusion and len(video_split) > 0:
+        if len(video_split) > 0:
             video_split_out = video_split
         else:
             video_split_out = None

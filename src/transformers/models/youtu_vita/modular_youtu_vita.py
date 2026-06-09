@@ -231,6 +231,21 @@ class YoutuVITAOmniConfig(YoutuVITATextConfig):
     # joint encoder, so attention is restricted to images / audios that belong
     # to the same group. See :meth:`YoutuVITAOmniModel.forward_video`.
     video_group_attention: bool = False
+    # Per-omni-encoder-layer mask controlling which layers apply video fusion
+    # attention. Mirrors the megatron-side ``--video-fusion-layer-freq`` arg.
+    # Accepted values:
+    #   * ``None`` (default) -- every layer is a fusion layer (legacy
+    #     behaviour: image + audio of the same video share an attention
+    #     window inside every layer).
+    #   * ``int N`` -- moe-style 1:N ratio, layer ``i`` is fusion iff
+    #     ``i % N == 0``.
+    #   * ``list[int]`` of length ``num_hidden_layers`` -- explicit 0/1
+    #     mask. ``1`` = fusion layer (segmentation follows
+    #     ``video_group_attention``); ``0`` = non-fusion layer (each image
+    #     and each audio chunk is its own attention window).
+    # Only used by :meth:`YoutuVITAOmniModel.forward_video`; non-video
+    # paths already encode each image / audio independently.
+    video_fusion_layer_freq: Optional[Union[int, list]] = None
 
 
 class YoutuVITAConfig(PreTrainedConfig):
@@ -261,6 +276,14 @@ class YoutuVITAConfig(PreTrainedConfig):
         # vision_start_token_id=133377,
         # vision_end_token_id=133378,
         tie_word_embeddings=False,
+        # When True, the omni model runs the joint cross-modal
+        # ``forward_video`` over the dedicated ``video_*`` buffers
+        # produced by the video processor (vision frames and audio chunks
+        # of the same video attend to each other inside one packed
+        # sequence). When False, the same ``video_*`` data is routed
+        # through the regular ``vision`` / ``audio`` encoders independently.
+        # Mirrors ``args.video_omni_fusion`` on the megatron side.
+        video_omni_fusion=False,
         **kwargs,
     ):
         def _build_sub_config(key, value):
@@ -290,6 +313,7 @@ class YoutuVITAConfig(PreTrainedConfig):
         # self.vision_end_token_id = vision_end_token_id
 
         self.tie_word_embeddings = tie_word_embeddings
+        self.video_omni_fusion = video_omni_fusion
         super().__init__(**kwargs)
 
 
@@ -2001,7 +2025,7 @@ class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens,
         rotary_pos_emb: torch.Tensor,
     ) -> BaseModelOutput:
         """Run the transformer body on packed features.
@@ -2009,6 +2033,13 @@ class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
         Args:
             hidden_states: ``[seq_len, hidden]`` already-projected features.
             cu_seqlens: cumulative sequence lengths (``thd`` varlen format).
+                Either a single ``Tensor`` shared across every transformer
+                layer, or a ``list`` of length ``num_hidden_layers`` with
+                one ``Tensor`` per layer (mirrors the megatron
+                ``patch_per_layer_packed_seq_params`` dispatch). Used by
+                :meth:`YoutuVITAOmniModel.forward_video` to apply
+                different fusion / non-fusion segmentations on different
+                layers via ``video_fusion_layer_freq``.
             rotary_pos_emb: ``[seq_len, head_dim]`` rotary positions (already
                 concatenated for both ``h`` and ``w`` / duplicated for audio).
         """
@@ -2018,18 +2049,28 @@ class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
-        for layer in self.layers:
+        per_layer_cu_seqlens = isinstance(cu_seqlens, list)
+        if per_layer_cu_seqlens and len(cu_seqlens) != len(self.layers):
+            raise ValueError(
+                f"per-layer cu_seqlens length {len(cu_seqlens)} != "
+                f"num_hidden_layers {len(self.layers)}"
+            )
+
+        for layer_idx, layer in enumerate(self.layers):
+            layer_cu_seqlens = (
+                cu_seqlens[layer_idx] if per_layer_cu_seqlens else cu_seqlens
+            )
             if self.gradient_checkpointing and self.training:
                 hidden_states = self._gradient_checkpointing_func(
                     layer.__call__,
                     hidden_states,
-                    cu_seqlens,
+                    layer_cu_seqlens,
                     position_embeddings,
                 )
             else:
                 hidden_states = layer(
                     hidden_states=hidden_states,
-                    cu_seqlens=cu_seqlens,
+                    cu_seqlens=layer_cu_seqlens,
                     position_embeddings=position_embeddings,
                 )
 
@@ -2055,6 +2096,53 @@ class YoutuVITAOmniAudioPatchMerger(YoutuVITAAudioPatchMerger):
 
     def __init__(self, config: YoutuVITAOmniConfig) -> None:
         super().__init__(config)
+
+
+def _normalize_video_fusion_layer_pattern(
+    video_fusion_layer_freq, num_layers: int
+) -> list:
+    """Normalize ``YoutuVITAOmniConfig.video_fusion_layer_freq`` into a
+    ``list[bool]`` of length ``num_layers``. Mirrors the parsing used on
+    the megatron side (see ``MegatronOmniModel.__init__``).
+
+    Accepted ``video_fusion_layer_freq`` shapes:
+        * ``None``     -> all-fusion (legacy behaviour).
+        * ``int N``    -> moe-style 1:N ratio (layer ``i`` is fusion iff
+                          ``i % N == 0``); ``N <= 0`` is treated as 1.
+        * ``list[int]`` of length ``num_layers`` -> explicit 0/1 mask.
+
+    Raises ``ValueError`` on length mismatch or invalid entries so config
+    bugs surface immediately rather than silently misaligning the
+    per-layer attention windows.
+    """
+    if video_fusion_layer_freq is None:
+        return [True] * num_layers
+    if isinstance(video_fusion_layer_freq, bool):
+        # ``bool`` is a subclass of ``int``; reject so that
+        # ``video_fusion_layer_freq=True`` does not silently turn into 1.
+        raise ValueError(
+            f"video_fusion_layer_freq must be int / list / None, "
+            f"got bool {video_fusion_layer_freq!r}"
+        )
+    if isinstance(video_fusion_layer_freq, int):
+        n = max(int(video_fusion_layer_freq), 1)
+        return [(i % n == 0) for i in range(num_layers)]
+    if isinstance(video_fusion_layer_freq, (list, tuple)):
+        if len(video_fusion_layer_freq) != num_layers:
+            raise ValueError(
+                f"video_fusion_layer_freq length {len(video_fusion_layer_freq)} != "
+                f"omni encoder num_hidden_layers {num_layers}"
+            )
+        for v in video_fusion_layer_freq:
+            if v not in (0, 1, True, False):
+                raise ValueError(
+                    f"video_fusion_layer_freq entries must be 0/1, got {v!r}"
+                )
+        return [bool(v) for v in video_fusion_layer_freq]
+    raise ValueError(
+        f"video_fusion_layer_freq must be int / list / None, "
+        f"got {type(video_fusion_layer_freq).__name__}"
+    )
 
 
 class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
@@ -2087,6 +2175,22 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         # Modality-specific post-encoder mergers + projectors.
         self.vision_merger = YoutuVITAOmniVisionPatchMerger(config)
         self.audio_merger = YoutuVITAOmniAudioPatchMerger(config)
+
+        # Per-layer video fusion mask. Mirrors the megatron-side
+        # ``--video-fusion-layer-freq`` (parsed in
+        # ``MegatronOmniModel.__init__``). Normalize the raw config value
+        # (``None`` / ``int`` / ``list``) into a ``list[bool]`` of length
+        # ``num_hidden_layers`` once. ``True`` = fusion layer (image+audio
+        # share an attention window; segmentation follows
+        # ``config.video_group_attention``); ``False`` = non-fusion layer
+        # (each image / audio chunk is its own attention window).
+        self._video_fusion_layer_pattern = _normalize_video_fusion_layer_pattern(
+            config.video_fusion_layer_freq,
+            int(config.num_hidden_layers),
+        )
+        # Fast-path flag: when every layer is a fusion layer, ``forward_video``
+        # can fall back to a single ``cu_seqlens`` tensor (legacy path).
+        self._has_nofusion_layer = not all(self._video_fusion_layer_pattern)
 
         self.post_init()
 
@@ -2215,6 +2319,28 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
             * ``video_audio_embeddings``: ``[N_audios, max_S_after_merge,
               out_hidden_size]``
             * ``video_audio_lens_after_merge``: ``[N_audios]``
+
+        Notes:
+            Per-layer fusion mask
+            ~~~~~~~~~~~~~~~~~~~~~
+            ``self.config.video_fusion_layer_freq`` (parsed in
+            ``__init__`` into ``self._video_fusion_layer_pattern``)
+            controls the segmentation used by each transformer layer of
+            the omni encoder:
+
+            * Fusion layer (mask entry ``1``, default): each video
+              produces one or more attention segments according to
+              ``self.config.video_group_attention``. Image and audio
+              tokens of the same video can attend to each other within
+              the same segment.
+            * Non-fusion layer (mask entry ``0``): each image-chunk and
+              each audio-chunk becomes its own attention segment, so
+              attention is fully isolated per chunk regardless of
+              ``video_group_attention``.
+
+            Both segmentations are built once over the same packed
+            feature sequence and then dispatched per-layer inside
+            :meth:`YoutuVITAOmniEncoder.forward`.
         """
         if video_split is None or video_split.numel() == 0:
             raise ValueError(
@@ -2300,6 +2426,13 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         segment_features = []
         segment_rotary = []
         segment_lengths = []
+        # Per-event segment lengths (one entry per image-chunk / audio-chunk)
+        # in the same order as ``segment_features`` rows. Used to build the
+        # *non-fusion* ``cu_seqlens`` for layers where each image / audio
+        # chunk must be its own attention window. Populated regardless of
+        # the per-layer fusion pattern so the loop stays branch-free; only
+        # consumed when at least one layer is non-fusion.
+        nofusion_segment_lengths = []
         segment_modality_masks = []  # True = vision, False = audio
         per_video_audio_chunk_lens = []
 
@@ -2577,6 +2710,11 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
                             device=device,
                         )
                     )
+                    # Each event is its own attention window in the
+                    # non-fusion path; record its length here -- the
+                    # iteration order matches the packed feature row
+                    # order regardless of how events were grouped.
+                    nofusion_segment_lengths.append(int(feat.size(0)))
                 group_features_tensor = torch.cat(group_features_list, dim=0)
                 group_rotary_tensor = torch.cat(group_rotary_list, dim=0)
                 group_mask_tensor = torch.cat(group_mask_list, dim=0)
@@ -2601,13 +2739,38 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         packed_rotary = torch.cat(segment_rotary, dim=0)
         packed_modality_mask = torch.cat(segment_modality_masks, dim=0)
 
-        cu_seqlens = torch.nn.functional.pad(
+        cu_seqlens_fusion = torch.nn.functional.pad(
             torch.tensor(segment_lengths, dtype=torch.int32, device=device).cumsum(
                 dim=0, dtype=torch.int32
             ),
             (1, 0),
             value=0,
         )
+
+        # Per-layer fusion mask. When at least one layer is non-fusion we
+        # also build a separate ``cu_seqlens`` that splits each image /
+        # audio chunk into its own attention window, then assemble a list
+        # of length ``num_hidden_layers`` to feed
+        # :meth:`YoutuVITAOmniEncoder.forward` (resolved per-layer in the
+        # encoder's own loop). When every layer is fusion (the common
+        # case / legacy behaviour), pass a single tensor so no extra
+        # dispatch overhead is incurred. Mirrors
+        # ``MegatronOmniModel.forward_video`` in
+        # ``vita_megatron/core/models/omni/omni_model.py``.
+        if self._has_nofusion_layer:
+            cu_seqlens_nofusion = torch.nn.functional.pad(
+                torch.tensor(
+                    nofusion_segment_lengths, dtype=torch.int32, device=device
+                ).cumsum(dim=0, dtype=torch.int32),
+                (1, 0),
+                value=0,
+            )
+            cu_seqlens = [
+                cu_seqlens_fusion if fusion else cu_seqlens_nofusion
+                for fusion in self._video_fusion_layer_pattern
+            ]
+        else:
+            cu_seqlens = cu_seqlens_fusion
 
         # 4. Run the shared transformer once over the packed sequence.
         encoder_output = self.encoder(
@@ -2681,7 +2844,7 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         has_audio = audios is not None
         has_video = video_split is not None and video_split.numel() > 0
 
-        if modality == "video" or (has_video and modality is None):
+        if modality == "video":
             return self.forward_video(
                 video_images=video_images,
                 video_image_grid_thw=video_image_grid_thw,
@@ -2690,21 +2853,20 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
                 video_image_indices=video_image_indices,
                 video_audio_indices=video_audio_indices,
             )
+        
+        # if modality == "video":
+        #     v = self.forward_vision(video_images, video_image_grid_thw)
+        #     a, a_len = self.forward_audio(video_audios)
+        #     return v, a, a_len
 
-        if modality == "vision" or (has_vision and not has_audio):
+        elif modality == "vision":
             return self.forward_vision(pixel_values, image_grid_thw)
 
-        if modality == "audio" or (has_audio and not has_vision):
+        elif modality == "audio":
             return self.forward_audio(audios)
 
-        if has_vision and has_audio:
-            v = self.forward_vision(pixel_values, image_grid_thw)
-            a, a_len = self.forward_audio(audios)
-            return {"vision": v, "audio": (a, a_len)}
-
         raise ValueError(
-            "YoutuVITAOmniModel.forward requires at least one of (pixel_values, image_grid_thw), "
-            "(audios,), or (video_images, video_image_grid_thw, video_split)."
+            "YoutuVITAOmniModel.forward could not dispatch for {modality=}."
         )
 
 
@@ -2782,8 +2944,8 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
         if self.omni_model is None:
             raise ValueError(
                 "YoutuVITAModel: video joint encoding requires `omni_model`, "
-                "but it is not configured. Either disable `video_omni_fusion` "
-                "in the processor or load a checkpoint with `omni_config`."
+                "but it is not configured. Either set `video_omni_fusion=False` "
+                "in the top-level config or load a checkpoint with `omni_config`."
             )
         return self.omni_model(
             modality="video",
@@ -2950,11 +3112,18 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
             # inputs_embeds = inputs_embeds + audio_embeds.mean() * 0.0
 
         # ------------------------------------------------------------------
-        # Joint video path: same-video vision/audio go through the shared
-        # omni encoder together (mirrors ``GPTMMModel._preprocess`` joint
-        # branch and ``LanguageModelEmbedding.forward`` independent
-        # ``video_*`` scatter in
-        # ``vita_megatron/core/models/common/embeddings/language_model_embedding.py``).
+        # Video path: the video processor always populates the dedicated
+        # ``video_*`` buffers when there are videos. The model decides via
+        # ``self.config.video_omni_fusion`` whether to:
+        #   * True  -- run the joint cross-modal ``forward_video`` so that
+        #              same-video vision/audio share an attention window
+        #              inside the omni encoder; or
+        #   * False -- route the same ``video_*`` data through the regular
+        #              vision / audio encoders independently.
+        # In both cases the outputs are scattered through
+        # ``video_image_indices`` / ``video_audio_indices`` (mirrors the
+        # ``LanguageModelEmbedding.forward`` independent ``video_*`` scatter
+        # in ``vita_megatron/core/models/common/embeddings/language_model_embedding.py``).
         # ------------------------------------------------------------------
         if video_split is not None and video_split.numel() > 0:
             device = inputs_embeds.device
@@ -2965,19 +3134,34 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
                 video_audios = [x.to(dtype).to(device) for x in video_audios]
             video_split_dev = video_split.to(device)
 
-            # Forward the scatter indices to the omni encoder so the joint
-            # forward path can recover the real temporal interleave between
-            # image frames and audio chunks (matching the processor's
-            # ``input_ids`` write order). Indices are kept on CPU here; the
-            # encoder only reads ``[1, ...]`` (seq positions).
-            video_image_embeds, video_audio_embeds, video_audio_lens = self._encode_video(
-                video_images=video_images,
-                video_image_grid_thw=video_image_grid_thw,
-                video_audios=video_audios,
-                video_split=video_split_dev,
-                video_image_indices=video_image_indices,
-                video_audio_indices=video_audio_indices,
-            )
+            if self.config.video_omni_fusion:
+                # Joint cross-modal forward: vision frames and audio chunks
+                # of the same video attend to each other in one packed
+                # sequence. Forward the scatter indices to the omni encoder
+                # so the joint forward path can recover the real temporal
+                # interleave between image frames and audio chunks (matching
+                # the processor's ``input_ids`` write order).
+                video_image_embeds, video_audio_embeds, video_audio_lens = self._encode_video(
+                    video_images=video_images,
+                    video_image_grid_thw=video_image_grid_thw,
+                    video_audios=video_audios,
+                    video_split=video_split_dev,
+                    video_image_indices=video_image_indices,
+                    video_audio_indices=video_audio_indices,
+                )
+            else:
+                # Independent paths: route the dedicated ``video_*`` buffers
+                # through the regular vision / audio encoders. The downstream
+                # scatter (below) is identical to the joint path.
+                video_image_embeds = self._encode_vision(
+                    pixel_values=video_images,
+                    image_grid_thw=video_image_grid_thw,
+                )
+                if video_audios is not None and len(video_audios) > 0:
+                    video_audio_embeds, video_audio_lens = self._encode_audio(video_audios)
+                else:
+                    video_audio_embeds = inputs_embeds.new_zeros((0, 0, inputs_embeds.shape[-1]))
+                    video_audio_lens = torch.zeros((0,), dtype=torch.long, device=device)
 
             # Independent scatter for video vision tokens.
             if video_image_indices is not None and video_image_indices.numel() > 0 and video_image_embeds.numel() > 0:
@@ -4279,11 +4463,6 @@ class YoutuVITAVideosKwargs(VideosKwargs, total=False):
     video_key_frame: bool
     use_audio_in_video: bool
     use_vision_in_video: bool
-    # When True, video frames+audio of the same video are jointly encoded by
-    # ``YoutuVITAOmniModel.forward_video`` so they can attend to each other.
-    # When False (default), video frames/audio fall back to the standalone
-    # image/audio paths.
-    video_omni_fusion: bool
 
 
 class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
@@ -4313,7 +4492,6 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
             # "video_key_frame": False,
             # "use_audio_in_video": True,
             # "use_vision_in_video": True,
-            # "video_omni_fusion": False,
         },
         "audio_kwargs": {
             "sampling_rate": 16000,
@@ -4735,7 +4913,6 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         temporal_merge_size=1,
         patch_size=14,
         video_key_frame=False,
-        video_omni_fusion=False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -4768,11 +4945,6 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         self.sampling_rate = 16000
 
         self.video_key_frame = video_key_frame
-        # When ``video_omni_fusion`` is False, ``add_video_input_discrete_or_contiguous``
-        # always returns ``video_split=None`` so upstream code falls back to the
-        # legacy (non-split) flow. When True, the per-video ``(num_images, num_audios)``
-        # tuples are surfaced and the joint-encode path is taken downstream.
-        self.video_omni_fusion = video_omni_fusion
 
     def get_video_frames(self, vid_path, video_max_fps=1, video_max_num_frames=8):
         vid = decord.VideoReader(vid_path, num_threads=1)
@@ -5114,7 +5286,6 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         use_vision_in_video = kwargs.get("use_vision_in_video", self.use_vision_in_video)
         video_audio_chunk_min_second = kwargs.get("video_audio_chunk_min_second", self.video_audio_chunk_min_second)
         video_audio_chunk_max_second = kwargs.get("video_audio_chunk_max_second", self.video_audio_chunk_max_second)
-        video_omni_fusion = kwargs.get("video_omni_fusion", self.video_omni_fusion)
 
         GLOBAL_CONSTANTS = get_token()
 
@@ -5149,7 +5320,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         video_grid_thw = []
         second_per_grids = []
         # Per-video splits ``(num_images, num_audios)``, consumed downstream
-        # by the ``video_omni_fusion`` joint-encode path. Mirrors
+        # by the model-side video omni-fusion path. Mirrors
         # :meth:`VideoProcessor.add_video_input_contiguous` in
         # ``cognitron_mm/processor/video_processor.py``.
         video_split = []
@@ -5417,13 +5588,13 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
         video_grid_thw = torch.tensor(video_grid_thw, dtype=torch.long)
         second_per_grids = torch.tensor(second_per_grids, dtype=torch.long)
 
-        # Per-video split metadata, consumed by the joint-video encoder when
-        # ``video_omni_fusion`` is enabled. Returns ``None`` whenever the
-        # omni-fusion toggle is off or no videos were processed; only surfaces
-        # the populated list when both conditions are met. Mirrors the
-        # behaviour of :meth:`VideoProcessor.add_video_input_discrete_or_contiguous`
+        # Per-video split metadata, consumed by upstream code (model-side
+        # video omni-fusion path). Surfaced whenever any per-video split was
+        # recorded; the model decides whether to take the joint forward path
+        # based on its own flag. Mirrors the behaviour of
+        # :meth:`VideoProcessor.add_video_input_discrete_or_contiguous`
         # in ``cognitron_mm/processor/video_processor.py``.
-        if video_omni_fusion and len(video_split) > 0:
+        if len(video_split) > 0:
             video_split_out = video_split
         else:
             video_split_out = None
@@ -6201,14 +6372,14 @@ class YoutuVITAProcessor(ProcessorMixin):
             else:
                 audio_seqlens = [len(x) for x in _audios]
 
-            # The video processor decides whether to populate ``video_split``
-            # (controlled by its ``video_omni_fusion`` toggle, with optional
-            # per-call override via ``videos_kwargs``). We branch on that
-            # signal --- mirroring the dispatch in
+            # The video processor always surfaces ``video_split`` whenever
+            # it has per-video accounting; the model side decides (via the
+            # ``video_omni_fusion`` config flag) whether to take the joint
+            # forward path or to route the same ``video_*`` data through
+            # the regular per-modality encoders. Mirrors the dispatch in
             # ``cognitron_mm/data/preprocess_common.py``: ``video_split is
             # None`` means the legacy (non-split) flow; otherwise we route
-            # into the dedicated ``video_*`` buffers consumed by the
-            # omni-fusion joint forward path.
+            # into the dedicated ``video_*`` buffers.
             if video_split is not None and len(video_split) == len(videos):
                 # Cross-video buffer consistency check, kept structurally
                 # identical to ``cognitron_mm/data/preprocess_common.py``.

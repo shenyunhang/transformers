@@ -44,11 +44,6 @@ class YoutuVITAVideosKwargs(VideosKwargs, total=False):
     video_key_frame: bool
     use_audio_in_video: bool
     use_vision_in_video: bool
-    # When True, video frames+audio of the same video are jointly encoded by
-    # ``YoutuVITAOmniModel.forward_video`` so they can attend to each other.
-    # When False (default), video frames/audio fall back to the standalone
-    # image/audio paths.
-    video_omni_fusion: bool
 
 
 class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
@@ -78,7 +73,6 @@ class YoutuVITAProcessorKwargs(ProcessingKwargs, total=False):
             # "video_key_frame": False,
             # "use_audio_in_video": True,
             # "use_vision_in_video": True,
-            # "video_omni_fusion": False,
         },
         "audio_kwargs": {
             "sampling_rate": 16000,
@@ -214,14 +208,14 @@ class YoutuVITAProcessor(ProcessorMixin):
             else:
                 audio_seqlens = [len(x) for x in _audios]
 
-            # The video processor decides whether to populate ``video_split``
-            # (controlled by its ``video_omni_fusion`` toggle, with optional
-            # per-call override via ``videos_kwargs``). We branch on that
-            # signal --- mirroring the dispatch in
+            # The video processor always surfaces ``video_split`` whenever
+            # it has per-video accounting; the model side decides (via the
+            # ``video_omni_fusion`` config flag) whether to take the joint
+            # forward path or to route the same ``video_*`` data through
+            # the regular per-modality encoders. Mirrors the dispatch in
             # ``cognitron_mm/data/preprocess_common.py``: ``video_split is
             # None`` means the legacy (non-split) flow; otherwise we route
-            # into the dedicated ``video_*`` buffers consumed by the
-            # omni-fusion joint forward path.
+            # into the dedicated ``video_*`` buffers.
             if video_split is not None and len(video_split) == len(videos):
                 # Cross-video buffer consistency check, kept structurally
                 # identical to ``cognitron_mm/data/preprocess_common.py``.

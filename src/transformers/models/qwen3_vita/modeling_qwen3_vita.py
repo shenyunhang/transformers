@@ -2987,8 +2987,8 @@ class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
         if self.omni_model is None:
             raise ValueError(
                 "Qwen3VITAModel: video joint encoding requires `omni_model`, "
-                "but it is not configured. Either disable `video_omni_fusion` "
-                "in the processor or load a checkpoint with `omni_config`."
+                "but it is not configured. Either set `video_omni_fusion=False` "
+                "in the top-level config or load a checkpoint with `omni_config`."
             )
         return self.omni_model(
             modality="video",
@@ -3172,11 +3172,18 @@ class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
             # inputs_embeds = inputs_embeds + audio_embeds.mean() * 0.0
 
         # ------------------------------------------------------------------
-        # Joint video path: same-video vision/audio go through the shared
-        # omni encoder together (mirrors ``GPTMMModel._preprocess`` joint
-        # branch and ``LanguageModelEmbedding.forward`` independent
-        # ``video_*`` scatter in
-        # ``vita_megatron/core/models/common/embeddings/language_model_embedding.py``).
+        # Video path: the video processor always populates the dedicated
+        # ``video_*`` buffers when there are videos. The model decides via
+        # ``self.config.video_omni_fusion`` whether to:
+        #   * True  -- run the joint cross-modal ``forward_video`` so that
+        #              same-video vision/audio share an attention window
+        #              inside the omni encoder; or
+        #   * False -- route the same ``video_*`` data through the regular
+        #              vision / audio encoders independently.
+        # In both cases the outputs are scattered through
+        # ``video_image_indices`` / ``video_audio_indices`` (mirrors the
+        # ``LanguageModelEmbedding.forward`` independent ``video_*`` scatter
+        # in ``vita_megatron/core/models/common/embeddings/language_model_embedding.py``).
         # ------------------------------------------------------------------
         if video_split is not None and video_split.numel() > 0:
             device = inputs_embeds.device
@@ -3187,19 +3194,34 @@ class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
                 video_audios = [x.to(dtype).to(device) for x in video_audios]
             video_split_dev = video_split.to(device)
 
-            # Forward the scatter indices to the omni encoder so the joint
-            # forward path can recover the real temporal interleave between
-            # image frames and audio chunks (matching the processor's
-            # ``input_ids`` write order). Indices are kept on CPU here; the
-            # encoder only reads ``[1, ...]`` (seq positions).
-            video_image_embeds, video_audio_embeds, video_audio_lens = self._encode_video(
-                video_images=video_images,
-                video_image_grid_thw=video_image_grid_thw,
-                video_audios=video_audios,
-                video_split=video_split_dev,
-                video_image_indices=video_image_indices,
-                video_audio_indices=video_audio_indices,
-            )
+            if self.config.video_omni_fusion:
+                # Joint cross-modal forward: vision frames and audio chunks
+                # of the same video attend to each other in one packed
+                # sequence. Forward the scatter indices to the omni encoder
+                # so the joint forward path can recover the real temporal
+                # interleave between image frames and audio chunks (matching
+                # the processor's ``input_ids`` write order).
+                video_image_embeds, video_audio_embeds, video_audio_lens = self._encode_video(
+                    video_images=video_images,
+                    video_image_grid_thw=video_image_grid_thw,
+                    video_audios=video_audios,
+                    video_split=video_split_dev,
+                    video_image_indices=video_image_indices,
+                    video_audio_indices=video_audio_indices,
+                )
+            else:
+                # Independent paths: route the dedicated ``video_*`` buffers
+                # through the regular vision / audio encoders. The downstream
+                # scatter (below) is identical to the joint path.
+                video_image_embeds = self._encode_vision(
+                    pixel_values=video_images,
+                    image_grid_thw=video_image_grid_thw,
+                )
+                if video_audios is not None and len(video_audios) > 0:
+                    video_audio_embeds, video_audio_lens = self._encode_audio(video_audios)
+                else:
+                    video_audio_embeds = inputs_embeds.new_zeros((0, 0, inputs_embeds.shape[-1]))
+                    video_audio_lens = torch.zeros((0,), dtype=torch.long, device=device)
 
             # Independent scatter for video vision tokens.
             if video_image_indices is not None and video_image_indices.numel() > 0 and video_image_embeds.numel() > 0:

@@ -291,6 +291,14 @@ class Qwen3VITAConfig(PreTrainedConfig):
         # vision_start_token_id=133377,
         # vision_end_token_id=133378,
         tie_word_embeddings=False,
+        # When True, the omni model runs the joint cross-modal
+        # ``forward_video`` over the dedicated ``video_*`` buffers
+        # produced by the video processor (vision frames and audio chunks
+        # of the same video attend to each other inside one packed
+        # sequence). When False, the same ``video_*`` data is routed
+        # through the regular ``vision`` / ``audio`` encoders independently.
+        # Mirrors ``args.video_omni_fusion`` on the megatron side.
+        video_omni_fusion=False,
         **kwargs,
     ):
         def _build_sub_config(key, value):
@@ -320,6 +328,7 @@ class Qwen3VITAConfig(PreTrainedConfig):
         # self.vision_end_token_id = vision_end_token_id
 
         self.tie_word_embeddings = tie_word_embeddings
+        self.video_omni_fusion = video_omni_fusion
         super().__init__(**kwargs)
 
 

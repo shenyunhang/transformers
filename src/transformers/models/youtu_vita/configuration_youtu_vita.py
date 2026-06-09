@@ -5,6 +5,7 @@
 #                          modular_youtu_vita.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 
+
 from huggingface_hub.dataclasses import strict
 
 from ...configuration_utils import PreTrainedConfig
@@ -241,6 +242,21 @@ class YoutuVITAOmniConfig(YoutuVITATextConfig):
     # joint encoder, so attention is restricted to images / audios that belong
     # to the same group. See :meth:`YoutuVITAOmniModel.forward_video`.
     video_group_attention: bool = False
+    # Per-omni-encoder-layer mask controlling which layers apply video fusion
+    # attention. Mirrors the megatron-side ``--video-fusion-layer-freq`` arg.
+    # Accepted values:
+    #   * ``None`` (default) -- every layer is a fusion layer (legacy
+    #     behaviour: image + audio of the same video share an attention
+    #     window inside every layer).
+    #   * ``int N`` -- moe-style 1:N ratio, layer ``i`` is fusion iff
+    #     ``i % N == 0``.
+    #   * ``list[int]`` of length ``num_hidden_layers`` -- explicit 0/1
+    #     mask. ``1`` = fusion layer (segmentation follows
+    #     ``video_group_attention``); ``0`` = non-fusion layer (each image
+    #     and each audio chunk is its own attention window).
+    # Only used by :meth:`YoutuVITAOmniModel.forward_video`; non-video
+    # paths already encode each image / audio independently.
+    video_fusion_layer_freq: int | list | None = None
 
 
 class YoutuVITAConfig(PreTrainedConfig):
@@ -271,6 +287,14 @@ class YoutuVITAConfig(PreTrainedConfig):
         # vision_start_token_id=133377,
         # vision_end_token_id=133378,
         tie_word_embeddings=False,
+        # When True, the omni model runs the joint cross-modal
+        # ``forward_video`` over the dedicated ``video_*`` buffers
+        # produced by the video processor (vision frames and audio chunks
+        # of the same video attend to each other inside one packed
+        # sequence). When False, the same ``video_*`` data is routed
+        # through the regular ``vision`` / ``audio`` encoders independently.
+        # Mirrors ``args.video_omni_fusion`` on the megatron side.
+        video_omni_fusion=False,
         **kwargs,
     ):
         def _build_sub_config(key, value):
@@ -300,6 +324,7 @@ class YoutuVITAConfig(PreTrainedConfig):
         # self.vision_end_token_id = vision_end_token_id
 
         self.tie_word_embeddings = tie_word_embeddings
+        self.video_omni_fusion = video_omni_fusion
         super().__init__(**kwargs)
 
 
