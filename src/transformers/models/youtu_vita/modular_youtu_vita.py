@@ -246,6 +246,11 @@ class YoutuVITAOmniConfig(YoutuVITATextConfig):
     # Only used by :meth:`YoutuVITAOmniModel.forward_video`; non-video
     # paths already encode each image / audio independently.
     video_fusion_layer_freq: Optional[Union[int, list]] = None
+    # If True, the omni encoder uses 4D RoPE (M | T | H | W) instead of the
+    # legacy 2D (vision) / 1D (audio) rotary path. Mirrors the megatron-side
+    # ``--video-omni-4d-rope`` flag. Default False preserves legacy
+    # behaviour exactly. See :class:`YoutuVITAOmniFourDRotaryEmbedding`.
+    video_omni_4d_rope: bool = False
 
 
 class YoutuVITAConfig(PreTrainedConfig):
@@ -1810,6 +1815,116 @@ class YoutuVITAOmniRotaryEmbedding(nn.Module):
         return torch.outer(seq, inv_freq)
 
 
+# ---------------------------------------------------------------------------
+# 4D RoPE (M | T | H | W) for the omni encoder.
+#
+# Mirrors ``vita_megatron/core/models/omni/gpt_model.py``: the
+# ``head_dim`` of the omni transformer is split into 4 segments by way
+# of concatenating 4 separate ``inv_freq`` lookup tables. Downstream
+# ``vision_apply_rotary_pos_emb_flashatt`` is unchanged because the
+# encoder duplicates ``rotary_pos_emb`` along the feature axis to reach
+# ``head_dim`` (mirroring ``cos.repeat(...,2)`` on the megatron side).
+#
+# Constraints:
+#   m_dim + t_dim + h_dim + w_dim == head_dim // 2
+#   theta_m: small (default 100) so that small-cardinality modality ids
+#     produce non-vanishing rotation angles even at the lowest frequency.
+#   theta:   standard 10000 for T / H / W.
+# ---------------------------------------------------------------------------
+
+# Modality ids consumed by the M segment.  Image and audio are also used
+# for the standalone vision / audio paths; video frames / video audio
+# chunks use the dedicated video ids so the omni encoder can tell them
+# apart from stand-alone images / audios.
+M_IMAGE = 0
+M_AUDIO = 1
+M_VIDEO_FRAME = 2
+M_VIDEO_AUDIO = 3
+
+
+def _split_4d_dims(dim_rot: int, m_dim: int = 4) -> tuple:
+    """Default ``(m_dim, t_dim, h_dim, w_dim)`` split given
+    ``dim_rot = head_dim // 2``.
+
+    Strategy: reserve ``m_dim`` slots for the modality segment, then
+    distribute the remaining ``dim_rot - m_dim`` evenly across T / H / W
+    (any remainder is appended to the W segment).
+    """
+    if dim_rot < m_dim + 3:
+        raise ValueError(
+            f"dim_rot={dim_rot} too small for 4D split with m_dim={m_dim}; "
+            f"need dim_rot >= m_dim + 3"
+        )
+    rest = dim_rot - m_dim
+    per = rest // 3
+    rem = rest - per * 3
+    t_dim = per
+    h_dim = per
+    w_dim = per + rem
+    assert m_dim + t_dim + h_dim + w_dim == dim_rot
+    return m_dim, t_dim, h_dim, w_dim
+
+
+class YoutuVITAOmniFourDRotaryEmbedding(nn.Module):
+    """4D RoPE frequency table.
+
+    ``forward(pos_ids)`` takes a ``[S, 4]`` tensor whose columns are
+    ``(m, t, h, w)`` (long or float; ``t`` may be fractional) and returns
+    ``[S, m_dim + t_dim + h_dim + w_dim]`` raw frequency angles (NOT
+    yet sin/cos).
+    """
+
+    def __init__(
+        self,
+        m_dim: int,
+        t_dim: int,
+        h_dim: int,
+        w_dim: int,
+        theta_m: float = 100.0,
+        theta: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        if not (m_dim >= 1 and t_dim >= 1 and h_dim >= 1 and w_dim >= 1):
+            raise ValueError(
+                f"4D RoPE segment dims must be >= 1, got "
+                f"(m={m_dim}, t={t_dim}, h={h_dim}, w={w_dim})"
+            )
+        self.m_dim = m_dim
+        self.t_dim = t_dim
+        self.h_dim = h_dim
+        self.w_dim = w_dim
+        self.dim_rot = m_dim + t_dim + h_dim + w_dim
+        self.theta_m = theta_m
+        self.theta = theta
+
+    def _make_inv(self, d: int, base: float, device: torch.device) -> torch.Tensor:
+        # Local normalisation per segment (same convention as the
+        # megatron reference): ``inv_freq[k] = 1 / base ** (2k / (d*2))``,
+        # k = 0 .. d-1.
+        return 1.0 / (
+            base
+            ** (torch.arange(0, d * 2, 2, dtype=torch.float32, device=device) / (d * 2))
+        )
+
+    def forward(self, pos_ids: torch.Tensor) -> torch.Tensor:
+        if pos_ids.dim() != 2 or pos_ids.size(-1) != 4:
+            raise ValueError(
+                f"YoutuVITAOmniFourDRotaryEmbedding expects pos_ids of shape "
+                f"[S, 4], got {tuple(pos_ids.shape)}"
+            )
+        device = pos_ids.device
+        pos = pos_ids.to(dtype=torch.float32)
+        m_inv = self._make_inv(self.m_dim, self.theta_m, device)
+        t_inv = self._make_inv(self.t_dim, self.theta, device)
+        h_inv = self._make_inv(self.h_dim, self.theta, device)
+        w_inv = self._make_inv(self.w_dim, self.theta, device)
+        m_freqs = torch.outer(pos[:, 0], m_inv)
+        t_freqs = torch.outer(pos[:, 1], t_inv)
+        h_freqs = torch.outer(pos[:, 2], h_inv)
+        w_freqs = torch.outer(pos[:, 3], w_inv)
+        return torch.cat([m_freqs, t_freqs, h_freqs, w_freqs], dim=-1)
+
+
 class YoutuVITAOmniVisionEmbeddings(YoutuVITAVisionEmbeddings):
     """Linear patch embedding for already-patchified vision pixel values.
 
@@ -1971,6 +2086,32 @@ class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
         # final freqs dim equals ``head_dim``, audio duplicates to match.
         self.rotary_pos_emb = YoutuVITAOmniRotaryEmbedding(config.head_dim // 2)
 
+        # Optional 4D RoPE (M | T | H | W). Enabled by
+        # ``config.video_omni_4d_rope`` (default False).  The buffer dim
+        # split uses :func:`_split_4d_dims`; see the megatron reference
+        # ``vita_megatron/core/models/omni/gpt_model.py`` for the layout.
+        self.use_4d_rope = bool(getattr(config, "video_omni_4d_rope", False))
+        self.rotary_pos_emb_4d = None
+        self._4d_dims = None
+        if self.use_4d_rope:
+            dim_rot = config.head_dim // 2
+            m_dim, t_dim, h_dim, w_dim = _split_4d_dims(dim_rot, m_dim=4)
+            self.rotary_pos_emb_4d = YoutuVITAOmniFourDRotaryEmbedding(
+                m_dim=m_dim,
+                t_dim=t_dim,
+                h_dim=h_dim,
+                w_dim=w_dim,
+                theta_m=100.0,
+                theta=10000.0,
+            )
+            self._4d_dims = (m_dim, t_dim, h_dim, w_dim)
+            print(
+                f"[YoutuVITAOmniEncoder] 4D RoPE enabled: head_dim="
+                f"{config.head_dim}, dim_rot={dim_rot}, "
+                f"_4d_dims=(m={m_dim}, t={t_dim}, h={h_dim}, w={w_dim}), "
+                f"theta_m=100.0, theta=10000.0"
+            )
+
         self.layers = nn.ModuleList(
             [YoutuVITAOmniEncoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
@@ -2021,6 +2162,91 @@ class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
         rotary_pos_emb = torch.cat([rotary_pos_emb, rotary_pos_emb], dim=-1)
         return rotary_pos_emb
 
+    # ------------------------------------------------------------------
+    # 4D RoPE helpers (only valid when ``self.use_4d_rope`` is True).
+    # All return a ``[S, dim_rot]`` raw-angle tensor consumable by the
+    # downstream cos/sin computation in :meth:`forward`.
+    # ------------------------------------------------------------------
+
+    def _build_vision_hw_pos(self, h: int, w: int) -> torch.Tensor:
+        """Per-frame ``(h_idx, w_idx)`` after the same ``spatial_merge``
+        reordering as :meth:`vision_rot_pos_emb`.  Output shape ``[h*w, 2]``,
+        long dtype, on CPU (caller moves to device as needed).
+        """
+        sm = self.spatial_merge_size
+        hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+        hpos_ids = hpos_ids.reshape(h // sm, sm, w // sm, sm)
+        hpos_ids = hpos_ids.permute(0, 2, 1, 3).flatten()
+        wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+        wpos_ids = wpos_ids.reshape(h // sm, sm, w // sm, sm)
+        wpos_ids = wpos_ids.permute(0, 2, 1, 3).flatten()
+        return torch.stack([hpos_ids, wpos_ids], dim=-1).to(torch.long)
+
+    def vision_rot_pos_emb_4d(
+        self,
+        grid_thw: torch.Tensor,
+        m_id: int = M_IMAGE,
+    ) -> torch.Tensor:
+        """4D rotary for vision tokens (image / standalone vision path).
+
+        Each ``(t, h, w)`` row contributes ``t * h * w`` tokens; for each
+        of the ``t`` frames the spatial ``(h_idx, w_idx)`` indices are
+        identical (matches the legacy behaviour of
+        :meth:`vision_rot_pos_emb`), but the time index ``t_idx`` is the
+        frame index inside the row (0 .. t-1).
+        """
+        if self.rotary_pos_emb_4d is None:
+            raise RuntimeError(
+                "vision_rot_pos_emb_4d called but use_4d_rope is False"
+            )
+        pos_ids_list = []
+        for t, h, w in grid_thw.tolist():
+            t = int(t)
+            h = int(h)
+            w = int(w)
+            hw = self._build_vision_hw_pos(h, w)  # [h*w, 2]
+            n = hw.size(0)
+            m_col = torch.full((n,), int(m_id), dtype=torch.long)
+            for ti in range(t):
+                t_col = torch.full((n,), ti, dtype=torch.long)
+                pos_ids_list.append(
+                    torch.stack([m_col, t_col, hw[:, 0], hw[:, 1]], dim=-1)
+                )
+        pos_ids = torch.cat(pos_ids_list, dim=0)
+        return self.rotary_pos_emb_4d(pos_ids)
+
+    def audio_rot_pos_emb_4d(
+        self,
+        lens: torch.Tensor,
+        m_id: int = M_AUDIO,
+    ) -> torch.Tensor:
+        """4D rotary for audio tokens.
+
+        Within each chunk, the ``t`` index is the per-token offset
+        (0 .. length-1); ``h = w = 0``. Different audio chunks restart
+        at ``t = 0`` because each chunk is its own attention segment.
+        """
+        if self.rotary_pos_emb_4d is None:
+            raise RuntimeError(
+                "audio_rot_pos_emb_4d called but use_4d_rope is False"
+            )
+        pos_ids_list = []
+        for length in lens.tolist():
+            n = int(length)
+            if n <= 0:
+                continue
+            m_col = torch.full((n,), int(m_id), dtype=torch.long)
+            t_col = torch.arange(n, dtype=torch.long)
+            z = torch.zeros((n,), dtype=torch.long)
+            pos_ids_list.append(torch.stack([m_col, t_col, z, z], dim=-1))
+        if len(pos_ids_list) == 0:
+            return torch.zeros(
+                (0, self.rotary_pos_emb_4d.dim_rot),
+                dtype=torch.float32,
+            )
+        pos_ids = torch.cat(pos_ids_list, dim=0)
+        return self.rotary_pos_emb_4d(pos_ids)
+
     # ---------------------------------------------------------------- forward
     def forward(
         self,
@@ -2042,12 +2268,31 @@ class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
                 layers via ``video_fusion_layer_freq``.
             rotary_pos_emb: ``[seq_len, head_dim]`` rotary positions (already
                 concatenated for both ``h`` and ``w`` / duplicated for audio).
+                May also be a ``list[Tensor]`` of length ``num_hidden_layers``
+                providing a *different* rotary embedding per layer (used by
+                the 4D RoPE path in :meth:`YoutuVITAOmniModel.forward_video`
+                so fusion vs non-fusion layers see different time encodings
+                for the same physical token).
         """
         hidden_states = hidden_states.contiguous()
 
-        # Per-token (cos, sin) used by ``vision_apply_rotary_pos_emb_flashatt``.
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
+        per_layer_rotary = isinstance(rotary_pos_emb, list)
+        if per_layer_rotary:
+            if len(rotary_pos_emb) != len(self.layers):
+                raise ValueError(
+                    f"per-layer rotary_pos_emb length {len(rotary_pos_emb)} != "
+                    f"num_hidden_layers {len(self.layers)}"
+                )
+            position_embeddings_list = []
+            for layer_rotary in rotary_pos_emb:
+                emb = torch.cat((layer_rotary, layer_rotary), dim=-1)
+                position_embeddings_list.append((emb.cos(), emb.sin()))
+            position_embeddings = None  # picked per layer below
+        else:
+            # Per-token (cos, sin) used by ``vision_apply_rotary_pos_emb_flashatt``.
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            position_embeddings = (emb.cos(), emb.sin())
+            position_embeddings_list = None
 
         per_layer_cu_seqlens = isinstance(cu_seqlens, list)
         if per_layer_cu_seqlens and len(cu_seqlens) != len(self.layers):
@@ -2060,18 +2305,23 @@ class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
             layer_cu_seqlens = (
                 cu_seqlens[layer_idx] if per_layer_cu_seqlens else cu_seqlens
             )
+            layer_position_embeddings = (
+                position_embeddings_list[layer_idx]
+                if per_layer_rotary
+                else position_embeddings
+            )
             if self.gradient_checkpointing and self.training:
                 hidden_states = self._gradient_checkpointing_func(
                     layer.__call__,
                     hidden_states,
                     layer_cu_seqlens,
-                    position_embeddings,
+                    layer_position_embeddings,
                 )
             else:
                 hidden_states = layer(
                     hidden_states=hidden_states,
                     cu_seqlens=layer_cu_seqlens,
-                    position_embeddings=position_embeddings,
+                    position_embeddings=layer_position_embeddings,
                 )
 
         return BaseModelOutput(last_hidden_state=hidden_states)
@@ -2192,7 +2442,99 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         # can fall back to a single ``cu_seqlens`` tensor (legacy path).
         self._has_nofusion_layer = not all(self._video_fusion_layer_pattern)
 
+        # 4D RoPE switch (mirrors the megatron-side ``--video-omni-4d-rope``).
+        # When True the omni encoder uses (M | T | H | W) coordinates per
+        # token; default False keeps the legacy 2D / 1D rotary path.
+        self.use_4d_rope = bool(getattr(config, "video_omni_4d_rope", False))
+
         self.post_init()
+
+    # ----------------------------------------------------------------------
+    # 4D RoPE helpers for the video path.
+    #
+    # ``forward_video`` packs multiple video chunks (one event per image
+    # frame / one event per audio chunk) into a single sequence and emits
+    # one or more attention groups per video. When ``self.use_4d_rope`` is
+    # True we generate two parallel rotary embeddings:
+    #
+    #   * fusion (group-shared window):
+    #       Each event consumes a *contiguous* block of t-indices on a
+    #       shared per-group cursor. A video frame advances the cursor by
+    #       :attr:`_VIDEO_FRAME_T_STEP` so that one frame's "duration" on
+    #       the time axis equals roughly the number of audio tokens
+    #       generated during one second of video (audio-token rate after
+    #       the omni audio encoder, ``100 / 8 = 12.5``).  An audio chunk
+    #       of ``n`` tokens consumes ``n`` slots (each audio token gets
+    #       its own integer t).  This keeps frame and audio temporal
+    #       scales aligned.
+    #   * non-fusion (per-chunk independent window):
+    #       Each event resets t to 0; cross-chunk t cannot be confused
+    #       because each chunk is its own attention segment.
+    #
+    # Both versions reuse the same modality / spatial coordinates; only
+    # the t coordinate differs.  Mirrors
+    # ``vita_megatron/core/models/omni/omni_model.py``.
+    # ----------------------------------------------------------------------
+
+    # Audio tokens emitted per second of video by the omni audio encoder
+    # (``100 Hz`` mel frames / ``8x`` Conv2d temporal downsample). Used as
+    # the per-frame t-step in fusion mode so frame and audio time scales
+    # align on the same axis (``inv_freq`` is shared). Fractional, so the
+    # downstream pos_ids tensor must be float.
+    _VIDEO_FRAME_T_STEP = 100.0 / 8
+
+    def _build_video_frame_4d_rotary(
+        self,
+        grid_row: torch.Tensor,
+        t_base: float,
+        device: torch.device,
+    ):
+        """Build 4D rotary for a single video-frame grid row.
+
+        Returns ``(rotary[T*H*W, dim_rot], t_advance=T*step)`` where
+        ``step = self._VIDEO_FRAME_T_STEP`` so each successive frame on
+        the shared cursor sits ``12.5`` units apart.  ``t_base`` may be
+        fractional (carried over from previous events in the group).
+        """
+        T_, H_, W_ = (int(v) for v in grid_row.tolist())
+        hw = self.encoder._build_vision_hw_pos(H_, W_)  # [H*W, 2] long, CPU
+        hw_f = hw.to(torch.float32)
+        n = hw.size(0)
+        step = self._VIDEO_FRAME_T_STEP
+        pos_ids_list = []
+        for ti in range(T_):
+            m_col = torch.full((n,), float(M_VIDEO_FRAME), dtype=torch.float32)
+            t_col = torch.full((n,), float(t_base) + ti * step, dtype=torch.float32)
+            pos_ids_list.append(
+                torch.stack([m_col, t_col, hw_f[:, 0], hw_f[:, 1]], dim=-1)
+            )
+        pos_ids = torch.cat(pos_ids_list, dim=0)
+        rotary = self.encoder.rotary_pos_emb_4d(pos_ids).to(device)
+        return rotary, T_ * step
+
+    def _build_video_audio_4d_rotary(
+        self,
+        chunk_len: int,
+        t_base: float,
+        device: torch.device,
+    ):
+        """Build 4D rotary for a single video-audio chunk.
+
+        Each audio token consumes one t-slot.  ``t_base`` may be
+        fractional (carried over from previous frame events in the
+        group); the audio side stays on integer offsets relative to it.
+        Returns ``(rotary[n, dim_rot], t_advance=n)``.
+        """
+        n = int(chunk_len)
+        if n <= 0:
+            empty_pos = torch.zeros((0, 4), dtype=torch.float32)
+            return self.encoder.rotary_pos_emb_4d(empty_pos).to(device), 0
+        m_col = torch.full((n,), float(M_VIDEO_AUDIO), dtype=torch.float32)
+        t_col = torch.arange(n, dtype=torch.float32) + float(t_base)
+        z = torch.zeros((n,), dtype=torch.float32)
+        pos_ids = torch.stack([m_col, t_col, z, z], dim=-1)
+        rotary = self.encoder.rotary_pos_emb_4d(pos_ids).to(device)
+        return rotary, n
 
     # ------------------------------------------------------------------ vision
     def forward_vision(
@@ -2204,7 +2546,12 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         spatial merge → projector. Returns ``[N, out_hidden_size]``."""
         hidden_states = self.vision_embeddings(pixel_values, image_grid_thw)
 
-        rotary_pos_emb = self.encoder.vision_rot_pos_emb(image_grid_thw).to(hidden_states.device)
+        if self.use_4d_rope:
+            rotary_pos_emb = self.encoder.vision_rot_pos_emb_4d(
+                image_grid_thw, m_id=M_IMAGE
+            ).to(hidden_states.device)
+        else:
+            rotary_pos_emb = self.encoder.vision_rot_pos_emb(image_grid_thw).to(hidden_states.device)
         cu_seqlens = torch.repeat_interleave(
             image_grid_thw[:, 1] * image_grid_thw[:, 2],
             image_grid_thw[:, 0],
@@ -2250,7 +2597,12 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         cu_seqlens = torch.nn.functional.pad(
             feature_lens.cumsum(dim=0, dtype=torch.int32), (1, 0), value=0
         )
-        rotary_pos_emb = self.encoder.audio_rot_pos_emb(feature_lens).to(hidden_states.device)
+        if self.use_4d_rope:
+            rotary_pos_emb = self.encoder.audio_rot_pos_emb_4d(
+                feature_lens, m_id=M_AUDIO
+            ).to(hidden_states.device)
+        else:
+            rotary_pos_emb = self.encoder.audio_rot_pos_emb(feature_lens).to(hidden_states.device)
 
         hidden_states = self.encoder(
             hidden_states=hidden_states,
@@ -2433,6 +2785,12 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         # the per-layer fusion pattern so the loop stays branch-free; only
         # consumed when at least one layer is non-fusion.
         nofusion_segment_lengths = []
+        # Parallel ``segment_rotary`` for non-fusion layers under 4D RoPE.
+        # Same row count as ``segment_rotary`` but with a per-chunk local
+        # t cursor (each chunk restarts at t=0). Only built when both
+        # ``self.use_4d_rope`` and at least one non-fusion layer exist.
+        build_nofusion_rotary = self.use_4d_rope and self._has_nofusion_layer
+        segment_rotary_nofusion = [] if build_nofusion_rotary else None
         segment_modality_masks = []  # True = vision, False = audio
         per_video_audio_chunk_lens = []
 
@@ -2472,32 +2830,42 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
             audio_token_cursor += video_audio_total_tokens
 
             # ---- per-frame vision rotary ----
+            # In the legacy 2D path we precompute ``vision_rotary_chunks``
+            # / ``audio_rotary_chunks`` here; under 4D RoPE we instead
+            # defer rotary construction to the group loop because the
+            # fusion-mode time index depends on the per-group cursor.
             if num_images > 0:
-                video_vision_rotary = self.encoder.vision_rot_pos_emb(video_grid_thw).to(device)
                 tokens_per_frame = (
                     video_grid_thw[:, 0] * video_grid_thw[:, 1] * video_grid_thw[:, 2]
                 ).tolist()
                 vision_feature_chunks = list(
                     video_vision_features.split(tokens_per_frame, dim=0)
                 )
-                vision_rotary_chunks = list(
-                    video_vision_rotary.split(tokens_per_frame, dim=0)
-                )
+                if self.use_4d_rope:
+                    vision_rotary_chunks = [None] * num_images
+                else:
+                    video_vision_rotary = self.encoder.vision_rot_pos_emb(video_grid_thw).to(device)
+                    vision_rotary_chunks = list(
+                        video_vision_rotary.split(tokens_per_frame, dim=0)
+                    )
             else:
                 vision_feature_chunks, vision_rotary_chunks = [], []
 
             # ---- per-chunk audio rotary ----
             if num_audio_chunks > 0:
-                video_audio_rotary = self.encoder.audio_rot_pos_emb(
-                    video_audio_chunk_lens
-                ).to(device)
                 tokens_per_audio_chunk = video_audio_chunk_lens.tolist()
                 audio_feature_chunks = list(
                     video_audio_features.split(tokens_per_audio_chunk, dim=0)
                 )
-                audio_rotary_chunks = list(
-                    video_audio_rotary.split(tokens_per_audio_chunk, dim=0)
-                )
+                if self.use_4d_rope:
+                    audio_rotary_chunks = [None] * num_audio_chunks
+                else:
+                    video_audio_rotary = self.encoder.audio_rot_pos_emb(
+                        video_audio_chunk_lens
+                    ).to(device)
+                    audio_rotary_chunks = list(
+                        video_audio_rotary.split(tokens_per_audio_chunk, dim=0)
+                    )
             else:
                 audio_feature_chunks, audio_rotary_chunks = [], []
 
@@ -2691,17 +3059,57 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
                 group_features_list = []
                 group_rotary_list = []
                 group_mask_list = []
+                group_rotary_nofusion_list = (
+                    [] if build_nofusion_rotary else None
+                )
+                # Per-group fusion-mode time cursor. A video frame
+                # advances the cursor by ``self._VIDEO_FRAME_T_STEP``
+                # (= 12.5, the audio-token rate per second of video) so
+                # that frame and audio share a common time scale; an
+                # audio chunk advances by its token count. Float because
+                # the per-frame step is fractional.
+                t_cursor_fusion = 0.0
                 for modality_kind, idx in group_events:
                     if modality_kind == 0:
                         feat = vision_feature_chunks[idx]
-                        rot = vision_rotary_chunks[idx]
                         mask_val = True
+                        if self.use_4d_rope:
+                            grid_row = video_grid_thw[idx]
+                            rotary_chunk, t_advance = self._build_video_frame_4d_rotary(
+                                grid_row,
+                                t_base=t_cursor_fusion,
+                                device=device,
+                            )
+                            t_cursor_fusion += t_advance
+                            if build_nofusion_rotary:
+                                rotary_chunk_nofusion, _ = self._build_video_frame_4d_rotary(
+                                    grid_row, t_base=0, device=device
+                                )
+                        else:
+                            rotary_chunk = vision_rotary_chunks[idx]
+                            rotary_chunk_nofusion = None
                     else:
                         feat = audio_feature_chunks[idx]
-                        rot = audio_rotary_chunks[idx]
                         mask_val = False
+                        if self.use_4d_rope:
+                            chunk_len = int(feat.size(0))
+                            rotary_chunk, t_advance = self._build_video_audio_4d_rotary(
+                                chunk_len,
+                                t_base=t_cursor_fusion,
+                                device=device,
+                            )
+                            t_cursor_fusion += t_advance
+                            if build_nofusion_rotary:
+                                rotary_chunk_nofusion, _ = self._build_video_audio_4d_rotary(
+                                    chunk_len, t_base=0, device=device
+                                )
+                        else:
+                            rotary_chunk = audio_rotary_chunks[idx]
+                            rotary_chunk_nofusion = None
                     group_features_list.append(feat)
-                    group_rotary_list.append(rot)
+                    group_rotary_list.append(rotary_chunk)
+                    if build_nofusion_rotary:
+                        group_rotary_nofusion_list.append(rotary_chunk_nofusion)
                     group_mask_list.append(
                         torch.full(
                             (feat.size(0),),
@@ -2718,9 +3126,15 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
                 group_features_tensor = torch.cat(group_features_list, dim=0)
                 group_rotary_tensor = torch.cat(group_rotary_list, dim=0)
                 group_mask_tensor = torch.cat(group_mask_list, dim=0)
+                if build_nofusion_rotary:
+                    group_rotary_nofusion_tensor = torch.cat(
+                        group_rotary_nofusion_list, dim=0
+                    )
 
                 segment_features.append(group_features_tensor)
                 segment_rotary.append(group_rotary_tensor)
+                if build_nofusion_rotary:
+                    segment_rotary_nofusion.append(group_rotary_nofusion_tensor)
                 segment_modality_masks.append(group_mask_tensor)
                 segment_lengths.append(group_features_tensor.size(0))
 
@@ -2738,6 +3152,12 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         packed_features = torch.cat(segment_features, dim=0)
         packed_rotary = torch.cat(segment_rotary, dim=0)
         packed_modality_mask = torch.cat(segment_modality_masks, dim=0)
+        # Parallel non-fusion rotary (only when 4D RoPE + non-fusion layer).
+        packed_rotary_nofusion = (
+            torch.cat(segment_rotary_nofusion, dim=0)
+            if build_nofusion_rotary
+            else None
+        )
 
         cu_seqlens_fusion = torch.nn.functional.pad(
             torch.tensor(segment_lengths, dtype=torch.int32, device=device).cumsum(
@@ -2772,11 +3192,24 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         else:
             cu_seqlens = cu_seqlens_fusion
 
+        # Per-layer rotary dispatch: under 4D RoPE, fusion vs non-fusion
+        # layers MUST see different rotary embeddings even for the same
+        # physical token (fusion uses group-shared time, non-fusion uses
+        # per-chunk-local time). For all other configurations the legacy
+        # single-tensor rotary is used and broadcasts to every layer.
+        if build_nofusion_rotary:
+            rotary_pos_emb_arg = [
+                packed_rotary if fusion else packed_rotary_nofusion
+                for fusion in self._video_fusion_layer_pattern
+            ]
+        else:
+            rotary_pos_emb_arg = packed_rotary
+
         # 4. Run the shared transformer once over the packed sequence.
         encoder_output = self.encoder(
             hidden_states=packed_features,
             cu_seqlens=cu_seqlens,
-            rotary_pos_emb=packed_rotary,
+            rotary_pos_emb=rotary_pos_emb_arg,
         ).last_hidden_state
 
         # 5. Split encoder output back via ``packed_modality_mask``.

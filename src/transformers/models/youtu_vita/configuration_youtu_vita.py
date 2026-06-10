@@ -257,6 +257,11 @@ class YoutuVITAOmniConfig(YoutuVITATextConfig):
     # Only used by :meth:`YoutuVITAOmniModel.forward_video`; non-video
     # paths already encode each image / audio independently.
     video_fusion_layer_freq: int | list | None = None
+    # If True, the omni encoder uses 4D RoPE (M | T | H | W) instead of the
+    # legacy 2D (vision) / 1D (audio) rotary path. Mirrors the megatron-side
+    # ``--video-omni-4d-rope`` flag. Default False preserves legacy
+    # behaviour exactly. See :class:`YoutuVITAOmniFourDRotaryEmbedding`.
+    video_omni_4d_rope: bool = False
 
 
 class YoutuVITAConfig(PreTrainedConfig):
