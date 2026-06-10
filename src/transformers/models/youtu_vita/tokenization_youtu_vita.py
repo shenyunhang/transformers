@@ -7,14 +7,14 @@
 
 import os
 import uuid
-
 import torch
+from ...models.whisper.feature_extraction_whisper import WhisperFeatureExtractor
+from ...utils import is_decord_available, is_flash_attn_2_available, is_torchaudio_available, logging
+
 from funasr.frontends.wav_frontend import WavFrontend
 from funasr.utils.load_utils import extract_fbank
 
-from ...models.whisper.feature_extraction_whisper import WhisperFeatureExtractor
-from ...utils import is_torchaudio_available, logging
-
+from ... import is_torch_available
 
 if is_torchaudio_available():
     import torchaudio
@@ -23,6 +23,7 @@ logger = logging.get_logger(__name__)
 
 
 class GLM4VoiceTokenizer:
+
     sampling_rate = 16000
 
     is_discrete = True
@@ -76,17 +77,21 @@ class GLM4VoiceTokenizer:
             assert isinstance(self.model_name_or_path, str)
 
             from speech_tokenizer.modeling_whisper import WhisperVQEncoder
-
-            logger.info(f"⏳ {self.device=} Loading {self.tokenizer_type} from {self.model_name_or_path}")
-            self.whisper_model = WhisperVQEncoder.from_pretrained(self.model_name_or_path).eval().to(self.device)
-            self.feature_extractor = WhisperFeatureExtractor.from_pretrained(self.model_name_or_path)
+            logger.info(
+                f"⏳ {self.device=} Loading {self.tokenizer_type} from {self.model_name_or_path}"
+            )
+            self.whisper_model = (
+                WhisperVQEncoder.from_pretrained(self.model_name_or_path).eval().to(self.device)
+            )
+            self.feature_extractor = WhisperFeatureExtractor.from_pretrained(
+                self.model_name_or_path
+            )
             logger.info(f"⏳ {self.device=} Loading {self.tokenizer_type} Done")
 
         if not hasattr(self, "audio_decoder") and self.flow_path:
             assert isinstance(self.flow_path, str)
 
             from .flow_inference import AudioDecoder
-
             logger.info(f"⏳ {self.device=} Loading zai-org/glm-4-voice-decoder")
             flow_config = os.path.join(self.flow_path, "config.yaml")
             flow_checkpoint = os.path.join(self.flow_path, "flow.pt")
@@ -158,7 +163,7 @@ class GLM4VoiceTokenizer:
                     if sampling_rate not in self._resample_buffer:
                         self._resample_buffer[sampling_rate] = torchaudio.transforms.Resample(
                             orig_freq=sampling_rate, new_freq=16000
-                        )  # .to(device)
+                        ) #.to(device)
                     # self._resample_buffer[sampling_rate].to(device)
                     audio = self._resample_buffer[sampling_rate](audio)
                 # if audio.shape[0] > 1:
@@ -178,7 +183,12 @@ class GLM4VoiceTokenizer:
                 return [0]
 
             pooling_kernel_size = model.config.pooling_kernel_size or 1
-            stride = model.conv1.stride[0] * model.conv2.stride[0] * pooling_kernel_size * feature_extractor.hop_length
+            stride = (
+                model.conv1.stride[0]
+                * model.conv2.stride[0]
+                * pooling_kernel_size
+                * feature_extractor.hop_length
+            )
             all_speech_tokens = [[] for _ in range(len(utts))]
             batch_size = 32
             for start in range(0, len(audios), batch_size):
@@ -194,7 +204,9 @@ class GLM4VoiceTokenizer:
                 features = features.to(device=device)
                 outputs = model(**features)
                 speech_tokens = outputs.quantized_token_ids
-                attention_mask = features.attention_mask[:, :: model.conv1.stride[0] * model.conv2.stride[0]]
+                attention_mask = features.attention_mask[
+                    :, :: model.conv1.stride[0] * model.conv2.stride[0]
+                ]
                 attention_mask = attention_mask[:, :: model.config.pooling_kernel_size]
                 assert attention_mask.shape == speech_tokens.shape
                 for i in range(len(speech_tokens)):
@@ -206,9 +218,7 @@ class GLM4VoiceTokenizer:
 
 
 class WavFrontendTokenizer:
-    def __init__(
-        self,
-    ):
+    def __init__(self,):
 
         self.sampling_rate = 16000
 
@@ -225,7 +235,9 @@ class WavFrontendTokenizer:
 
         self.device = "cpu"
 
-        logger.info(f"⏳ {self.device=} Loading {self.tokenizer_type}")
+        logger.info(
+            f"⏳ {self.device=} Loading {self.tokenizer_type}"
+        )
         self.frontend = WavFrontend(
             fs=16000,
             window="hamming",
@@ -344,8 +356,12 @@ class MelFilterBankTokenizer:
 
         assert isinstance(self.model_name_or_path, str)
 
-        logger.info(f"⏳ {self.device=} Loading {self.tokenizer_type} from {self.model_name_or_path}")
-        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(self.model_name_or_path)
+        logger.info(
+            f"⏳ {self.device=} Loading {self.tokenizer_type} from {self.model_name_or_path}"
+        )
+        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(
+            self.model_name_or_path
+        )
         logger.info(f"⏳ {self.device=} Loading {self.tokenizer_type} Done")
 
     @torch.no_grad()
@@ -445,7 +461,9 @@ class VisionTokenizer:
         ):
             self.tokenizer_contiguous.load_model()
 
-        if hasattr(self.tokenizer_discrete, "load_model") and callable(getattr(self.tokenizer_discrete, "load_model")):
+        if hasattr(self.tokenizer_discrete, "load_model") and callable(
+            getattr(self.tokenizer_discrete, "load_model")
+        ):
             self.tokenizer_discrete.load_model()
 
     @torch.no_grad()
@@ -513,7 +531,9 @@ class AudioTokenizer:
         ):
             self.tokenizer_contiguous.load_model()
 
-        if hasattr(self.tokenizer_discrete, "load_model") and callable(getattr(self.tokenizer_discrete, "load_model")):
+        if hasattr(self.tokenizer_discrete, "load_model") and callable(
+            getattr(self.tokenizer_discrete, "load_model")
+        ):
             self.tokenizer_discrete.load_model()
 
     @torch.no_grad()

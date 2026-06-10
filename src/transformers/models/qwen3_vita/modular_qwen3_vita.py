@@ -246,11 +246,36 @@ class Qwen3VITAOmniConfig(Qwen3VITATextConfig):
     # Only used by :meth:`Qwen3VITAOmniModel.forward_video`; non-video
     # paths already encode each image / audio independently.
     video_fusion_layer_freq: Optional[Union[int, list]] = None
-    # If True, the omni encoder uses 4D RoPE (M | T | H | W) instead of the
-    # legacy 2D (vision) / 1D (audio) rotary path. Mirrors the megatron-side
-    # ``--video-omni-4d-rope`` flag. Default False preserves legacy
-    # behaviour exactly. See :class:`Qwen3VITAOmniFourDRotaryEmbedding`.
-    video_omni_4d_rope: bool = False
+    # ------------------------------------------------------------------ 4D RoPE
+    # Two mutually exclusive 4D RoPE flavours for the omni encoder; both
+    # replace the legacy 2D (vision) / 1D (audio) rotary path with per-token
+    # ``(m, t, h, w)`` coordinates.  When neither flag is set the default
+    # legacy behaviour is preserved exactly.  When both are set the
+    # ``interleaved`` variant takes precedence (interleaved is the
+    # recommended config — see ``visualization/rope_2d_to_3d.html`` §5.8b).
+    #
+    # Mirrors the megatron-side flags ``--video-omni-chunked-mthw-rope``
+    # and ``--video-omni-interleaved-mthw-rope``. See
+    # :class:`Qwen3VITAOmniChunkedMTHWRotaryEmbedding` and
+    # :class:`Qwen3VITAOmniInterleavedMTHWRotaryEmbedding`.
+    video_omni_chunked_mthw_rope: bool = False
+    video_omni_interleaved_mthw_rope: bool = False
+    # Optional explicit ``(t_len, h_len, w_len)`` split for the THW segment
+    # in the interleaved variant; required to satisfy
+    # ``t_len == max(...)`` (T is the base of the stride=3 interleave).
+    # ``None`` triggers the default :func:`_split_3d_section` (T takes the
+    # remainder so ``mrope_section_thw[0] == max``).
+    video_omni_interleaved_thw_section: Optional[Tuple[int, int, int]] = None
+    # Shared M-segment hyper-parameters used by both 4D variants:
+    #   * ``four_d_rope_m_dim``   -- size of the modality segment (defaults
+    #     to ``4`` -- four M ids: image / audio / video_frame / video_audio);
+    #   * ``four_d_rope_theta_m`` -- small theta so low-cardinality modality
+    #     ids produce non-vanishing rotation angles even at the lowest
+    #     frequency slot of the M segment;
+    #   * ``four_d_rope_theta``   -- standard 10000 for T / H / W segments.
+    four_d_rope_m_dim: int = 4
+    four_d_rope_theta_m: float = 100.0
+    four_d_rope_theta: float = 10000.0
 
 
 class Qwen3VITAConfig(PreTrainedConfig):
@@ -1816,20 +1841,25 @@ class Qwen3VITAOmniRotaryEmbedding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 4D RoPE (M | T | H | W) for the omni encoder.
+# Chunked 4D RoPE (M | T | H | W) for the omni encoder.
 #
-# Mirrors ``vita_megatron/core/models/omni/gpt_model.py``: the
-# ``head_dim`` of the omni transformer is split into 4 segments by way
-# of concatenating 4 separate ``inv_freq`` lookup tables. Downstream
-# ``vision_apply_rotary_pos_emb_flashatt`` is unchanged because the
-# encoder duplicates ``rotary_pos_emb`` along the feature axis to reach
-# ``head_dim`` (mirroring ``cos.repeat(...,2)`` on the megatron side).
+# Mirrors :class:`ChunkedMTHWRotaryEmbedding` in
+# ``vita_megatron/core/models/omni/gpt_model.py``: the ``head_dim`` of the
+# omni transformer is split into 4 connected segments by way of
+# concatenating 4 separate ``inv_freq`` lookup tables. Downstream
+# ``vision_apply_rotary_pos_emb_flashatt`` is unchanged because the encoder
+# duplicates ``rotary_pos_emb`` along the feature axis to reach ``head_dim``
+# (mirroring ``cos.repeat(...,2)`` on the megatron side).
 #
 # Constraints:
 #   m_dim + t_dim + h_dim + w_dim == head_dim // 2
 #   theta_m: small (default 100) so that small-cardinality modality ids
 #     produce non-vanishing rotation angles even at the lowest frequency.
 #   theta:   standard 10000 for T / H / W.
+#
+# Companion: :class:`Qwen3VITAOmniInterleavedMTHWRotaryEmbedding` (see §5.8b)
+# is a drop-in replacement with the same ``forward(pos_ids: [S, 4]) ->
+# [S, dim_rot]`` signature.
 # ---------------------------------------------------------------------------
 
 # Modality ids consumed by the M segment.  Image and audio are also used
@@ -1865,8 +1895,17 @@ def _split_4d_dims(dim_rot: int, m_dim: int = 4) -> tuple:
     return m_dim, t_dim, h_dim, w_dim
 
 
-class Qwen3VITAOmniFourDRotaryEmbedding(nn.Module):
-    """4D RoPE frequency table.
+class Qwen3VITAOmniChunkedMTHWRotaryEmbedding(nn.Module):
+    """Chunked 4D RoPE frequency table (visualization §5.6).
+
+    Layout over ``dim_rot = head_dim // 2``::
+
+        [ M (m_dim) | T (t_dim) | H (h_dim) | W (w_dim) ]   ← connected segments
+
+    Companion of :class:`Qwen3VITAOmniInterleavedMTHWRotaryEmbedding`
+    (§5.8b): both have the same ``forward(pos_ids: [S, 4]) -> [S, dim_rot]``
+    signature so the encoder can pick either at construction time without
+    any other code change.
 
     ``forward(pos_ids)`` takes a ``[S, 4]`` tensor whose columns are
     ``(m, t, h, w)`` (long or float; ``t`` may be fractional) and returns
@@ -1909,8 +1948,8 @@ class Qwen3VITAOmniFourDRotaryEmbedding(nn.Module):
     def forward(self, pos_ids: torch.Tensor) -> torch.Tensor:
         if pos_ids.dim() != 2 or pos_ids.size(-1) != 4:
             raise ValueError(
-                f"Qwen3VITAOmniFourDRotaryEmbedding expects pos_ids of shape "
-                f"[S, 4], got {tuple(pos_ids.shape)}"
+                f"Qwen3VITAOmniChunkedMTHWRotaryEmbedding expects pos_ids of "
+                f"shape [S, 4], got {tuple(pos_ids.shape)}"
             )
         device = pos_ids.device
         pos = pos_ids.to(dtype=torch.float32)
@@ -1923,6 +1962,164 @@ class Qwen3VITAOmniFourDRotaryEmbedding(nn.Module):
         h_freqs = torch.outer(pos[:, 2], h_inv)
         w_freqs = torch.outer(pos[:, 3], w_inv)
         return torch.cat([m_freqs, t_freqs, h_freqs, w_freqs], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Interleaved 4D RoPE (visualization §5.8b): M-only high-frequency segment +
+# T/H/W stride=3 interleaved (Qwen3-VL style ``apply_interleaved_mrope``).
+#
+# Motivation (see ``visualization/rope_2d_to_3d.html`` §5.8 H + §5.8b):
+#   Letting M occupy ``stride=4`` slots in a fully-interleaved 4D layout
+#   wastes half of M's slots: ``m_id * inv_freq[k]`` collapses to ~0 for
+#   small m_id at low frequencies. M is a small-cardinality categorical id
+#   (image / audio / video_frame / video_audio = 4 values) that only needs
+#   a few high-frequency slots to be discriminable, while the
+#   low-frequency tail is most valuable for the T axis (long-range
+#   temporal encoding).
+#
+# Layout (over ``dim_rot = head_dim // 2``):
+#   [ M-only m_dim slots (highest m_dim frequencies)
+#   | T/H/W stride=3 interleaved over the remaining thw_dim ]
+#
+# THW segment behaviour matches §5.7 / Qwen3-VL ``apply_interleaved_mrope``:
+# T is the base (covers all thw_dim slots), H/W overwrite stride=3 slices.
+# ---------------------------------------------------------------------------
+
+
+def apply_interleaved_mrope(freqs: torch.Tensor, mrope_section) -> torch.Tensor:
+    """Qwen3-VL style ``apply_interleaved_mrope`` (stride=3, base=axis 0).
+
+    Reorganizes a ``[3, S, dim_rot]`` per-axis frequency tensor into a
+    ``[S, dim_rot]`` interleaved layout ``[T H W T H W ... T T]``.
+
+    Args:
+        freqs: ``[3, S, dim_rot]``; axis-0 order is ``(T, H, W)``.
+        mrope_section: 3-tuple ``(t_len, h_len, w_len)``. Constraints:
+            * ``sum == dim_rot``
+            * ``t_len = max(...)`` (T is the base, owns the overflow).
+    """
+    if freqs.dim() != 3 or freqs.size(0) != 3:
+        raise ValueError(
+            f"apply_interleaved_mrope expects freqs of shape [3, S, dim_rot], "
+            f"got {tuple(freqs.shape)}"
+        )
+    out = freqs[0].clone()                                        # base = T
+    for dim, offset in enumerate((1, 2), start=1):                # H -> 1, W -> 2
+        length = int(mrope_section[dim]) * 3
+        idx = slice(offset, length, 3)
+        out[..., idx] = freqs[dim, ..., idx]
+    return out
+
+
+def _split_3d_section(thw_dim: int) -> Tuple[int, int, int]:
+    """Default ``mrope_section_thw`` for the THW segment.
+
+    T takes the remainder so that ``mrope_section[0] = max`` (required by
+    :func:`apply_interleaved_mrope`).
+    """
+    if thw_dim < 3:
+        raise ValueError(f"thw_dim must be >= 3, got {thw_dim}")
+    per = thw_dim // 3
+    rem = thw_dim - per * 3
+    return (per + rem, per, per)                                  # (t, h, w), t = max
+
+
+class Qwen3VITAOmniInterleavedMTHWRotaryEmbedding(nn.Module):
+    """Interleaved 4D RoPE: M-only high-frequency segment + T/H/W interleaved.
+
+    Drop-in replacement for :class:`Qwen3VITAOmniChunkedMTHWRotaryEmbedding`:
+    same forward signature ``(pos_ids: [S, 4]) -> [S, dim_rot]``, same
+    ``dim_rot`` attribute.
+
+    See ``visualization/rope_2d_to_3d.html`` §5.8b for the rationale.
+    """
+
+    def __init__(
+        self,
+        dim_rot: int,
+        m_dim: int = 4,
+        mrope_section_thw: Optional[Tuple[int, int, int]] = None,
+        theta_m: float = 100.0,
+        theta: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        thw_dim = dim_rot - m_dim
+        if not (m_dim >= 1 and thw_dim >= 3):
+            raise ValueError(
+                f"InterleavedMTHWRotaryEmbedding requires m_dim>=1 and "
+                f"thw_dim>=3, got m_dim={m_dim}, thw_dim={thw_dim} "
+                f"(dim_rot={dim_rot})"
+            )
+        if mrope_section_thw is None:
+            mrope_section_thw = _split_3d_section(thw_dim)
+        sec = tuple(int(x) for x in mrope_section_thw)
+        if sum(sec) != thw_dim:
+            raise ValueError(
+                f"mrope_section_thw sum {sum(sec)} must equal thw_dim={thw_dim}"
+            )
+        if sec[0] != max(sec):
+            raise ValueError(
+                f"mrope_section_thw[0] (T) must be the largest segment "
+                f"(base of the stride=3 interleave); got {sec}"
+            )
+
+        # Public attributes (mirror chunked variant for drop-in compat).
+        self.m_dim = m_dim
+        self.t_dim = sec[0]
+        self.h_dim = sec[1]
+        self.w_dim = sec[2]
+        self.thw_dim = thw_dim
+        self.dim_rot = dim_rot
+        self.mrope_section_thw = sec
+        self.theta_m = theta_m
+        self.theta = theta
+
+    def _make_m_inv(self, device: torch.device) -> torch.Tensor:
+        # M segment: m_dim independent inv_freq slots (only highest freq).
+        return 1.0 / (
+            self.theta_m
+            ** (
+                torch.arange(0, self.m_dim * 2, 2, dtype=torch.float32, device=device)
+                / (self.m_dim * 2)
+            )
+        )
+
+    def _make_thw_inv(self, device: torch.device) -> torch.Tensor:
+        # T/H/W shared full-length inv_freq table; after stride=3 interleave
+        # each axis ends up with an evenly-spaced ``mrope_section_thw[d]``-
+        # sized subset spanning the entire frequency range.
+        return 1.0 / (
+            self.theta
+            ** (
+                torch.arange(0, self.thw_dim * 2, 2, dtype=torch.float32, device=device)
+                / (self.thw_dim * 2)
+            )
+        )
+
+    def forward(self, pos_ids: torch.Tensor) -> torch.Tensor:
+        if pos_ids.dim() != 2 or pos_ids.size(-1) != 4:
+            raise ValueError(
+                f"Qwen3VITAOmniInterleavedMTHWRotaryEmbedding expects pos_ids "
+                f"of shape [S, 4], got {tuple(pos_ids.shape)}"
+            )
+        device = pos_ids.device
+        pos = pos_ids.to(dtype=torch.float32)
+
+        # M segment: small-cardinality id rotated only on highest m_dim
+        # frequency slots (small theta_m keeps low m_id values discriminable).
+        m_inv = self._make_m_inv(device)
+        m_freqs = torch.outer(pos[:, 0], m_inv)                   # [S, m_dim]
+
+        # THW segment: 3 axes share the same full-length thw_inv, then
+        # stride=3 interleave gives each axis an even subset of slots.
+        thw_inv = self._make_thw_inv(device)
+        f_t = torch.outer(pos[:, 1], thw_inv)                     # [S, thw_dim]
+        f_h = torch.outer(pos[:, 2], thw_inv)
+        f_w = torch.outer(pos[:, 3], thw_inv)
+        thw_stack = torch.stack([f_t, f_h, f_w], dim=0)           # [3, S, thw_dim]
+        thw_freqs = apply_interleaved_mrope(thw_stack, self.mrope_section_thw)
+
+        return torch.cat([m_freqs, thw_freqs], dim=-1)            # [S, dim_rot]
 
 
 class Qwen3VITAOmniVisionEmbeddings(Qwen3VITAVisionEmbeddings):
@@ -2086,31 +2283,67 @@ class Qwen3VITAOmniEncoder(Qwen3VITAOmniPreTrainedModel):
         # final freqs dim equals ``head_dim``, audio duplicates to match.
         self.rotary_pos_emb = Qwen3VITAOmniRotaryEmbedding(config.head_dim // 2)
 
-        # Optional 4D RoPE (M | T | H | W). Enabled by
-        # ``config.video_omni_4d_rope`` (default False).  The buffer dim
-        # split uses :func:`_split_4d_dims`; see the megatron reference
+        # Optional 4D RoPE (M | T | H | W). Two mutually exclusive flavours
+        # mirror the megatron-side flags
+        # ``--video-omni-chunked-mthw-rope`` (§5.6 chunked) and
+        # ``--video-omni-interleaved-mthw-rope`` (§5.8b interleaved). When
+        # both are set the interleaved variant takes precedence.  See
+        # ``visualization/rope_2d_to_3d.html`` and
         # ``vita_megatron/core/models/omni/gpt_model.py`` for the layout.
-        self.use_4d_rope = bool(getattr(config, "video_omni_4d_rope", False))
+        self.video_omni_chunked_mthw_rope = bool(
+            getattr(config, "video_omni_chunked_mthw_rope", False)
+        )
+        self.video_omni_interleaved_mthw_rope = bool(
+            getattr(config, "video_omni_interleaved_mthw_rope", False)
+        )
+        self.video_omni_interleaved_thw_section = getattr(
+            config, "video_omni_interleaved_thw_section", None
+        )
         self.rotary_pos_emb_4d = None
         self._4d_dims = None
-        if self.use_4d_rope:
+        if self.video_omni_chunked_mthw_rope or self.video_omni_interleaved_mthw_rope:
             dim_rot = config.head_dim // 2
-            m_dim, t_dim, h_dim, w_dim = _split_4d_dims(dim_rot, m_dim=4)
-            self.rotary_pos_emb_4d = Qwen3VITAOmniFourDRotaryEmbedding(
-                m_dim=m_dim,
-                t_dim=t_dim,
-                h_dim=h_dim,
-                w_dim=w_dim,
-                theta_m=100.0,
-                theta=10000.0,
-            )
-            self._4d_dims = (m_dim, t_dim, h_dim, w_dim)
-            print(
-                f"[Qwen3VITAOmniEncoder] 4D RoPE enabled: head_dim="
-                f"{config.head_dim}, dim_rot={dim_rot}, "
-                f"_4d_dims=(m={m_dim}, t={t_dim}, h={h_dim}, w={w_dim}), "
-                f"theta_m=100.0, theta=10000.0"
-            )
+            m_dim_cfg = int(getattr(config, "four_d_rope_m_dim", 4))
+            theta_m_cfg = float(getattr(config, "four_d_rope_theta_m", 100.0))
+            theta_cfg = float(getattr(config, "four_d_rope_theta", 10000.0))
+            if self.video_omni_interleaved_mthw_rope:
+                self.rotary_pos_emb_4d = Qwen3VITAOmniInterleavedMTHWRotaryEmbedding(
+                    dim_rot=dim_rot,
+                    m_dim=m_dim_cfg,
+                    mrope_section_thw=self.video_omni_interleaved_thw_section,
+                    theta_m=theta_m_cfg,
+                    theta=theta_cfg,
+                )
+                sec = self.rotary_pos_emb_4d.mrope_section_thw
+                self._4d_dims = (
+                    self.rotary_pos_emb_4d.m_dim,
+                    self.rotary_pos_emb_4d.t_dim,
+                    self.rotary_pos_emb_4d.h_dim,
+                    self.rotary_pos_emb_4d.w_dim,
+                )
+                print(
+                    f"[Qwen3VITAOmniEncoder] Interleaved-MTHW 4D RoPE enabled: "
+                    f"head_dim={config.head_dim}, dim_rot={dim_rot}, "
+                    f"m_dim={m_dim_cfg}, mrope_section_thw={sec}, "
+                    f"theta_m={theta_m_cfg}, theta={theta_cfg}"
+                )
+            else:
+                m_dim, t_dim, h_dim, w_dim = _split_4d_dims(dim_rot, m_dim=m_dim_cfg)
+                self.rotary_pos_emb_4d = Qwen3VITAOmniChunkedMTHWRotaryEmbedding(
+                    m_dim=m_dim,
+                    t_dim=t_dim,
+                    h_dim=h_dim,
+                    w_dim=w_dim,
+                    theta_m=theta_m_cfg,
+                    theta=theta_cfg,
+                )
+                self._4d_dims = (m_dim, t_dim, h_dim, w_dim)
+                print(
+                    f"[Qwen3VITAOmniEncoder] Chunked-MTHW 4D RoPE enabled: "
+                    f"head_dim={config.head_dim}, dim_rot={dim_rot}, "
+                    f"_4d_dims=(m={m_dim}, t={t_dim}, h={h_dim}, w={w_dim}), "
+                    f"theta_m={theta_m_cfg}, theta={theta_cfg}"
+                )
 
         self.layers = nn.ModuleList(
             [Qwen3VITAOmniEncoderLayer(config) for _ in range(config.num_hidden_layers)]
@@ -2163,7 +2396,9 @@ class Qwen3VITAOmniEncoder(Qwen3VITAOmniPreTrainedModel):
         return rotary_pos_emb
 
     # ------------------------------------------------------------------
-    # 4D RoPE helpers (only valid when ``self.use_4d_rope`` is True).
+    # 4D RoPE helpers (only valid when ``self.rotary_pos_emb_4d`` is built,
+    # i.e. either ``video_omni_chunked_mthw_rope`` or
+    # ``video_omni_interleaved_mthw_rope`` is enabled).
     # All return a ``[S, dim_rot]`` raw-angle tensor consumable by the
     # downstream cos/sin computation in :meth:`forward`.
     # ------------------------------------------------------------------
@@ -2197,7 +2432,9 @@ class Qwen3VITAOmniEncoder(Qwen3VITAOmniPreTrainedModel):
         """
         if self.rotary_pos_emb_4d is None:
             raise RuntimeError(
-                "vision_rot_pos_emb_4d called but use_4d_rope is False"
+                "vision_rot_pos_emb_4d called but neither "
+                "video_omni_chunked_mthw_rope nor "
+                "video_omni_interleaved_mthw_rope is enabled"
             )
         pos_ids_list = []
         for t, h, w in grid_thw.tolist():
@@ -2228,7 +2465,9 @@ class Qwen3VITAOmniEncoder(Qwen3VITAOmniPreTrainedModel):
         """
         if self.rotary_pos_emb_4d is None:
             raise RuntimeError(
-                "audio_rot_pos_emb_4d called but use_4d_rope is False"
+                "audio_rot_pos_emb_4d called but neither "
+                "video_omni_chunked_mthw_rope nor "
+                "video_omni_interleaved_mthw_rope is enabled"
             )
         pos_ids_list = []
         for length in lens.tolist():
@@ -2442,10 +2681,20 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
         # can fall back to a single ``cu_seqlens`` tensor (legacy path).
         self._has_nofusion_layer = not all(self._video_fusion_layer_pattern)
 
-        # 4D RoPE switch (mirrors the megatron-side ``--video-omni-4d-rope``).
-        # When True the omni encoder uses (M | T | H | W) coordinates per
-        # token; default False keeps the legacy 2D / 1D rotary path.
-        self.use_4d_rope = bool(getattr(config, "video_omni_4d_rope", False))
+        # 4D RoPE switches (mirror megatron-side flags
+        # ``--video-omni-chunked-mthw-rope`` and
+        # ``--video-omni-interleaved-mthw-rope``).  When either is True
+        # the omni encoder uses (M | T | H | W) coordinates per token;
+        # default False keeps the legacy 2D / 1D rotary path.  The two
+        # flags are mutually exclusive (interleaved takes precedence in
+        # the encoder's instantiation logic); we keep both attributes so
+        # call sites can use the explicit ``or`` predicate.
+        self.video_omni_chunked_mthw_rope = bool(
+            getattr(config, "video_omni_chunked_mthw_rope", False)
+        )
+        self.video_omni_interleaved_mthw_rope = bool(
+            getattr(config, "video_omni_interleaved_mthw_rope", False)
+        )
 
         self.post_init()
 
@@ -2454,8 +2703,10 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
     #
     # ``forward_video`` packs multiple video chunks (one event per image
     # frame / one event per audio chunk) into a single sequence and emits
-    # one or more attention groups per video. When ``self.use_4d_rope`` is
-    # True we generate two parallel rotary embeddings:
+    # one or more attention groups per video. When either
+    # ``video_omni_chunked_mthw_rope`` or
+    # ``video_omni_interleaved_mthw_rope`` is enabled we generate two
+    # parallel rotary embeddings:
     #
     #   * fusion (group-shared window):
     #       Each event consumes a *contiguous* block of t-indices on a
@@ -2546,7 +2797,7 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
         spatial merge → projector. Returns ``[N, out_hidden_size]``."""
         hidden_states = self.vision_embeddings(pixel_values, image_grid_thw)
 
-        if self.use_4d_rope:
+        if (self.video_omni_chunked_mthw_rope or self.video_omni_interleaved_mthw_rope):
             rotary_pos_emb = self.encoder.vision_rot_pos_emb_4d(
                 image_grid_thw, m_id=M_IMAGE
             ).to(hidden_states.device)
@@ -2597,7 +2848,7 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
         cu_seqlens = torch.nn.functional.pad(
             feature_lens.cumsum(dim=0, dtype=torch.int32), (1, 0), value=0
         )
-        if self.use_4d_rope:
+        if (self.video_omni_chunked_mthw_rope or self.video_omni_interleaved_mthw_rope):
             rotary_pos_emb = self.encoder.audio_rot_pos_emb_4d(
                 feature_lens, m_id=M_AUDIO
             ).to(hidden_states.device)
@@ -2787,9 +3038,10 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
         nofusion_segment_lengths = []
         # Parallel ``segment_rotary`` for non-fusion layers under 4D RoPE.
         # Same row count as ``segment_rotary`` but with a per-chunk local
-        # t cursor (each chunk restarts at t=0). Only built when both
-        # ``self.use_4d_rope`` and at least one non-fusion layer exist.
-        build_nofusion_rotary = self.use_4d_rope and self._has_nofusion_layer
+        # t cursor (each chunk restarts at t=0). Only built when 4D RoPE
+        # is enabled (chunked or interleaved) and at least one non-fusion
+        # layer exists.
+        build_nofusion_rotary = (self.video_omni_chunked_mthw_rope or self.video_omni_interleaved_mthw_rope) and self._has_nofusion_layer
         segment_rotary_nofusion = [] if build_nofusion_rotary else None
         segment_modality_masks = []  # True = vision, False = audio
         per_video_audio_chunk_lens = []
@@ -2841,7 +3093,7 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                 vision_feature_chunks = list(
                     video_vision_features.split(tokens_per_frame, dim=0)
                 )
-                if self.use_4d_rope:
+                if (self.video_omni_chunked_mthw_rope or self.video_omni_interleaved_mthw_rope):
                     vision_rotary_chunks = [None] * num_images
                 else:
                     video_vision_rotary = self.encoder.vision_rot_pos_emb(video_grid_thw).to(device)
@@ -2857,7 +3109,7 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                 audio_feature_chunks = list(
                     video_audio_features.split(tokens_per_audio_chunk, dim=0)
                 )
-                if self.use_4d_rope:
+                if (self.video_omni_chunked_mthw_rope or self.video_omni_interleaved_mthw_rope):
                     audio_rotary_chunks = [None] * num_audio_chunks
                 else:
                     video_audio_rotary = self.encoder.audio_rot_pos_emb(
@@ -3073,7 +3325,7 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                     if modality_kind == 0:
                         feat = vision_feature_chunks[idx]
                         mask_val = True
-                        if self.use_4d_rope:
+                        if (self.video_omni_chunked_mthw_rope or self.video_omni_interleaved_mthw_rope):
                             grid_row = video_grid_thw[idx]
                             rotary_chunk, t_advance = self._build_video_frame_4d_rotary(
                                 grid_row,
@@ -3091,7 +3343,7 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                     else:
                         feat = audio_feature_chunks[idx]
                         mask_val = False
-                        if self.use_4d_rope:
+                        if (self.video_omni_chunked_mthw_rope or self.video_omni_interleaved_mthw_rope):
                             chunk_len = int(feat.size(0))
                             rotary_chunk, t_advance = self._build_video_audio_4d_rotary(
                                 chunk_len,

@@ -257,11 +257,36 @@ class YoutuVITAOmniConfig(YoutuVITATextConfig):
     # Only used by :meth:`YoutuVITAOmniModel.forward_video`; non-video
     # paths already encode each image / audio independently.
     video_fusion_layer_freq: int | list | None = None
-    # If True, the omni encoder uses 4D RoPE (M | T | H | W) instead of the
-    # legacy 2D (vision) / 1D (audio) rotary path. Mirrors the megatron-side
-    # ``--video-omni-4d-rope`` flag. Default False preserves legacy
-    # behaviour exactly. See :class:`YoutuVITAOmniFourDRotaryEmbedding`.
-    video_omni_4d_rope: bool = False
+    # ------------------------------------------------------------------ 4D RoPE
+    # Two mutually exclusive 4D RoPE flavours for the omni encoder; both
+    # replace the legacy 2D (vision) / 1D (audio) rotary path with per-token
+    # ``(m, t, h, w)`` coordinates.  When neither flag is set the default
+    # legacy behaviour is preserved exactly.  When both are set the
+    # ``interleaved`` variant takes precedence (interleaved is the
+    # recommended config — see ``visualization/rope_2d_to_3d.html`` §5.8b).
+    #
+    # Mirrors the megatron-side flags ``--video-omni-chunked-mthw-rope``
+    # and ``--video-omni-interleaved-mthw-rope``. See
+    # :class:`YoutuVITAOmniChunkedMTHWRotaryEmbedding` and
+    # :class:`YoutuVITAOmniInterleavedMTHWRotaryEmbedding`.
+    video_omni_chunked_mthw_rope: bool = False
+    video_omni_interleaved_mthw_rope: bool = False
+    # Optional explicit ``(t_len, h_len, w_len)`` split for the THW segment
+    # in the interleaved variant; required to satisfy
+    # ``t_len == max(...)`` (T is the base of the stride=3 interleave).
+    # ``None`` triggers the default :func:`_split_3d_section` (T takes the
+    # remainder so ``mrope_section_thw[0] == max``).
+    video_omni_interleaved_thw_section: tuple[int, int, int] | None = None
+    # Shared M-segment hyper-parameters used by both 4D variants:
+    #   * ``four_d_rope_m_dim``   -- size of the modality segment (defaults
+    #     to ``4`` -- four M ids: image / audio / video_frame / video_audio);
+    #   * ``four_d_rope_theta_m`` -- small theta so low-cardinality modality
+    #     ids produce non-vanishing rotation angles even at the lowest
+    #     frequency slot of the M segment;
+    #   * ``four_d_rope_theta``   -- standard 10000 for T / H / W segments.
+    four_d_rope_m_dim: int = 4
+    four_d_rope_theta_m: float = 100.0
+    four_d_rope_theta: float = 10000.0
 
 
 class YoutuVITAConfig(PreTrainedConfig):
