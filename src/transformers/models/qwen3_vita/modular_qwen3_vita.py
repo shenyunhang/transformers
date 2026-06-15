@@ -2709,15 +2709,18 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
     # parallel rotary embeddings:
     #
     #   * fusion (group-shared window):
-    #       Each event consumes a *contiguous* block of t-indices on a
-    #       shared per-group cursor. A video frame advances the cursor by
-    #       :attr:`_VIDEO_FRAME_T_STEP` so that one frame's "duration" on
-    #       the time axis equals roughly the number of audio tokens
-    #       generated during one second of video (audio-token rate after
-    #       the omni audio encoder, ``100 / 8 = 12.5``).  An audio chunk
-    #       of ``n`` tokens consumes ``n`` slots (each audio token gets
-    #       its own integer t).  This keeps frame and audio temporal
-    #       scales aligned.
+    #       Vision and audio advance on **independent** per-group t
+    #       cursors that both restart at 0 inside each group, so that
+    #       a video frame and an audio token corresponding to the same
+    #       wall-clock instant in the source video share the same t
+    #       coordinate (modality is still distinguishable via the M
+    #       axis). Each video frame advances the *vision* cursor by
+    #       :attr:`_VIDEO_FRAME_T_STEP` (``100/8 = 12.5``, the audio
+    #       token rate per second of video produced by the omni audio
+    #       encoder); each audio token advances the *audio* cursor by
+    #       1. All tokens of the same frame share one t value (the
+    #       intra-frame ``t = t_base + ti * step`` is constant across
+    #       the frame's H*W patches).
     #   * non-fusion (per-chunk independent window):
     #       Each event resets t to 0; cross-chunk t cannot be confused
     #       because each chunk is its own attention segment.
@@ -3314,13 +3317,24 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                 group_rotary_nofusion_list = (
                     [] if build_nofusion_rotary else None
                 )
-                # Per-group fusion-mode time cursor. A video frame
-                # advances the cursor by ``self._VIDEO_FRAME_T_STEP``
-                # (= 12.5, the audio-token rate per second of video) so
-                # that frame and audio share a common time scale; an
-                # audio chunk advances by its token count. Float because
-                # the per-frame step is fractional.
-                t_cursor_fusion = 0.0
+                # Per-group fusion-mode time cursors. Vision and audio
+                # advance on **independent** t cursors that both restart
+                # at 0 inside each group. Rationale: we want vision and
+                # audio of the same group to be t-synchronised from a
+                # common origin so that a frame appearing at the same
+                # wall-clock instant as an audio token shares the same
+                # t coordinate. Both modalities use the *same* per-second
+                # rate of 12.5 (i.e. ``self._VIDEO_FRAME_T_STEP``):
+                #   * each video frame advances ``t_cursor_vision`` by
+                #     ``_VIDEO_FRAME_T_STEP`` (one frame == 1/fps of
+                #     video time, which the omni audio encoder emits
+                #     ~12.5 audio tokens for);
+                #   * each audio token advances ``t_cursor_audio`` by 1.
+                # The intra-frame t is constant (``_build_video_frame_4d_rotary``
+                # already gives every patch in the same frame the same
+                # ``t_base + ti * step`` value).
+                t_cursor_vision = 0.0
+                t_cursor_audio = 0.0
                 for modality_kind, idx in group_events:
                     if modality_kind == 0:
                         feat = vision_feature_chunks[idx]
@@ -3329,10 +3343,10 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                             grid_row = video_grid_thw[idx]
                             rotary_chunk, t_advance = self._build_video_frame_4d_rotary(
                                 grid_row,
-                                t_base=t_cursor_fusion,
+                                t_base=t_cursor_vision,
                                 device=device,
                             )
-                            t_cursor_fusion += t_advance
+                            t_cursor_vision += t_advance
                             if build_nofusion_rotary:
                                 rotary_chunk_nofusion, _ = self._build_video_frame_4d_rotary(
                                     grid_row, t_base=0, device=device
@@ -3347,10 +3361,10 @@ class Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel):
                             chunk_len = int(feat.size(0))
                             rotary_chunk, t_advance = self._build_video_audio_4d_rotary(
                                 chunk_len,
-                                t_base=t_cursor_fusion,
+                                t_base=t_cursor_audio,
                                 device=device,
                             )
-                            t_cursor_fusion += t_advance
+                            t_cursor_audio += t_advance
                             if build_nofusion_rotary:
                                 rotary_chunk_nofusion, _ = self._build_video_audio_4d_rotary(
                                     chunk_len, t_base=0, device=device
