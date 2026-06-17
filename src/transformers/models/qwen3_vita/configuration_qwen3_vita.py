@@ -282,15 +282,17 @@ class Qwen3VITAOmniConfig(Qwen3VITATextConfig):
     # remainder so ``mrope_section_thw[0] == max``).
     video_omni_interleaved_thw_section: tuple[int, int, int] | None = None
     # Shared M-segment hyper-parameters used by both 4D variants:
-    #   * ``four_d_rope_m_dim``   -- size of the modality segment (defaults
-    #     to ``4`` -- four M ids: image / audio / video_frame / video_audio);
-    #   * ``four_d_rope_theta_m`` -- small theta so low-cardinality modality
+    #   * ``rope_m_dim``   -- size of the modality segment (defaults
+    #     to ``4`` -- four M ids: image / audio / video_frame / video_audio).
+    #     Set to ``0`` to drop the M segment and degrade to a pure 3D
+    #     (T | H | W) RoPE;
+    #   * ``rope_theta_m`` -- small theta so low-cardinality modality
     #     ids produce non-vanishing rotation angles even at the lowest
     #     frequency slot of the M segment;
-    #   * ``four_d_rope_theta``   -- standard 10000 for T / H / W segments.
-    four_d_rope_m_dim: int = 4
-    four_d_rope_theta_m: float = 100.0
-    four_d_rope_theta: float = 10000.0
+    #   * ``rope_theta``   -- standard 10000 for T / H / W segments.
+    rope_m_dim: int = 4
+    rope_theta_m: float = 100.0
+    rope_theta: float = 10000.0
 
 
 class Qwen3VITAConfig(PreTrainedConfig):

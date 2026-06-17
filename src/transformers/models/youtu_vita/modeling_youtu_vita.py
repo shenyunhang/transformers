@@ -18,7 +18,7 @@ from ... import initialization as init
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
-from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub
+from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
 from ...masking_utils import create_causal_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import GradientCheckpointingLayer
@@ -1997,8 +1997,15 @@ class YoutuVITAOmniChunkedMTHWRotaryEmbedding(nn.Module):
         theta: float = 10000.0,
     ) -> None:
         super().__init__()
-        if not (m_dim >= 1 and t_dim >= 1 and h_dim >= 1 and w_dim >= 1):
-            raise ValueError(f"4D RoPE segment dims must be >= 1, got (m={m_dim}, t={t_dim}, h={h_dim}, w={w_dim})")
+        # ``m_dim == 0`` degrades the layout to a pure 3D RoPE
+        # ``[ T | H | W ]`` (the M / modality segment is dropped). T/H/W must
+        # always keep at least one slot each.
+        if not (m_dim >= 0 and t_dim >= 1 and h_dim >= 1 and w_dim >= 1):
+            raise ValueError(
+                f"4D RoPE segment dims: m_dim must be >= 0 (0 -> degrade to 3D "
+                f"T/H/W) and t/h/w must be >= 1, got "
+                f"(m={m_dim}, t={t_dim}, h={h_dim}, w={w_dim})"
+            )
         self.m_dim = m_dim
         self.t_dim = t_dim
         self.h_dim = h_dim
@@ -2020,15 +2027,17 @@ class YoutuVITAOmniChunkedMTHWRotaryEmbedding(nn.Module):
             )
         device = pos_ids.device
         pos = pos_ids.to(dtype=torch.float32)
-        m_inv = self._make_inv(self.m_dim, self.theta_m, device)
+        segs = []
+        if self.m_dim > 0:
+            m_inv = self._make_inv(self.m_dim, self.theta_m, device)
+            segs.append(torch.outer(pos[:, 0], m_inv))
         t_inv = self._make_inv(self.t_dim, self.theta, device)
         h_inv = self._make_inv(self.h_dim, self.theta, device)
         w_inv = self._make_inv(self.w_dim, self.theta, device)
-        m_freqs = torch.outer(pos[:, 0], m_inv)
-        t_freqs = torch.outer(pos[:, 1], t_inv)
-        h_freqs = torch.outer(pos[:, 2], h_inv)
-        w_freqs = torch.outer(pos[:, 3], w_inv)
-        return torch.cat([m_freqs, t_freqs, h_freqs, w_freqs], dim=-1)
+        segs.append(torch.outer(pos[:, 1], t_inv))
+        segs.append(torch.outer(pos[:, 2], h_inv))
+        segs.append(torch.outer(pos[:, 3], w_inv))
+        return torch.cat(segs, dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -2108,11 +2117,13 @@ class YoutuVITAOmniInterleavedMTHWRotaryEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         thw_dim = dim_rot - m_dim
-        if not (m_dim >= 1 and thw_dim >= 3):
+        # ``m_dim == 0`` drops the M segment and degrades to a pure 3D RoPE:
+        # the whole ``dim_rot`` becomes the stride=3 interleaved T/H/W block.
+        if not (m_dim >= 0 and thw_dim >= 3):
             raise ValueError(
-                f"InterleavedMTHWRotaryEmbedding requires m_dim>=1 and "
-                f"thw_dim>=3, got m_dim={m_dim}, thw_dim={thw_dim} "
-                f"(dim_rot={dim_rot})"
+                f"InterleavedMTHWRotaryEmbedding requires m_dim>=0 (0 -> "
+                f"degrade to 3D T/H/W) and thw_dim>=3, got m_dim={m_dim}, "
+                f"thw_dim={thw_dim} (dim_rot={dim_rot})"
             )
         if mrope_section_thw is None:
             mrope_section_thw = _split_3d_section(thw_dim)
@@ -2159,11 +2170,6 @@ class YoutuVITAOmniInterleavedMTHWRotaryEmbedding(nn.Module):
         device = pos_ids.device
         pos = pos_ids.to(dtype=torch.float32)
 
-        # M segment: small-cardinality id rotated only on highest m_dim
-        # frequency slots (small theta_m keeps low m_id values discriminable).
-        m_inv = self._make_m_inv(device)
-        m_freqs = torch.outer(pos[:, 0], m_inv)  # [S, m_dim]
-
         # THW segment: 3 axes share the same full-length thw_inv, then
         # stride=3 interleave gives each axis an even subset of slots.
         thw_inv = self._make_thw_inv(device)
@@ -2173,6 +2179,14 @@ class YoutuVITAOmniInterleavedMTHWRotaryEmbedding(nn.Module):
         thw_stack = torch.stack([f_t, f_h, f_w], dim=0)  # [3, S, thw_dim]
         thw_freqs = apply_interleaved_mrope(thw_stack, self.mrope_section_thw)
 
+        if self.m_dim == 0:
+            # Pure 3D RoPE: no M segment.
+            return thw_freqs  # [S, dim_rot]
+
+        # M segment: small-cardinality id rotated only on highest m_dim
+        # frequency slots (small theta_m keeps low m_id values discriminable).
+        m_inv = self._make_m_inv(device)
+        m_freqs = torch.outer(pos[:, 0], m_inv)  # [S, m_dim]
         return torch.cat([m_freqs, thw_freqs], dim=-1)  # [S, dim_rot]
 
 
@@ -2233,6 +2247,7 @@ class YoutuVITAOmniMLP(nn.Module):
         return down_proj
 
 
+@use_kernelized_func(apply_rotary_pos_emb)
 class YoutuVITAOmniFlashAttention2(nn.Module):
     """Packed ``thd``-layout Qwen3-style attention (qk-norm, GQA) that takes
     ``cu_seqlens`` and per-token ``(cos, sin)`` rotary positions.
@@ -2244,52 +2259,35 @@ class YoutuVITAOmniFlashAttention2(nn.Module):
 
     def __init__(self, config: YoutuVITAOmniConfig, layer_idx: int = 0):
         super().__init__()
+        self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.config = config
         self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
-        self.num_heads = config.num_attention_heads
-
-        self.q_lora_rank = config.q_lora_rank
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.kv_lora_rank = config.kv_lora_rank
-        self.v_head_dim = config.v_head_dim
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_head_dim = config.qk_head_dim
         # Encoder use-case: bidirectional attention.
         self.is_causal = False
-        if self.q_lora_rank is None:
-            self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
-        else:
-            self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
-            self.q_a_layernorm = YoutuVITATextRMSNorm(config.q_lora_rank)
-            self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
 
-        self.kv_a_proj_with_mqa = nn.Linear(
-            config.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=config.attention_bias,
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
-        self.kv_a_layernorm = YoutuVITATextRMSNorm(self.kv_lora_rank)
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
-
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
         self.o_proj = nn.Linear(
-            self.num_heads * self.v_head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-
-        self.scaling = self.qk_head_dim ** (-0.5)
-        if self.config.rope_parameters.get("rope_type", "default") != "default":
-            mscale_all_dim = self.config.rope_parameters.get("mscale_all_dim", 0)
-            scaling_factor = self.config.rope_parameters["factor"]
-            if mscale_all_dim:
-                mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-                self.scaling = self.scaling * mscale * mscale
+        self.q_norm = YoutuVITAOmniRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )  # unlike olmo, only on the head dim!
+        self.k_norm = YoutuVITAOmniRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )  # thus post q_norm does not need reshape
+        self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         # Mirror naming used by :class:`YoutuVITAVisionFlashAttention2`.
         self.dropout = config.attention_dropout
 
@@ -2414,7 +2412,12 @@ def _split_4d_dims(dim_rot: int, m_dim: int = 4) -> tuple:
     Strategy: reserve ``m_dim`` slots for the modality segment, then
     distribute the remaining ``dim_rot - m_dim`` evenly across T / H / W
     (any remainder is appended to the W segment).
+
+    ``m_dim == 0`` is allowed and yields ``(0, t, h, w)``: the M segment is
+    dropped and the whole ``dim_rot`` is shared by T/H/W (pure 3D RoPE).
     """
+    if m_dim < 0:
+        raise ValueError(f"m_dim must be >= 0, got {m_dim}")
     if dim_rot < m_dim + 3:
         raise ValueError(f"dim_rot={dim_rot} too small for 4D split with m_dim={m_dim}; need dim_rot >= m_dim + 3")
     rest = dim_rot - m_dim
@@ -2465,9 +2468,9 @@ class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
         self._4d_dims = None
         if self.video_omni_chunked_mthw_rope or self.video_omni_interleaved_mthw_rope:
             dim_rot = config.head_dim // 2
-            m_dim_cfg = int(getattr(config, "four_d_rope_m_dim", 4))
-            theta_m_cfg = float(getattr(config, "four_d_rope_theta_m", 100.0))
-            theta_cfg = float(getattr(config, "four_d_rope_theta", 10000.0))
+            m_dim_cfg = int(getattr(config, "rope_m_dim", 4))
+            theta_m_cfg = float(getattr(config, "rope_theta_m", 100.0))
+            theta_cfg = float(getattr(config, "rope_theta", 10000.0))
             if self.video_omni_interleaved_mthw_rope:
                 self.rotary_pos_emb_4d = YoutuVITAOmniInterleavedMTHWRotaryEmbedding(
                     dim_rot=dim_rot,
@@ -2484,7 +2487,8 @@ class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
                     self.rotary_pos_emb_4d.w_dim,
                 )
                 print(
-                    f"[YoutuVITAOmniEncoder] Interleaved-MTHW 4D RoPE enabled: "
+                    f"[YoutuVITAOmniEncoder] Interleaved-MTHW 4D RoPE enabled"
+                    f"{' (m_dim=0 -> degraded to 3D T/H/W)' if m_dim_cfg == 0 else ''}: "
                     f"head_dim={config.head_dim}, dim_rot={dim_rot}, "
                     f"m_dim={m_dim_cfg}, mrope_section_thw={sec}, "
                     f"theta_m={theta_m_cfg}, theta={theta_cfg}"
@@ -2501,7 +2505,8 @@ class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
                 )
                 self._4d_dims = (m_dim, t_dim, h_dim, w_dim)
                 print(
-                    f"[YoutuVITAOmniEncoder] Chunked-MTHW 4D RoPE enabled: "
+                    f"[YoutuVITAOmniEncoder] Chunked-MTHW 4D RoPE enabled"
+                    f"{' (m_dim=0 -> degraded to 3D T/H/W)' if m_dim == 0 else ''}: "
                     f"head_dim={config.head_dim}, dim_rot={dim_rot}, "
                     f"_4d_dims=(m={m_dim}, t={t_dim}, h={h_dim}, w={w_dim}), "
                     f"theta_m={theta_m_cfg}, theta={theta_cfg}"
@@ -3746,7 +3751,7 @@ class YoutuVITAModel(YoutuVITAPreTrainedModel):
             # print(f"{image_grid_thw.size()=}")
             # print(f"{images.size()=}")
 
-            if len(image_grid_thw) > 64:
+            if len(image_grid_thw) > 1024:
                 image_embeds = []
                 image_grid_thw = torch.split(image_grid_thw, 64, dim=0)
                 chunk_num = len(image_grid_thw)

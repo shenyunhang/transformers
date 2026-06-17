@@ -267,15 +267,17 @@ class Qwen3VITAOmniConfig(Qwen3VITATextConfig):
     # remainder so ``mrope_section_thw[0] == max``).
     video_omni_interleaved_thw_section: Optional[Tuple[int, int, int]] = None
     # Shared M-segment hyper-parameters used by both 4D variants:
-    #   * ``four_d_rope_m_dim``   -- size of the modality segment (defaults
-    #     to ``4`` -- four M ids: image / audio / video_frame / video_audio);
-    #   * ``four_d_rope_theta_m`` -- small theta so low-cardinality modality
+    #   * ``rope_m_dim``   -- size of the modality segment (defaults
+    #     to ``4`` -- four M ids: image / audio / video_frame / video_audio).
+    #     Set to ``0`` to drop the M segment and degrade to a pure 3D
+    #     (T | H | W) RoPE;
+    #   * ``rope_theta_m`` -- small theta so low-cardinality modality
     #     ids produce non-vanishing rotation angles even at the lowest
     #     frequency slot of the M segment;
-    #   * ``four_d_rope_theta``   -- standard 10000 for T / H / W segments.
-    four_d_rope_m_dim: int = 4
-    four_d_rope_theta_m: float = 100.0
-    four_d_rope_theta: float = 10000.0
+    #   * ``rope_theta``   -- standard 10000 for T / H / W segments.
+    rope_m_dim: int = 4
+    rope_theta_m: float = 100.0
+    rope_theta: float = 10000.0
 
 
 class Qwen3VITAConfig(PreTrainedConfig):
@@ -1879,7 +1881,12 @@ def _split_4d_dims(dim_rot: int, m_dim: int = 4) -> tuple:
     Strategy: reserve ``m_dim`` slots for the modality segment, then
     distribute the remaining ``dim_rot - m_dim`` evenly across T / H / W
     (any remainder is appended to the W segment).
+
+    ``m_dim == 0`` is allowed and yields ``(0, t, h, w)``: the M segment is
+    dropped and the whole ``dim_rot`` is shared by T/H/W (pure 3D RoPE).
     """
+    if m_dim < 0:
+        raise ValueError(f"m_dim must be >= 0, got {m_dim}")
     if dim_rot < m_dim + 3:
         raise ValueError(
             f"dim_rot={dim_rot} too small for 4D split with m_dim={m_dim}; "
@@ -1923,9 +1930,13 @@ class Qwen3VITAOmniChunkedMTHWRotaryEmbedding(nn.Module):
         theta: float = 10000.0,
     ) -> None:
         super().__init__()
-        if not (m_dim >= 1 and t_dim >= 1 and h_dim >= 1 and w_dim >= 1):
+        # ``m_dim == 0`` degrades the layout to a pure 3D RoPE
+        # ``[ T | H | W ]`` (the M / modality segment is dropped). T/H/W must
+        # always keep at least one slot each.
+        if not (m_dim >= 0 and t_dim >= 1 and h_dim >= 1 and w_dim >= 1):
             raise ValueError(
-                f"4D RoPE segment dims must be >= 1, got "
+                f"4D RoPE segment dims: m_dim must be >= 0 (0 -> degrade to 3D "
+                f"T/H/W) and t/h/w must be >= 1, got "
                 f"(m={m_dim}, t={t_dim}, h={h_dim}, w={w_dim})"
             )
         self.m_dim = m_dim
@@ -1953,15 +1964,17 @@ class Qwen3VITAOmniChunkedMTHWRotaryEmbedding(nn.Module):
             )
         device = pos_ids.device
         pos = pos_ids.to(dtype=torch.float32)
-        m_inv = self._make_inv(self.m_dim, self.theta_m, device)
+        segs = []
+        if self.m_dim > 0:
+            m_inv = self._make_inv(self.m_dim, self.theta_m, device)
+            segs.append(torch.outer(pos[:, 0], m_inv))
         t_inv = self._make_inv(self.t_dim, self.theta, device)
         h_inv = self._make_inv(self.h_dim, self.theta, device)
         w_inv = self._make_inv(self.w_dim, self.theta, device)
-        m_freqs = torch.outer(pos[:, 0], m_inv)
-        t_freqs = torch.outer(pos[:, 1], t_inv)
-        h_freqs = torch.outer(pos[:, 2], h_inv)
-        w_freqs = torch.outer(pos[:, 3], w_inv)
-        return torch.cat([m_freqs, t_freqs, h_freqs, w_freqs], dim=-1)
+        segs.append(torch.outer(pos[:, 1], t_inv))
+        segs.append(torch.outer(pos[:, 2], h_inv))
+        segs.append(torch.outer(pos[:, 3], w_inv))
+        return torch.cat(segs, dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -2044,11 +2057,13 @@ class Qwen3VITAOmniInterleavedMTHWRotaryEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         thw_dim = dim_rot - m_dim
-        if not (m_dim >= 1 and thw_dim >= 3):
+        # ``m_dim == 0`` drops the M segment and degrades to a pure 3D RoPE:
+        # the whole ``dim_rot`` becomes the stride=3 interleaved T/H/W block.
+        if not (m_dim >= 0 and thw_dim >= 3):
             raise ValueError(
-                f"InterleavedMTHWRotaryEmbedding requires m_dim>=1 and "
-                f"thw_dim>=3, got m_dim={m_dim}, thw_dim={thw_dim} "
-                f"(dim_rot={dim_rot})"
+                f"InterleavedMTHWRotaryEmbedding requires m_dim>=0 (0 -> "
+                f"degrade to 3D T/H/W) and thw_dim>=3, got m_dim={m_dim}, "
+                f"thw_dim={thw_dim} (dim_rot={dim_rot})"
             )
         if mrope_section_thw is None:
             mrope_section_thw = _split_3d_section(thw_dim)
@@ -2105,11 +2120,6 @@ class Qwen3VITAOmniInterleavedMTHWRotaryEmbedding(nn.Module):
         device = pos_ids.device
         pos = pos_ids.to(dtype=torch.float32)
 
-        # M segment: small-cardinality id rotated only on highest m_dim
-        # frequency slots (small theta_m keeps low m_id values discriminable).
-        m_inv = self._make_m_inv(device)
-        m_freqs = torch.outer(pos[:, 0], m_inv)                   # [S, m_dim]
-
         # THW segment: 3 axes share the same full-length thw_inv, then
         # stride=3 interleave gives each axis an even subset of slots.
         thw_inv = self._make_thw_inv(device)
@@ -2119,6 +2129,14 @@ class Qwen3VITAOmniInterleavedMTHWRotaryEmbedding(nn.Module):
         thw_stack = torch.stack([f_t, f_h, f_w], dim=0)           # [3, S, thw_dim]
         thw_freqs = apply_interleaved_mrope(thw_stack, self.mrope_section_thw)
 
+        if self.m_dim == 0:
+            # Pure 3D RoPE: no M segment.
+            return thw_freqs                                      # [S, dim_rot]
+
+        # M segment: small-cardinality id rotated only on highest m_dim
+        # frequency slots (small theta_m keeps low m_id values discriminable).
+        m_inv = self._make_m_inv(device)
+        m_freqs = torch.outer(pos[:, 0], m_inv)                   # [S, m_dim]
         return torch.cat([m_freqs, thw_freqs], dim=-1)            # [S, dim_rot]
 
 
@@ -2303,9 +2321,9 @@ class Qwen3VITAOmniEncoder(Qwen3VITAOmniPreTrainedModel):
         self._4d_dims = None
         if self.video_omni_chunked_mthw_rope or self.video_omni_interleaved_mthw_rope:
             dim_rot = config.head_dim // 2
-            m_dim_cfg = int(getattr(config, "four_d_rope_m_dim", 4))
-            theta_m_cfg = float(getattr(config, "four_d_rope_theta_m", 100.0))
-            theta_cfg = float(getattr(config, "four_d_rope_theta", 10000.0))
+            m_dim_cfg = int(getattr(config, "rope_m_dim", 4))
+            theta_m_cfg = float(getattr(config, "rope_theta_m", 100.0))
+            theta_cfg = float(getattr(config, "rope_theta", 10000.0))
             if self.video_omni_interleaved_mthw_rope:
                 self.rotary_pos_emb_4d = Qwen3VITAOmniInterleavedMTHWRotaryEmbedding(
                     dim_rot=dim_rot,
@@ -2322,7 +2340,8 @@ class Qwen3VITAOmniEncoder(Qwen3VITAOmniPreTrainedModel):
                     self.rotary_pos_emb_4d.w_dim,
                 )
                 print(
-                    f"[Qwen3VITAOmniEncoder] Interleaved-MTHW 4D RoPE enabled: "
+                    f"[Qwen3VITAOmniEncoder] Interleaved-MTHW 4D RoPE enabled"
+                    f"{' (m_dim=0 -> degraded to 3D T/H/W)' if m_dim_cfg == 0 else ''}: "
                     f"head_dim={config.head_dim}, dim_rot={dim_rot}, "
                     f"m_dim={m_dim_cfg}, mrope_section_thw={sec}, "
                     f"theta_m={theta_m_cfg}, theta={theta_cfg}"
@@ -2339,7 +2358,8 @@ class Qwen3VITAOmniEncoder(Qwen3VITAOmniPreTrainedModel):
                 )
                 self._4d_dims = (m_dim, t_dim, h_dim, w_dim)
                 print(
-                    f"[Qwen3VITAOmniEncoder] Chunked-MTHW 4D RoPE enabled: "
+                    f"[Qwen3VITAOmniEncoder] Chunked-MTHW 4D RoPE enabled"
+                    f"{' (m_dim=0 -> degraded to 3D T/H/W)' if m_dim == 0 else ''}: "
                     f"head_dim={config.head_dim}, dim_rot={dim_rot}, "
                     f"_4d_dims=(m={m_dim}, t={t_dim}, h={h_dim}, w={w_dim}), "
                     f"theta_m={theta_m_cfg}, theta={theta_cfg}"

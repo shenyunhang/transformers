@@ -5,8 +5,10 @@
 > - `src/transformers/models/youtu_vita/`（核心：`modular_youtu_vita.py`，自动生成 `modeling_youtu_vita.py`）
 >
 > 文档定位：**专门介绍上述两个模型采用的 `omni_encoder + llm_decoder` 范式**，包括其模型结构、各模态预处理与 forward 推理流程。
-> - 仅描述 **omni 路径**（即 `config.omni_config is not None` 的主线 checkpoint）；早期独立 vision/audio encoder 后备分支不在本文范围。
+> - 仅描述 **omni 路径**（即 `config.omni_config is not None` 的主线 checkpoint）；早期独立 vision/audio encoder 后备分支（`Qwen3VITAVisionModel` / `Qwen3VITAAudioModel`，由 `vision_config` / `audio_config` 触发）不在本文范围。
 > - 不涉及训练、对齐验收、引擎适配细节。
+>
+> **代码对齐说明**：本次说明对齐 `modular_*.py` 的当前结构。`qwen3_vita` 与 `youtu_vita` 两份 `modular` 文件在 omni 范式部分**结构完全一致（逐行对应）**，`youtu_vita` 是带前缀重命名的**独立完整拷贝**（并非 `pass` 继承 `qwen3_vita`），差异仅集中在内嵌 tokenizer 工具与特殊 token 集合（见 §5）。下文以 `qwen3_vita` 类名为例，`youtu_vita` 把 `Qwen3VITA*` 前缀替换为 `YoutuVITA*` 即可一一对应。
 
 ---
 
@@ -34,7 +36,9 @@
 │ [video_images, video_image_grid_thw, video_audios, video_split]          │
 │                                  ─► (范式 B 才用，见 §2.4)               │
 │                                                                          │
-│                共享 Qwen3 Transformer Body (双向 + packed varlen)        │
+│         共享 Qwen3 Transformer Body（Qwen3VITAOmniEncoder）             │
+│         双向 + packed varlen flash-attn；RoPE 默认 2D(视觉)/1D(音频)，    │
+│         可选 4D (M|T|H|W) 见 §1.3.4                                       │
 │                       │                              │                   │
 │  vision_merger (2×2 空间合并 + 2 层 MLP) ──► image_embeds  [N_img, H]   │
 │  audio_merger  (2× 时间合并   + 2 层 MLP) ──► audio_embeds [B, S_a, H]  │
@@ -59,34 +63,36 @@
 
 ### 1.2 主要类与角色
 
-`qwen3_vita`（以 modular 文件为权威源）：
+`qwen3_vita`（以 modular 文件为权威源，行号对齐 `modular_qwen3_vita.py`）：
 
 | 类 | 角色 |
 |---|---|
-| `Qwen3VITAConfig` | 顶层 config：`text_config` + `omni_config`（本范式下二者均必填）。 |
-| `Qwen3VITAOmniConfig`（继承 `Qwen3VITATextConfig`） | OmniEncoder 的 Transformer 配置（继承 Qwen3 结构），同时含视觉/音频前端的超参（patch、mel、merger 等）。 |
-| `Qwen3VITATextConfig`（继承 `Qwen3Config`） | LanguageModel 的 Qwen3 配置。 |
-| `Qwen3VITAOmniVisionEmbeddings` | 视觉前端：`nn.Linear(in=C·patch²·temporal_patch, out=H_enc)`，把已 patchify 的像素投到 Encoder 隐维。 |
-| `Qwen3VITAOmniAudioEmbeddings` | 音频前端：3 层 stride‑2 Conv2d（**对 mel 时间轴 8× 降采样**）+ 线性投影到 `H_enc`。 |
-| `Qwen3VITAOmniEncoder` | 共享 Transformer body：双向、无 causal mask、packed varlen 注意力；视觉走 2D RoPE，音频走 1D RoPE。 |
-| `Qwen3VITAVisionPatchMerger` / `Qwen3VITAAudioPatchMerger` | merger + projector：视觉 `spatial_merge_size=2`（即 2×2）、音频 `temporal_merge_size=2`；其后接 2 层 MLP 投到 LM 隐维 `out_hidden_size = H`。 |
-| `Qwen3VITAOmniModel` | 上述前端 + body + merger 的封装；`forward(modality=...)` 分派 `forward_vision` / `forward_audio` / `forward_video`。 |
-| `Qwen3VITATextModel` | 自回归 LM 主体（Qwen3：qk‑norm、GQA、SwiGLU、RMSNorm、标准 RoPE、可选 sliding window）。 |
-| `Qwen3VITAModel` | 顶层组合：`omni_model` + `language_model`。 |
-| `Qwen3VITAForCausalLM` | `GenerationMixin` 入口，含 `lm_head`（与 `embed_tokens` tied）。 |
+| `Qwen3VITAConfig`（`:283`） | 顶层 config：`text_config` + `omni_config`（本范式下二者均必填）；顶层还持有 `tie_word_embeddings`、`video_omni_fusion`（视频范式开关，见 §2.4）。 |
+| `Qwen3VITAOmniConfig`（`:210`，继承 `Qwen3VITATextConfig`） | OmniEncoder 的 Transformer 配置（继承 Qwen3 结构），同时含视觉/音频前端超参（patch、mel、merger）与视频融合 / 4D RoPE 相关字段。 |
+| `Qwen3VITATextConfig`（`:201`，继承 `Qwen3Config`） | LanguageModel 的 Qwen3 配置。 |
+| `Qwen3VITAOmniVisionEmbeddings`（`:2143`，继承 `Qwen3VITAVisionEmbeddings`） | 视觉前端：`nn.Linear(in=C·patch²·temporal_patch, out=hidden_size)`，把已 patchify 的像素投到 Encoder 隐维。 |
+| `Qwen3VITAOmniAudioEmbeddings`（`:2156`，继承 `Qwen3VITACNNAudioEmbeddings`） | 音频前端：3 层 stride‑2 Conv2d（**对 mel 时间轴 8× 降采样**）+ 末尾 `linear_proj` 投影到 `hidden_size`。 |
+| `Qwen3VITAOmniEncoder`（`:2280`） | 共享 Transformer body：双向、无 causal mask、packed varlen flash-attn；视觉 2D RoPE、音频 1D RoPE，可选 4D MTHW RoPE；`forward` 支持 **per-layer 的 `cu_seqlens` 与 rotary**（供视频分层融合用）。 |
+| `Qwen3VITAOmniVisionPatchMerger`（`:2589`）/ `Qwen3VITAOmniAudioPatchMerger`（`:2601`） | merger + projector：视觉 `spatial_merge_size=2`（2×2）、音频 `temporal_merge_size=2`；其后接 2 层 MLP 投到 LM 隐维 `out_hidden_size`。 |
+| `Qwen3VITAOmniRotaryEmbedding` / `Qwen3VITAOmniChunkedMTHWRotaryEmbedding`（`:1905`）/ `Qwen3VITAOmniInterleavedMTHWRotaryEmbedding`（`:2040`） | OmniEncoder 的 RoPE：默认旋转 + 两种可选 4D (M\|T\|H\|W) 变体（见 §1.3.4）。 |
+| `Qwen3VITAOmniModel`（`:2657`） | 上述前端 + body + merger 的封装；`forward(modality=...)` 分派 `forward_vision` / `forward_audio` / `forward_video`。 |
+| `Qwen3VITATextModel`（`:1794`） | 自回归 LM 主体（Qwen3：qk‑norm、GQA、SwiGLU、RMSNorm、标准 RoPE、可选 sliding window）。 |
+| `Qwen3VITAModel`（`:3592`） | 顶层组合：`omni_model` + `language_model`（按 config 还可含后备 `vision_model` / `audio_model`，本范式不走）。 |
+| `Qwen3VITAForCausalLM`（`:3916`） | `GenerationMixin` 入口，含 `lm_head`（与 `embed_tokens` tied）。 |
 
-`youtu_vita`：在结构上几乎完全继承自 `qwen3_vita`（`YoutuVITAOmniModel(Qwen3VITAOmniModel): pass`），差异集中在 **特殊 token 集合** 与 **video processor** 两处（见 §5）。
+`youtu_vita`：在 omni 范式部分与 `qwen3_vita` **结构逐行一致**（独立拷贝、前缀替换为 `YoutuVITA*`，`YoutuVITAOmniModel` 继承自 `YoutuVITAOmniPreTrainedModel` 而非 `qwen3_vita` 的类）；差异集中在 **内嵌 tokenizer 工具** 与 **特殊 token 集合 / video processor** 三处（见 §5）。
 
 ### 1.3 架构特点
 
 1. **OmniEncoder 是共享的多模态前融合 Encoder**：vision/audio 前端各自投到同一隐维后，**复用同一份 Transformer 权重**做双向编码，仅在最后由各自 patch merger + 2 层 MLP 分别投到 LM 隐维。
-2. **Encoder 完全双向 + packed varlen**：
+2. **Encoder 完全双向 + packed varlen flash-attn**：
    - 视觉用 2D RoPE，按 `image_grid_thw` 拼成 `cu_seqlens`；
    - 音频用 1D RoPE，按音频特征长度拼成 `cu_seqlens`；
+   - attention 走 `flash_attn_varlen_func`（`Qwen3VITAOmniFlashAttention2`，`is_causal=False`，复用 Qwen3 的 qk‑norm + GQA 投影）；
    - **不会进入 LM 的 KV cache**，每条 prompt 在 prefill 阶段一次性算完。
 3. **LanguageModel 是标准 Qwen3 Decoder**：
    - causal、自回归、有 KV cache；
-   - **标准 RoPE，不是 M‑RoPE**（与 Qwen2‑VL/Qwen2.5‑Omni 不同）；
+   - **LM 端用标准 RoPE，不是 M‑RoPE**（与 Qwen2‑VL/Qwen2.5‑Omni 不同）；§1.3.4 的 4D MTHW RoPE 只作用于 OmniEncoder 内部，不影响 LM；
    - 可选 sliding window attention（由 `text_config.sliding_window` 决定）。
 4. **多模态嵌入注入方式：显式索引 scatter（非 placeholder id 比对）**：
    - processor 输出 `image_indices` / `audio_indices` / `video_image_indices` / `video_audio_indices`；
@@ -98,6 +104,18 @@
    - 主 LM 自回归产出这些 token 即视为音频输出，waveform 合成在外部完成（不在本文范围）。
 6. **权重共享**：`lm_head.weight` 与 `model.embed_tokens.weight` tied（`_tied_weights_keys`）。
 7. **TP/PP 提示**：`_tp_plan = {"lm_head": "colwise_gather_output"}`、`_pp_plan = {"lm_head": (["hidden_states"], ["logits"])}`。
+
+#### 1.3.4 可选：OmniEncoder 4D MTHW RoPE 与视频分层融合（默认关闭）
+
+以下三项均为 **OmniEncoder 内部** 的可选增强，由 `omni_config` 控制，**默认全关时退化为上文的 2D/1D RoPE + 整段双向注意力**，不影响 LM：
+
+1. **4D (M\|T\|H\|W) RoPE**：每个 token 用 `(modality, t, h, w)` 四维坐标，取代默认 2D/1D 路径。两种互斥变体：
+   - `video_omni_chunked_mthw_rope`（`Qwen3VITAOmniChunkedMTHWRotaryEmbedding`）：head_dim 切成 M/T/H/W 四段分别旋转；
+   - `video_omni_interleaved_mthw_rope`（`Qwen3VITAOmniInterleavedMTHWRotaryEmbedding`）：M 段高频独占 + T/H/W 以 stride=3 交错（Qwen3‑VL 风格 `apply_interleaved_mrope`）；两者同开时 **interleaved 优先**。
+   - M 轴模态 id：`M_IMAGE=0 / M_AUDIO=1 / M_VIDEO_FRAME=2 / M_VIDEO_AUDIO=3`；`rope_m_dim=0` 时退化为纯 3D (T\|H\|W)。
+   - 视频融合模式下视觉帧与音频在 **同一 t 轴** 推进（每帧推进 `_VIDEO_FRAME_T_STEP = 100/8 = 12.5`，对齐音频 token 速率），使同一时刻的视/听 token 共享 t 坐标。
+2. **`video_fusion_layer_freq`**：逐层 fusion 掩码（`None`→全 fusion；`int N`→`i%N==0` 为 fusion；`list[int]` 显式 0/1）。fusion 层让同一视频的视/音 token 共享 attention 窗口；非 fusion 层则每个 image/audio chunk 各自独立成段。由此 `Qwen3VITAOmniEncoder.forward` 支持 **每层传入不同的 `cu_seqlens` 与 rotary**。
+3. **`video_group_attention`**：fusion 层内进一步把单个视频切成 `(I + A*)` 组，使注意力限制在同组的图/音之间。
 
 ---
 
@@ -112,7 +130,7 @@ LM 词表包括：
 - 普通文本 token（Qwen3 tokenizer）；
 - 多模态占位 / 边界 token（字面量见下表，引用自 `youtu_vita/modular_youtu_vita.py:Youtu_VITA_TOKEN`，`qwen3_vita` 同套）；
 - 16384 个离散音频输出 token `<\|audio_*\|>`（仅 S2S 场景下出现在输出端）；
-- 控制 token：`Youtu_VITA_TOKEN_bus1`（`modular_youtu_vita.py:2056`，bus1 精简版，仅含 image）与 `Youtu_VITA_TOKEN`（`:2164`，含 image/audio/video/think/code/tool_call/action 等完整集），按 config 选择。
+- 控制 token：`Youtu_VITA_TOKEN_bus1`（`modular_youtu_vita.py:4112`，bus1 精简版，仅含 image）与 `Youtu_VITA_TOKEN`（`:4219`，含 image/audio/video/think/code/tool_call/action 等完整集，默认启用见 `:4357`），按 config 选择。
 
 | 类别 | tag | start | end | context（占位） |
 |---|---|---|---|---|
@@ -147,7 +165,7 @@ assistant
 
 ### 2.3 音频
 
-1. 原始波形经 `WavFrontendTokenizer` / `MelFilterBankTokenizer`（`youtu_vita/modular_youtu_vita.py:2541/2634`）得到 mel 特征 `[T_i, num_mel_bins]`（`num_mel_bins=128`），按样本组成 list。
+1. 原始波形经 `WavFrontendTokenizer` / `MelFilterBankTokenizer`（`youtu_vita/modular_youtu_vita.py:4596/4689`）得到 mel 特征 `[T_i, num_mel_bins]`（`num_mel_bins=128`），按样本组成 list。
 2. 模型音频前端（`Qwen3VITAOmniAudioEmbeddings`）：
    - 把所有样本 mel 在时间轴拼接 `[num_mel_bins, sum(T_i)]`；
    - 3 层 stride‑2 Conv2d → **时间轴 8× 降采样**；
@@ -165,7 +183,18 @@ assistant
 
 ### 2.4 视频
 
-视频可走 **两种处理范式**，二者互斥；**范式选择由 processor 的 `video_omni_fusion` 开关决定**（默认 `False` → 范式 A；`True` 时 processor 会输出非空 `video_split` 张量，模型侧路由到 `forward_video`）。源码判定：`Qwen3VITAOmniModel.forward` 中 `has_video = video_split is not None and video_split.numel() > 0`。
+视频可走 **两种处理范式**，二者互斥；**范式选择由顶层 `Qwen3VITAConfig.video_omni_fusion` 决定（默认 `False`），由模型在 `forward` 中分派，而非 processor**。重要更正：processor 只要存在视频就**始终**填充 `video_*` 缓冲（含非空 `video_split`）；模型侧据 `self.config.video_omni_fusion` 决定把这批 `video_*` 数据送入范式 A 还是范式 B。源码判定（`Qwen3VITAModel.forward`，`:3847`）：
+
+```python
+if video_split is not None and video_split.numel() > 0:   # 有视频
+    if self.config.video_omni_fusion:                      # True → 范式 B（联合）
+        ... = self._encode_video(...)                      # forward_video
+    else:                                                  # False → 范式 A（独立）
+        video_image_embeds = self._encode_vision(...)
+        video_audio_embeds, ... = self._encode_audio(...)
+```
+
+> 注意：`video_split` 在两种范式下都会被填充，**不能用「`video_split is None`」区分范式**；它在范式 B 中用于 `forward_video` 切分每个视频的图/音 chunk，在范式 A 中不参与 OmniEncoder（仅作为「存在视频」的触发标记）。
 
 #### 范式 A：拆分模态独立处理（`video_omni_fusion=False`，默认）
 
@@ -185,7 +214,8 @@ assistant
 - `video_images: [N_patch_rows, 3·patch_dim²]` —— batch 内全部视频帧的视觉 patch 拼接；
 - `video_image_grid_thw: [N_grid_rows, 3]` —— 每帧 `(T, H, W)`，多行可属同一视频；
 - `video_audios: list[FloatTensor[T_i, num_mel_bins]]` —— 每个 **音频块**（chunk）的 mel 张量；processor 端按 `video_audio_chunk_max_second` 把整段音频切成等时长的 chunk（不足部分末尾保留尾巴）；
-- `video_split: LongTensor[N_video, 2]` —— 每个视频的 `(num_images, num_audio_chunks)`，由 processor 在写完每段视频后追加一行（`modular_qwen3_vita.py:5250`）。
+- `video_split: LongTensor[N_video, 2]` —— 每个视频的 `(num_images, num_audio_chunks)`，由 processor 在写完每段视频后追加一行（`Qwen3VITAVideoProcessor.add_video_input_discrete_or_contiguous`，`modular_qwen3_vita.py:6290` 附近）；
+- `video_image_indices: [2, total_image_tokens]` / `video_audio_indices: list[[2, 1, n_i]]` —— scatter 索引，**同时被 `forward_video` 用来按 `seq_pos` 还原真实音视频交错顺序**（缺失时回退 `divmod`）。
 
 ##### 关键中间量
 
@@ -197,6 +227,14 @@ assistant
 
 ##### 交错规则（核心）
 
+`forward_video`（`:2896`）在每个视频内把视觉帧 chunk（`I`）与音频块 chunk（`A`）按 **真实时间顺序** 交错成一个 segment。当前实现有两条路径：
+
+**优先：按 processor 写入顺序恢复（`video_image_indices` / `video_audio_indices` 均提供时）**
+
+processor 在拼 prompt 时已把每帧/每音频块的占位 token 按真实时间顺序写入 `input_ids`；`forward_video` 读取它们在文本中的首个 `seq_pos`（图像取每帧首个 `IMG_CONTEXT`，音频取每段 `seg[1,0,0]`），按 `seq_pos` 升序排出真实交错次序 `ordered_events`。此路径**不依赖任何固定比例假设**，任意的 `I/A` 交错都能正确还原。并强制校验音频段 `seq_pos` 单调递增，否则报错（避免后续 split 错位）。
+
+**回退：`divmod` 启发式（缺少 indices 时）**
+
 ```python
 num_image_chunks         = len(vision_feature_chunks)
 num_audio_chunks_actual  = len(audio_feature_chunks)
@@ -205,7 +243,9 @@ audios_per_image, extra_audio_count = divmod(num_audio_chunks_actual, num_image_
 
 - 仅有视觉 → 直接按帧顺序排；
 - 仅有音频 → 直接按 chunk 顺序排；
-- 二者皆有 → **每张图后挂 `audios_per_image` 个音频块；前 `extra_audio_count` 张图各多挂 1 个**（保证总数严格对齐）。
+- 二者皆有 → **每张图后挂 `audios_per_image` 个音频块；前 `extra_audio_count` 张图各多挂 1 个**（仅当「每个 chunk 恰为 1 图 + 1 音」时与真实顺序一致）。
+
+> 下面的可视化以回退路径的 `divmod` 排布为例说明 segment 结构；走优先路径时排布顺序由 processor 的真实写入次序决定，segment 的拼接 / RoPE / mask 构造方式完全相同。
 
 视频内排序总是 **`I A* I A* I A* …`**，永不出现"两个图相邻而无音频在中间分隔"的情况（除非 `audios_per_image == 0` 且 `extra_audio_count` 已耗尽）。
 
@@ -250,6 +290,8 @@ video v 的 segment_features:
 
 多视频时，每个视频按上述方式各自拼一个 segment，所有 segment 再 `torch.cat(..., dim=0)` 成 packed sequence；用 `cu_seqlens = [0, len(seg_0), len(seg_0)+len(seg_1), ...]` 投入 `self.encoder`，**视频之间的 attention 互不可见，视频内 visual+audio 全互可见**。
 
+> **分层融合（`video_fusion_layer_freq` / `video_group_attention`，见 §1.3.4）**：上述「视频内全互可见」是 **fusion 层** 的行为。当配置了非全 fusion 的逐层掩码时，`forward_video` 会**同时构造两套切分**——fusion 层用上面的「整段视频」`cu_seqlens`（可再被 `video_group_attention` 切成 `(I+A*)` 组），非 fusion 层用「每个 image/audio chunk 各自独立」的 `cu_seqlens`——再以 `list` 形式逐层传入 `Qwen3VITAOmniEncoder.forward`，由各层选用对应切分（4D RoPE 开启时还会并行准备每层不同的 rotary）。默认 `video_fusion_layer_freq=None` 时所有层都是 fusion 层，退化为上述单一 `cu_seqlens`。
+
 ##### 边界情形
 
 | 情形 | 行为 |
@@ -278,15 +320,17 @@ video v 的 segment_features:
 |---|---|---|
 | `input_ids` | `LongTensor[B, S]` | 含 `<\|*_pad\|>` 占位 token 的文本 id。 |
 | `attention_mask` | `LongTensor[B, S]` | 标准 mask。 |
-| `pixel_values` / `images` | `FloatTensor[N_patches_all, C·patch²·temporal_patch]` | patchify 后的图像。 |
+| `images` | `FloatTensor[N_patches_all, C·patch²·temporal_patch]` | patchify 后的图像（`Qwen3VITAModel.forward` 的形参名为 `images`；内部 `_encode_vision` 再传给 `forward_vision(pixel_values=...)`）。 |
 | `image_grid_thw` | `LongTensor[N_images, 3]` | 每张图的 `(T, H_patches, W_patches)`。 |
 | `image_indices` | `LongTensor[2, N_img_tokens]` | 全局 `(batch_idx, seq_idx)`；个数 = merger 后视觉 token 数。 |
 | `audios` / `input_features` | `list[FloatTensor[T_i, num_mel_bins]]` | 经 mel + WavFrontend 处理；模型前端内部 `cat+transpose` 拼接。 |
 | `audio_indices` | `list[LongTensor[2, n_i]]` | per‑sample `(batch_idx, seq_idx)`。 |
-| `video_image_indices` | `LongTensor[2, N]` | 视频帧对应的占位索引。 |
-| `video_audio_indices` | `list[LongTensor[2, n_i]]` | 视频音轨对应的占位索引。 |
-| `video_split` | `LongTensor[N_video, 2]` 或 `None` | **范式 B 必填**：每个视频的 `(num_images, num_audios)`，用于 `forward_video` 内构造交错 segment 与 OmniEncoder 注意力隔离。`None` 时走范式 A。 |
-| `position_ids`、`past_key_values`、`use_cache`、`cache_position` | — | LM 标准字段。 |
+| `video_images` / `video_image_grid_thw` | 同 `images` / `image_grid_thw` | 视频帧的视觉 patch（专用缓冲）。 |
+| `video_audios` | `list[FloatTensor[T_i, num_mel_bins]]` | 视频音频 chunk 的 mel（专用缓冲）。 |
+| `video_image_indices` | `LongTensor[2, N]` | 视频帧对应的占位索引；范式 B 下还用于恢复真实音视频交错顺序。 |
+| `video_audio_indices` | `list[LongTensor[2, 1, n_i]]` | 视频音轨对应的占位索引（per‑segment）；范式 B 下与上者配合恢复交错顺序。 |
+| `video_split` | `LongTensor[N_video, 2]` 或 `None` | **有视频时由 processor 始终填充**：每个视频的 `(num_images, num_audios)`。非空即触发视频分支；**走范式 A 还是 B 由顶层 `config.video_omni_fusion` 决定，与本字段是否为 None 无关**。 |
+| `position_ids`、`past_key_values`、`use_cache`、`cache_position`、`inputs_embeds` | — | LM 标准字段。 |
 
 ---
 
@@ -298,10 +342,12 @@ video v 的 segment_features:
 
 | 输入存在的字段 | 触发调用 | 输出 |
 |---|---|---|
-| `pixel_values` + `image_grid_thw`（无 `video_split`） | `_encode_vision → omni_model(modality="vision")` → `forward_vision` | `image_embeds: [N_img_tokens, H]` |
+| `images` + `image_grid_thw` | `_encode_vision → omni_model(modality="vision")` → `forward_vision` | `image_embeds: [N_img_tokens, H]` |
 | `audios`（非视频上下文） | `_encode_audio → omni_model(modality="audio")` → `forward_audio` | `(audio_embeds: [B, S_a, H], audio_lengths)` |
-| `video_images` + `video_image_grid_thw`，`video_split=None` | 范式 A：与上面两条相同，仅用 `video_image_indices` / `video_audio_indices` 写回 | 同上 |
-| `video_images` + `video_audios` + `video_split` 非空 | 范式 B：`omni_model.forward_video(...)` | `(video_image_embeddings, video_audio_embeddings, lens)` |
+| `video_split` 非空 **且** `config.video_omni_fusion=False` | 范式 A：`_encode_vision` + `_encode_audio`（复用单图/单音通路），写回用 `video_*_indices` | 同上 |
+| `video_split` 非空 **且** `config.video_omni_fusion=True` | 范式 B：`_encode_video → omni_model.forward_video(...)` | `(video_image_embeddings, video_audio_embeddings, lens)` |
+
+> 视觉路径在 `len(image_grid_thw) > 64` 时会按 64 张一组分块编码再 `cat`（`:3713`，控显存）。训练态在缺图/缺音时还会用 `fake_images` / `fake_audios` 走一次前向并以 `*.mean()*0.0` 接回梯度（推理不涉及）。
 
 ### 3.1 Step‑by‑step
 
@@ -322,12 +368,12 @@ video v 的 segment_features:
      3. 1D RoPE + `cu_seqlens` + 共享 Encoder；
      4. `audio_merger`：2× 时间合并 + 2 层 MLP → `(audio_embeds: [B, S_a, H], audio_lengths)`。
 
-4. **视频编码**（当存在视频帧/视频音轨）—— **两种范式互斥，由 `video_split` 是否非空决定**：
-   - **范式 A**：`video_split is None`。视觉部分复用 §3.1.2（输入是该视频的全部帧 patch）、音频部分复用 §3.1.3（输入是该视频的全部音频块）；两路在 OmniEncoder 内 **互不感知**，分别输出 `video_image_embeds`、`video_audio_embeds`。
-   - **范式 B**：`video_split is not None`。调 `omni_model.forward_video(video_images, video_image_grid_thw, video_audios, video_split)`：
+4. **视频编码**（当 `video_split` 非空）—— **两种范式互斥，由顶层 `config.video_omni_fusion` 决定，与 `video_split` 是否为 None 无关**：
+   - **范式 A**（`config.video_omni_fusion=False`，默认）：视觉部分复用 §3.1.2（输入是该视频的全部帧 patch）、音频部分复用 §3.1.3（输入是该视频的全部音频块）；两路在 OmniEncoder 内 **互不感知**，分别输出 `video_image_embeds`、`video_audio_embeds`。
+   - **范式 B**（`config.video_omni_fusion=True`）：调 `_encode_video → omni_model.forward_video(video_images, video_image_grid_thw, video_audios, video_split, video_image_indices, video_audio_indices)`：
      1. 分别过 `vision_embeddings` / `audio_embeddings` 拿到 visual/audio features；
-     2. 按 `video_split` 把同一视频的 visual chunk 与 audio chunk 取出，按"每张图后挂 `audios_per_image` 个音频块、前 `extra_audio_count` 张图多挂 1 个"做 **交错拼接**，形成一个 segment，同时拼好 1D/2D 混合 RoPE 与 `modality_mask`；
-     3. 多视频的 segment 通过 `cu_seqlens` 在 OmniEncoder 内 **共享 attention 窗口但相互隔离**；
+     2. 按 `video_split` 把同一视频的 visual chunk 与 audio chunk 取出，**按 processor 写入 `input_ids` 的真实时间顺序（读 `video_image_indices` / `video_audio_indices` 的 `seq_pos` 排序）交错拼成 segment**（缺 indices 时回退 `divmod` 启发式），同时拼好 RoPE（默认 2D/1D，或 4D MTHW）与 `modality_mask`；
+     3. 多视频 segment 通过 `cu_seqlens` 在 OmniEncoder 内 **共享 attention 窗口但相互隔离**；若开启 `video_fusion_layer_freq` 则按层切换 fusion / 非 fusion 的 `cu_seqlens`（与 rotary）；
      4. Encoder 输出按 `modality_mask` 拆回视觉/音频，分别经 `vision_merger` / `audio_merger` → `video_image_embeddings`、`video_audio_embeddings` (+ `video_audio_lens_after_merge`)。
 
 5. **占位 scatter（核心步骤）**
@@ -377,8 +423,9 @@ video v 的 segment_features:
 | I6 | `lm_head.weight` 与 `model.embed_tokens.weight` tied；权重加载完成后两者须指向同一块存储。 |
 | I7 | LM 是 **标准 RoPE，不是 M‑RoPE**。 |
 | I8 | 音频输出 token `<\|audio_*\|>` 由主 LM 自回归产出，**不需要任何额外 head**；LM 输出后链路无自定义后处理。 |
-| I9 | 视频走两种范式之一，由 processor 的 `video_omni_fusion` 开关决定：`False`（默认）→ `video_split=None` → 范式 A（拆分模态独立）；`True` → `video_split` 非空 → 范式 B（联合视频编码，OmniEncoder 内音视频 chunk 交错并按视频隔离 attention）。两者共享同一份 OmniEncoder 权重，最终都用 `video_image_indices` / `video_audio_indices` scatter 回 `inputs_embeds`。 |
+| I9 | 视频走两种范式之一，**由顶层 `config.video_omni_fusion` 决定，而非 processor，也与 `video_split` 是否为 None 无关**：有视频时 processor 始终填非空 `video_split`；`video_omni_fusion=False`（默认）→ 范式 A（拆分模态独立）；`True` → 范式 B（联合视频编码，OmniEncoder 内音视频 chunk 按真实时间顺序交错并按视频隔离 attention，可选分层融合 / 4D RoPE）。两者共享同一份 OmniEncoder 权重，最终都用 `video_image_indices` / `video_audio_indices` scatter 回 `inputs_embeds`。 |
 | I10 | OmniEncoder **双向 + 无 causal mask**；LM **严格 causal**；两者之间通过 scatter 把 OmniEncoder 输出当作 prompt token embedding 注入，**不引入 cross‑attention**——这是"前融合"的核心。 |
+| I11 | 4D MTHW RoPE 与视频分层融合（`video_omni_*_mthw_rope` / `video_fusion_layer_freq` / `video_group_attention`）只作用于 **OmniEncoder 内部**，默认全关时等价于 2D/1D RoPE + 整段双向注意力；**任何配置下都不改变 LM 端的标准 RoPE / causal 行为**。 |
 
 ---
 
@@ -387,7 +434,8 @@ video v 的 segment_features:
 | 字段 | 说明 |
 |---|---|
 | `text_config` (`Qwen3VITATextConfig`) | LM 主体：`hidden_size`、`num_hidden_layers`、`num_attention_heads`、`num_key_value_heads`、`head_dim`、`rope_theta`、`max_position_embeddings`、可选 `sliding_window`、`vocab_size`。 |
-| `omni_config` (`Qwen3VITAOmniConfig`) | 共享 OmniEncoder 配置；除继承 `Qwen3VITATextConfig` 的 Transformer 字段外，关键多模态超参（默认值见源码 `modular_qwen3_vita.py:213-229`）： |
+| `omni_config` (`Qwen3VITAOmniConfig`) | 共享 OmniEncoder 配置；除继承 `Qwen3VITATextConfig` 的 Transformer 字段外，关键多模态超参（默认值见源码 `modular_qwen3_vita.py:215-280`）： |
+| └ `num_channels` | 视觉通道数，默认 `3`。 |
 | └ `patch_size` | 视觉 patch 大小，默认 `16`。 |
 | └ `spatial_merge_size` | 视觉 merger 空间合并因子，默认 `2`（即 2×2）。 |
 | └ `num_mel_bins` | 音频 mel 维数，默认 `128`。 |
@@ -395,7 +443,15 @@ video v 的 segment_features:
 | └ `temporal_merge_size` | 音频 merger 时间合并因子，默认 `2`。 |
 | └ `n_window` / `n_window_infer` | 音频前端的 attention 窗口长度（train/infer 各一份），默认 `50` / `800`。 |
 | └ `conv_chunksize` | 音频 Conv2d 分块大小（控显存），默认 `500`。 |
-| `image_token_id` / `audio_token_id` / `video_token_id` | 仅用于 processor 端占位标记；模型侧靠 `*_indices` 直接定位，不强依赖 id。 |
+| └ `merger_hidden_size` / `out_hidden_size` | merger MLP 隐维 / 投到 LM 的输出隐维，默认均 `4608`。 |
+| └ `video_group_attention` | fusion 层内是否按 `(I+A*)` 分组隔离注意力，默认 `False`（见 §1.3.4）。 |
+| └ `video_fusion_layer_freq` | 逐层 fusion 掩码（`None` / `int N` / `list[int]`），默认 `None`（全 fusion）。 |
+| └ `video_omni_chunked_mthw_rope` / `video_omni_interleaved_mthw_rope` | 两种互斥的 4D (M\|T\|H\|W) RoPE 开关，默认均 `False`（用 2D/1D 传统 RoPE）；同开时 interleaved 优先。 |
+| └ `video_omni_interleaved_thw_section` | interleaved 变体的显式 `(t,h,w)` 切分，默认 `None`（自动）。 |
+| └ `rope_m_dim` / `rope_theta_m` / `rope_theta` | 4D RoPE 的 M 段维数 / M 段 theta / T·H·W 段 theta，默认 `4` / `100.0` / `10000.0`；`rope_m_dim=0` 退化为纯 3D。 |
+| 顶层 `Qwen3VITAConfig` 字段 | |
+| └ `video_omni_fusion` | **视频范式总开关**，默认 `False`（范式 A）；`True` 走范式 B 联合视频编码（见 §2.4）。 |
+| └ `tie_word_embeddings` | 顶层默认 `False`，但 `Qwen3VITAForCausalLM._tied_weights_keys` 仍把 `lm_head.weight` 绑到 `embed_tokens.weight`。 |
 | `_tied_weights_keys` | `{"lm_head.weight": "model.embed_tokens.weight"}`。 |
 | `_tp_plan` | `{"lm_head": "colwise_gather_output"}`。 |
 | `_pp_plan` | `{"lm_head": (["hidden_states"], ["logits"])}`。 |
@@ -406,10 +462,11 @@ video v 的 segment_features:
 
 | 维度 | `qwen3_vita` | `youtu_vita` |
 |---|---|---|
+| 与对方的关系 | 范式定义方 | **独立完整拷贝**：omni 范式部分与 `qwen3_vita` 逐行一致，仅前缀 `Qwen3VITA*`→`YoutuVITA*`；**不通过 `import` 继承 `qwen3_vita`**。 |
 | `omni_config` 默认启用 | 是（本范式主线） | 是（本范式主线） |
-| OmniEncoder | `Qwen3VITAOmniModel` | `YoutuVITAOmniModel(Qwen3VITAOmniModel): pass`（结构无差异） |
-| LanguageModel | `Qwen3VITATextModel` | `YoutuVITATextModel`（同样基于 Qwen3） |
+| OmniEncoder | `Qwen3VITAOmniModel(Qwen3VITAOmniPreTrainedModel)` | `YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel)`（结构一致） |
+| LanguageModel | `Qwen3VITATextModel`（基于 Qwen3） | `YoutuVITATextModel`（基于 `Youtu*`，同 Qwen3 结构） |
 | 顶层 `Model` / `ForCausalLM` | `Qwen3VITAModel` / `Qwen3VITAForCausalLM` | `YoutuVITAModel` / `YoutuVITAForCausalLM`（forward 签名一致） |
-| 特殊 token 集 | `processing_qwen3_vita.py` 内 | 两套：`Youtu_VITA_TOKEN_bus1`（`:2056`，仅含 image）与 `Youtu_VITA_TOKEN`（`:2164`，含 image/audio/video + think/code/tool_call/action 等），按 config 选择 |
-| Tokenizer 内嵌工具 | `tokenization_qwen3_vita.py` | 额外内嵌 `GLM4VoiceTokenizer`、`WavFrontendTokenizer`、`MelFilterBankTokenizer`、`VisionTokenizer`、`AudioTokenizer` |
-| Video processor | `Qwen3VITAVideoProcessor` | `YoutuVITAVideoProcessor`（更复杂的视频分桶；范式 A/B 仍由 `video_split` 是否非空决定） |
+| 特殊 token 集 | `processing_qwen3_vita.py` 内 | 两套：`Youtu_VITA_TOKEN_bus1`（`modular_youtu_vita.py:4112`，仅含 image）与 `Youtu_VITA_TOKEN`（`:4219`，含 image/audio/video + think/code/tool_call/action 等），默认用后者（`:4357`） |
+| Tokenizer 内嵌工具 | `tokenization_qwen3_vita.py` | 额外内嵌 `GLM4VoiceTokenizer`（`:4391`）、`WavFrontendTokenizer`（`:4596`，依赖 `funasr.frontends.wav_frontend.WavFrontend`）、`MelFilterBankTokenizer` 等 |
+| Video processor | `Qwen3VITAVideoProcessor` | `YoutuVITAVideoProcessor`（更复杂的视频分桶；范式 A/B 仍由顶层 `config.video_omni_fusion` 决定） |
