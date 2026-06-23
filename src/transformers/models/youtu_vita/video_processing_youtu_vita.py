@@ -632,10 +632,13 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             else:
                                 new_targets += [GLOBAL_CONSTANTS.IGNORE_TOKEN_ID]
 
-                        audio_token_length = -(
-                            -audio_token_length_func(len(audio_chunk_frame)) // self.temporal_merge_size
+                        # audio_token_length = -(-audio_token_length_func(len(audio_chunk_frame)) // self.temporal_merge_size)
+                        audio_token_length = (
+                            audio_token_length_func(len(audio_chunk_frame)) + self.temporal_merge_size - 1
+                        ) // self.temporal_merge_size
+                        assert audio_token_length > 0, (
+                            f"{audio_token_length=}, {audio_token_length_func(len(audio_chunk_frame))=}, {self.temporal_merge_size=}"
                         )
-                        assert audio_token_length > 0
                         audio_indice_b = torch.zeros(
                             1, audio_token_length, dtype=torch.int64
                         )  # This will change in collate_fn
