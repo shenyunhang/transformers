@@ -2544,15 +2544,17 @@ class YoutuVITAOmniEncoder(YoutuVITAOmniPreTrainedModel):
         """
         hidden_states = hidden_states.contiguous()
 
-        per_layer_rotary = isinstance(rotary_pos_emb, list)
+        # Per-layer rotary is a stacked tensor ``[num_layers, S, dim]`` (one
+        # rotary per layer); a shared rotary is a plain ``[S, dim]`` tensor.
+        per_layer_rotary = torch.is_tensor(rotary_pos_emb) and rotary_pos_emb.dim() == 3
         if per_layer_rotary:
-            if len(rotary_pos_emb) != len(self.layers):
+            if rotary_pos_emb.size(0) != len(self.layers):
                 raise ValueError(
-                    f"per-layer rotary_pos_emb length {len(rotary_pos_emb)} != "
+                    f"per-layer rotary_pos_emb length {rotary_pos_emb.size(0)} != "
                     f"num_hidden_layers {len(self.layers)}"
                 )
             position_embeddings_list = []
-            for layer_rotary in rotary_pos_emb:
+            for layer_rotary in rotary_pos_emb:  # iterates dim 0 -> [S, dim]
                 emb = torch.cat((layer_rotary, layer_rotary), dim=-1)
                 position_embeddings_list.append((emb.cos(), emb.sin()))
             position_embeddings = None  # picked per layer below
@@ -3493,10 +3495,21 @@ class YoutuVITAOmniModel(YoutuVITAOmniPreTrainedModel):
         # per-chunk-local time). For all other configurations the legacy
         # single-tensor rotary is used and broadcasts to every layer.
         if build_nofusion_rotary:
-            rotary_pos_emb_arg = [
-                packed_rotary if fusion else packed_rotary_nofusion
-                for fusion in self._video_fusion_layer_pattern
-            ]
+            # Stack the per-layer rotary embeddings into a SINGLE tensor of
+            # shape ``[num_layers, S, dim]`` (row ``i`` = rotary for layer
+            # ``i``) rather than a per-layer python ``list``. This mirrors the
+            # megatron-side implementation, where the stacked form is required
+            # so the rotary can cross the activation-checkpoint boundary
+            # (``save_for_backward`` accepts tensors only). Keeping the two
+            # sides in the same representation avoids divergence; per-layer
+            # selection happens inside ``YoutuVITAOmniEncoder.forward``.
+            rotary_pos_emb_arg = torch.stack(
+                [
+                    packed_rotary if fusion else packed_rotary_nofusion
+                    for fusion in self._video_fusion_layer_pattern
+                ],
+                dim=0,
+            )
         else:
             rotary_pos_emb_arg = packed_rotary
 
