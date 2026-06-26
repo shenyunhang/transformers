@@ -207,7 +207,7 @@ class Qwen3VITATextConfig(Qwen3Config):
     pass
 
 
-class Qwen3VITAOmniConfig(Qwen3VITATextConfig):
+class Qwen3VITAOmniConfig(Qwen3Config):
 
     model_type = "qwen3_vita_omni"
     base_config_key = "omni_config"

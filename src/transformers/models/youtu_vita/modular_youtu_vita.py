@@ -29,6 +29,7 @@ from ...utils import is_decord_available, is_flash_attn_2_available, is_torchaud
 from ...video_processing_utils import BaseVideoProcessor
 from ...video_utils import VideoInput
 from ..siglip2.configuration_siglip2 import Siglip2VisionConfig
+from ..qwen3.configuration_qwen3 import Qwen3Config
 from ..youtu.configuration_youtu import YoutuConfig
 from ..youtu.modeling_youtu import (
     YoutuAttention,
@@ -216,7 +217,7 @@ class YoutuVITATextConfig(YoutuConfig):
     pass
 
 
-class YoutuVITAOmniConfig(YoutuVITATextConfig):
+class YoutuVITAOmniConfig(Qwen3Config):
 
     model_type = "youtu_vita_omni"
     base_config_key = "omni_config"

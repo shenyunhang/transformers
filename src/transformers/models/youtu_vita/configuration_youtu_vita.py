@@ -219,8 +219,68 @@ class YoutuVITATextConfig(PreTrainedConfig):
         super().__post_init__(**kwargs)
 
 
-class YoutuVITAOmniConfig(YoutuVITATextConfig):
+@auto_docstring(checkpoint="Qwen/YoutuVITAOmni-8B")
+@strict
+class YoutuVITAOmniConfig(PreTrainedConfig):
+    r"""
+    ```python
+    >>> from transformers import YoutuVITAOmniModel, YoutuVITAOmniConfig
+
+    >>> # Initializing a YoutuVITAOmni style configuration
+    >>> configuration = YoutuVITAOmniConfig()
+
+    >>> # Initializing a model from the YoutuVITAOmni-8B style configuration
+    >>> model = YoutuVITAOmniModel(configuration)
+
+    >>> # Accessing the model configuration
+    >>> configuration = model.config
+    ```
+    """
+
     model_type = "youtu_vita_omni"
+    keys_to_ignore_at_inference = ["past_key_values"]
+
+    # Default tensor parallel plan for base model `YoutuVITAOmni`
+    base_model_tp_plan = {
+        "layers.*.self_attn.q_proj": "colwise",
+        "layers.*.self_attn.k_proj": "colwise",
+        "layers.*.self_attn.v_proj": "colwise",
+        "layers.*.self_attn.q_norm": "replicated_with_grad_allreduce",
+        "layers.*.self_attn.k_norm": "replicated_with_grad_allreduce",
+        "layers.*.self_attn.o_proj": "rowwise",
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+    }
+    base_model_pp_plan = {
+        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
+        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
+        "norm": (["hidden_states"], ["hidden_states"]),
+    }
+
+    vocab_size: int = 151936
+    hidden_size: int = 4096
+    intermediate_size: int = 22016
+    num_hidden_layers: int = 32
+    num_attention_heads: int = 32
+    num_key_value_heads: int | None = 32
+    head_dim: int = 128
+    hidden_act: str = "silu"
+    max_position_embeddings: int = 32768
+    initializer_range: float = 0.02
+    rms_norm_eps: float = 1e-6
+    use_cache: bool = True
+    tie_word_embeddings: bool = False
+    rope_parameters: RopeParameters | dict | None = None
+    attention_bias: bool = False
+    use_sliding_window: bool = False
+    sliding_window: int | None = 4096
+    max_window_layers: int = 28
+    layer_types: list[str] | None = None
+    attention_dropout: float | int = 0.0
+    pad_token_id: int | None = None
+    bos_token_id: int | None = None
+    eos_token_id: int | list[int] | None = None
     base_config_key = "omni_config"
 
     # ---- Omni-specific fields ------------------------------------------------
@@ -289,6 +349,20 @@ class YoutuVITAOmniConfig(YoutuVITATextConfig):
     rope_m_dim: int = 4
     rope_theta_m: float = 100.0
     rope_theta: float = 10000.0
+
+    def __post_init__(self, **kwargs):
+        self.sliding_window = self.sliding_window if self.use_sliding_window else None
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+
+        if self.layer_types is None:
+            self.layer_types = [
+                "sliding_attention"
+                if self.sliding_window is not None and i >= self.max_window_layers
+                else "full_attention"
+                for i in range(self.num_hidden_layers)
+            ]
+        super().__post_init__(**kwargs)
 
 
 class YoutuVITAConfig(PreTrainedConfig):
