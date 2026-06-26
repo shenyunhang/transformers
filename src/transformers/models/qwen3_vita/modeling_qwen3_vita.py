@@ -3686,7 +3686,7 @@ class Qwen3VITAModel(Qwen3VITAPreTrainedModel):
             # print(f"{image_grid_thw.size()=}")
             # print(f"{images.size()=}")
 
-            if len(image_grid_thw) > 64:
+            if len(image_grid_thw) > 1024:
                 image_embeds = []
                 image_grid_thw = torch.split(image_grid_thw, 64, dim=0)
                 chunk_num = len(image_grid_thw)

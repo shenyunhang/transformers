@@ -5566,7 +5566,7 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                     #     -audio_token_length_func(len(audio)) // self.temporal_merge_size
                     # )
                     audio_token_length = (audio_token_length_func(len(audio)) + self.temporal_merge_size - 1) // self.temporal_merge_size
-                    assert audio_token_length > 0, f"{audio_token_length=}, {audio_token_length_func(len(audio))=}, {self.temporal_merge_size=}"
+                    assert audio_token_length > 0, f"{len(audio)=} {audio_token_length_func(len(audio))=} {audio_token_length=} {self.temporal_merge_size=} {audio_or_paths=}"
 
                     audio_indice_b = torch.zeros(
                         1, audio_token_length, dtype=torch.int64
@@ -6271,7 +6271,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
 
                         # audio_token_length = -(-audio_token_length_func(len(audio_chunk_frame)) // self.temporal_merge_size)
                         audio_token_length = (audio_token_length_func(len(audio_chunk_frame)) + self.temporal_merge_size - 1) // self.temporal_merge_size
-                        assert audio_token_length > 0, f"{audio_token_length=}, {audio_token_length_func(len(audio_chunk_frame))=}, {self.temporal_merge_size=}"
+                        assert audio_token_length > 0, f"{len(audio_chunk_frame)=} {audio_token_length_func(len(audio_chunk_frame))=} {audio_token_length=} {self.temporal_merge_size=} {video_paths=}"
                         audio_indice_b = torch.zeros(
                             1, audio_token_length, dtype=torch.int64
                         )  # This will change in collate_fn

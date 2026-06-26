@@ -637,7 +637,7 @@ class YoutuVITAVideoProcessor(BaseVideoProcessor):
                             audio_token_length_func(len(audio_chunk_frame)) + self.temporal_merge_size - 1
                         ) // self.temporal_merge_size
                         assert audio_token_length > 0, (
-                            f"{audio_token_length=}, {audio_token_length_func(len(audio_chunk_frame))=}, {self.temporal_merge_size=}"
+                            f"{len(audio_chunk_frame)=} {audio_token_length_func(len(audio_chunk_frame))=} {audio_token_length=} {self.temporal_merge_size=} {video_paths=}"
                         )
                         audio_indice_b = torch.zeros(
                             1, audio_token_length, dtype=torch.int64

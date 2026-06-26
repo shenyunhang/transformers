@@ -386,7 +386,7 @@ class YoutuVITAFeatureExtractor(SequenceFeatureExtractor):
                         audio_token_length_func(len(audio)) + self.temporal_merge_size - 1
                     ) // self.temporal_merge_size
                     assert audio_token_length > 0, (
-                        f"{audio_token_length=}, {audio_token_length_func(len(audio))=}, {self.temporal_merge_size=}"
+                        f"{len(audio)=} {audio_token_length_func(len(audio))=} {audio_token_length=} {self.temporal_merge_size=} {audio_or_paths=}"
                     )
 
                     audio_indice_b = torch.zeros(
