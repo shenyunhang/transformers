@@ -22,7 +22,6 @@ from .tokenization_youtu_vita import VisionTokenizer
 logger = logging.get_logger(__name__)
 
 
-# _GLOBAL_CONSTANTS = Youtu_VITA_TOKEN_bus1()
 _GLOBAL_CONSTANTS = Youtu_VITA_TOKEN()
 
 

@@ -15,7 +15,6 @@ from .modeling_qwen3_vita import Qwen3_VITA_TOKEN, Qwen3VITAAudioKwargs
 from .tokenization_qwen3_vita import AudioTokenizer, GLM4VoiceTokenizer, MelFilterBankTokenizer, WavFrontendTokenizer
 
 
-# _GLOBAL_CONSTANTS = Qwen3_VITA_TOKEN_bus1()
 _GLOBAL_CONSTANTS = Qwen3_VITA_TOKEN()
 
 

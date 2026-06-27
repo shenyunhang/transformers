@@ -15,7 +15,6 @@ from .modeling_youtu_vita import Youtu_VITA_TOKEN, YoutuVITAAudioKwargs
 from .tokenization_youtu_vita import AudioTokenizer, GLM4VoiceTokenizer, MelFilterBankTokenizer, WavFrontendTokenizer
 
 
-# _GLOBAL_CONSTANTS = Youtu_VITA_TOKEN_bus1()
 _GLOBAL_CONSTANTS = Youtu_VITA_TOKEN()
 
 

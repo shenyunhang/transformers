@@ -22,7 +22,6 @@ from .tokenization_qwen3_vita import VisionTokenizer
 logger = logging.get_logger(__name__)
 
 
-# _GLOBAL_CONSTANTS = Qwen3_VITA_TOKEN_bus1()
 _GLOBAL_CONSTANTS = Qwen3_VITA_TOKEN()
 
 

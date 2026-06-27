@@ -6032,7 +6032,9 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
 
             if use_audio_in_video and audio_frames is not None:
                 # audios.extend(audio_frames)
-                audios.extend([xx for x in audio_chunks for xx in x])
+                # Skip zero-length audio segments so the audio list stays aligned
+                # with the audio token blocks emitted below.
+                audios.extend([xx for x in audio_chunks for xx in x if len(xx) > 0])
 
             new_input_ids += [VID_START_ID]
             if targets is not None:
@@ -6145,6 +6147,12 @@ class Qwen3VITAVideoProcessor(BaseVideoProcessor):
                 for audio_chunk_frame, audio_second_chunk_frame in zip(
                     audio_chunk_frames, audio_second_chunk_frames
                 ):
+                    # Skip empty audio segments (e.g. videos whose audio track is
+                    # missing or whose timestamp slicing yields zero-length chunks),
+                    # which would otherwise produce zero audio tokens. This stays
+                    # aligned with the filtering applied to ``audios`` above.
+                    if len(audio_chunk_frame) == 0:
+                        continue
 
                     # add timestamp
                     if timestamp_format == "HHMMSS":
