@@ -262,7 +262,8 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
             return image_data
 
         if is_contiguous:
-            return self.process_native(image_or_path, **kwargs)
+            # return self.process_native(image_or_path, **kwargs)
+            return self.process_native_v2(image_or_path, **kwargs)
 
     def process_images(self, image_or_paths, is_discrete=False, is_contiguous=False, **kwargs):
         images = []
@@ -338,6 +339,87 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
             "images": image[None, ...],
             "image_height": resized_height,
             "image_width": resized_width,
+        }
+
+    def process_native_v2(self, image_or_path, **kwargs):
+        """Resize keeping aspect ratio so the total pixels fall within
+        [min_pixels, max_pixels], then pad (without distorting the content) so
+        that both height and width are divisible by ``factor`` while the padded
+        size still stays within [min_pixels, max_pixels].
+        """
+        if isinstance(image_or_path, str):
+            image = PIL.Image.open(image_or_path).convert("RGB")
+        elif isinstance(image_or_path, PIL.Image.Image):
+            image = image_or_path.convert("RGB")
+        else:
+            image = image_or_path
+
+        width, height = image.size
+
+        min_pixels = kwargs.get("min_pixels", self.min_pixels)
+        max_pixels = kwargs.get("max_pixels", self.max_pixels)
+
+        factor = self.patch_size * self.spatial_merge_size
+
+        # ------------------------------------------------------------------
+        # Step 1: resize to keep aspect ratio with pixels in [min, max]
+        # ------------------------------------------------------------------
+        resized_height, resized_width = height, width
+        cur_pixels = resized_height * resized_width
+        if cur_pixels > max_pixels:
+            beta = math.sqrt(cur_pixels / max_pixels)
+            resized_height = max(1, int(math.floor(height / beta)))
+            resized_width = max(1, int(math.floor(width / beta)))
+        elif cur_pixels < min_pixels:
+            beta = math.sqrt(min_pixels / cur_pixels)
+            resized_height = max(1, int(math.ceil(height * beta)))
+            resized_width = max(1, int(math.ceil(width * beta)))
+
+        # ------------------------------------------------------------------
+        # Step 2: pad both dims to a multiple of factor, keep padded size
+        # within [min, max]. Padding up (ceil) is preferred since it keeps the
+        # full content; if that overflows max_pixels, pad down (floor) instead
+        # and shrink the content to fit the canvas, which is guaranteed to stay
+        # within max_pixels in a single step (floor canvas <= content area).
+        # ------------------------------------------------------------------
+        padded_height = math.ceil(resized_height / factor) * factor
+        padded_width = math.ceil(resized_width / factor) * factor
+
+        if padded_height * padded_width > max_pixels:
+            padded_height = max(factor, math.floor(resized_height / factor) * factor)
+            padded_width = max(factor, math.floor(resized_width / factor) * factor)
+
+            # Shrink the content (keep aspect ratio) so it fits in the canvas.
+            scale = min(padded_height / resized_height, padded_width / resized_width)
+            resized_height = max(1, min(padded_height, int(round(resized_height * scale))))
+            resized_width = max(1, min(padded_width, int(round(resized_width * scale))))
+
+        # ------------------------------------------------------------------
+        # Resize content then paste onto the padded canvas (centered).
+        # ------------------------------------------------------------------
+        image = image.resize((resized_width, resized_height), resample=PIL.Image.Resampling.BICUBIC)
+
+        background_color = tuple(int(x * 255) for x in self.mean)
+        canvas = PIL.Image.new("RGB", (padded_width, padded_height), background_color)
+        paste_x = (padded_width - resized_width) // 2
+        paste_y = (padded_height - resized_height) // 2
+        canvas.paste(image, (paste_x, paste_y))
+        image = canvas
+
+        image = np.array(image, dtype=np.float32)
+        image = image * 1.0 / 255.0
+
+        mean = np.array(self.mean, dtype=image.dtype)
+        std = np.array(self.std, dtype=image.dtype)
+        image = (image - mean) / std
+
+        image = torch.tensor(image, dtype=torch.float32)
+        image = image.permute(2, 0, 1)
+
+        return {
+            "images": image[None, ...],
+            "image_height": padded_height,
+            "image_width": padded_width,
         }
 
         return image[None, ...], (resized_width, resized_height)

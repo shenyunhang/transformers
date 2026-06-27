@@ -4122,113 +4122,6 @@ class DEFAULT_TOKEN:
             print(f"♾️ {field.name} {getattr(self, field.name)}")
 
 
-class Qwen3_VITA_TOKEN_bus1(DEFAULT_TOKEN):
-
-    IM_START = "<|begin_of_text|>"
-    IM_END = "<|end_of_text|>"
-    USER = "user"
-    ASSISTANT = "assistant"
-    SYSTEM = "system"
-
-    THINK_START_TOKEN = "<think>"
-    THINK_END_TOKEN = "</think>"
-    CODE_START_TOKEN = "<code>"
-    CODE_END_TOKEN = "</code>"
-    ANSWER_START_TOKEN = "<answer>"
-    ANSWER_END_TOKEN = "</answer>"
-
-    TOOL_CALL_START_TOKEN = "<tool_call>"
-    TOOL_CALL_END_TOKEN = "</tool_call>"
-    TOOL_RESPONSE_START_TOKEN = "<tool_response>"
-    TOOL_RESPONSE_END_TOKEN = "</tool_response>"
-
-    IMG_TAG_TOKEN = "<|image|>"
-    IMG_CONTEXT_TOKEN = "<|image_pad|>"
-    IMG_START_TOKEN = "<|vision_start|>"
-    IMG_END_TOKEN = "<|vision_end|>"
-
-    VID_TAG_TOKEN = "<|video|>"
-    VID_CONTEXT_TOKEN = "<|video_pad|>"
-    VID_START_TOKEN = "<|video_start|>"
-    VID_END_TOKEN = "<|video_end|>"
-
-    AUD_TAG_TOKEN = "<|audio|>"
-    AUD_CONTEXT_TOKEN = "<|audio_pad|>"
-    AUD_START_TOKEN = "<|audio_start|>"
-    AUD_END_TOKEN = "<|audio_end|>"
-
-    POLY_START_TOKEN = "<poly>"
-    POLY_END_TOKEN = "</poly>"
-    INS_START_TOKEN = "<ins>"
-    INS_END_TOKEN = "</ins>"
-    CKPT_START_TOKEN = "<kpt>"
-    CKPT_END_TOKEN = "</kpt>"
-    BOX_START_TOKEN = "<box>"
-    BOX_END_TOKEN = "</box>"
-    REF_START_TOKEN = "<ref>"
-    REF_END_TOKEN = "</ref>"
-    FG_TOKEN = "<FG>"
-    BG_TOKEN = "<BG>"
-    OTHERS_TOKEN = "<OTHERS>"
-
-    def __init__(self):
-        logger.info(f"♾️ {self.__class__.__name__=}")
-        print(f"♾️ {self.__class__.__name__=}")
-        super().__init__()
-
-        for i in range(2048):
-            for axis in ["x", "y"]:
-                setattr(self, f"{axis}_{i}_TOKEN", f"<{axis}_{i}>")
-
-        for i in range(1, 1001):
-            setattr(self, f"custom_{i}_TOKEN", f"<custom_{i}>")
-
-    def get_special_tokens(self):
-        return (
-            [getattr(self, f"{axis}_{i}_TOKEN") for i in range(2048) for axis in ["x", "y"]]
-            + [getattr(self, f"custom_{i}_TOKEN") for i in range(1, 1001)]
-            + [
-                self.POLY_START_TOKEN,
-                self.POLY_END_TOKEN,
-                self.INS_START_TOKEN,
-                self.INS_END_TOKEN,
-                self.CKPT_START_TOKEN,
-                self.CKPT_END_TOKEN,
-                self.BOX_START_TOKEN,
-                self.BOX_END_TOKEN,
-                self.REF_START_TOKEN,
-                self.REF_END_TOKEN,
-                self.FG_TOKEN,
-                self.BG_TOKEN,
-                self.OTHERS_TOKEN,
-                self.THINK_START_TOKEN,
-                self.THINK_END_TOKEN,
-                self.CODE_START_TOKEN,
-                self.CODE_END_TOKEN,
-                self.ANSWER_START_TOKEN,
-                self.ANSWER_END_TOKEN,
-                self.TOOL_CALL_START_TOKEN,
-                self.TOOL_CALL_END_TOKEN,
-                self.TOOL_RESPONSE_START_TOKEN,
-                self.TOOL_RESPONSE_END_TOKEN,
-                self.IM_START,
-                self.IM_END,
-                self.IMG_TAG_TOKEN,
-                self.IMG_CONTEXT_TOKEN,
-                self.IMG_START_TOKEN,
-                self.IMG_END_TOKEN,
-                self.VID_TAG_TOKEN,
-                self.VID_CONTEXT_TOKEN,
-                self.VID_START_TOKEN,
-                self.VID_END_TOKEN,
-                self.AUD_TAG_TOKEN,
-                self.AUD_CONTEXT_TOKEN,
-                self.AUD_START_TOKEN,
-                self.AUD_END_TOKEN,
-            ]
-        )
-
-
 class Qwen3_VITA_TOKEN(DEFAULT_TOKEN):
 
     IM_START = "<|begin_of_text|>"
@@ -4289,6 +4182,14 @@ class Qwen3_VITA_TOKEN(DEFAULT_TOKEN):
     FG_TOKEN = "<FG>"
     BG_TOKEN = "<BG>"
     OTHERS_TOKEN = "<OTHERS>"
+
+    START_TOKEN = "<start>"
+    CONTENT_TOKEN = "<content>"
+    UP_TOKEN = "<up>"
+    LEFT_TOKEN = "<left>"
+
+    SMILES_START_TOKEN = "<smiles>"
+    SMILES_END_TOKEN = "</smiles>"
 
     def __init__(self):
         logger.info(f"♾️ {self.__class__.__name__=}")
@@ -4363,10 +4264,17 @@ class Qwen3_VITA_TOKEN(DEFAULT_TOKEN):
             ]
             + [getattr(self, f"{axis}_{i}_TOKEN") for i in range(2048) for axis in ["x", "y"]]
             + [getattr(self, f"custom_{i}_TOKEN") for i in range(1, 1001)]
+            + [
+                self.START_TOKEN,
+                self.CONTENT_TOKEN,
+                self.UP_TOKEN,
+                self.LEFT_TOKEN,
+                self.SMILES_START_TOKEN,
+                self.SMILES_END_TOKEN,
+            ]
         )
 
 
-# _GLOBAL_CONSTANTS = Qwen3_VITA_TOKEN_bus1()
 _GLOBAL_CONSTANTS = Qwen3_VITA_TOKEN()
 
 
@@ -6534,7 +6442,8 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
             return image_data
 
         if is_contiguous:
-            return self.process_native(image_or_path, **kwargs)
+            # return self.process_native(image_or_path, **kwargs)
+            return self.process_native_v2(image_or_path, **kwargs)
 
     def process_images(self, image_or_paths, is_discrete=False, is_contiguous=False, **kwargs):
         images = []
@@ -6610,6 +6519,89 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
             "images": image[None, ...],
             "image_height": resized_height,
             "image_width": resized_width,
+        }
+
+    def process_native_v2(self, image_or_path, **kwargs):
+        """Resize keeping aspect ratio so the total pixels fall within
+        [min_pixels, max_pixels], then pad (without distorting the content) so
+        that both height and width are divisible by ``factor`` while the padded
+        size still stays within [min_pixels, max_pixels].
+        """
+        if isinstance(image_or_path, str):
+            image = PIL.Image.open(image_or_path).convert("RGB")
+        elif isinstance(image_or_path, PIL.Image.Image):
+            image = image_or_path.convert("RGB")
+        else:
+            image = image_or_path
+
+        width, height = image.size
+
+        min_pixels = kwargs.get("min_pixels", self.min_pixels)
+        max_pixels = kwargs.get("max_pixels", self.max_pixels)
+
+        factor = self.patch_size * self.spatial_merge_size
+
+        # ------------------------------------------------------------------
+        # Step 1: resize to keep aspect ratio with pixels in [min, max]
+        # ------------------------------------------------------------------
+        resized_height, resized_width = height, width
+        cur_pixels = resized_height * resized_width
+        if cur_pixels > max_pixels:
+            beta = math.sqrt(cur_pixels / max_pixels)
+            resized_height = max(1, int(math.floor(height / beta)))
+            resized_width = max(1, int(math.floor(width / beta)))
+        elif cur_pixels < min_pixels:
+            beta = math.sqrt(min_pixels / cur_pixels)
+            resized_height = max(1, int(math.ceil(height * beta)))
+            resized_width = max(1, int(math.ceil(width * beta)))
+
+        # ------------------------------------------------------------------
+        # Step 2: pad both dims to a multiple of factor, keep padded size
+        # within [min, max]. Padding up (ceil) is preferred since it keeps the
+        # full content; if that overflows max_pixels, pad down (floor) instead
+        # and shrink the content to fit the canvas, which is guaranteed to stay
+        # within max_pixels in a single step (floor canvas <= content area).
+        # ------------------------------------------------------------------
+        padded_height = math.ceil(resized_height / factor) * factor
+        padded_width = math.ceil(resized_width / factor) * factor
+
+        if padded_height * padded_width > max_pixels:
+            padded_height = max(factor, math.floor(resized_height / factor) * factor)
+            padded_width = max(factor, math.floor(resized_width / factor) * factor)
+
+            # Shrink the content (keep aspect ratio) so it fits in the canvas.
+            scale = min(padded_height / resized_height, padded_width / resized_width)
+            resized_height = max(1, min(padded_height, int(round(resized_height * scale))))
+            resized_width = max(1, min(padded_width, int(round(resized_width * scale))))
+
+        # ------------------------------------------------------------------
+        # Resize content then paste onto the padded canvas (centered).
+        # ------------------------------------------------------------------
+        image = image.resize(
+            (resized_width, resized_height), resample=PIL.Image.Resampling.BICUBIC
+        )
+
+        background_color = tuple(int(x * 255) for x in self.mean)
+        canvas = PIL.Image.new("RGB", (padded_width, padded_height), background_color)
+        paste_x = (padded_width - resized_width) // 2
+        paste_y = (padded_height - resized_height) // 2
+        canvas.paste(image, (paste_x, paste_y))
+        image = canvas
+
+        image = np.array(image, dtype=np.float32)
+        image = image * 1.0 / 255.0
+
+        mean = np.array(self.mean, dtype=image.dtype)
+        std = np.array(self.std, dtype=image.dtype)
+        image = (image - mean) / std
+
+        image = torch.tensor(image, dtype=torch.float32)
+        image = image.permute(2, 0, 1)
+
+        return {
+            "images": image[None, ...],
+            "image_height": padded_height,
+            "image_width": padded_width,
         }
 
         return image[None, ...], (resized_width, resized_height)
