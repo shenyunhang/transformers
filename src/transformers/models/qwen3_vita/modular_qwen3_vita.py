@@ -6583,7 +6583,9 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
             resized_width = max(1, min(padded_width, int(round(resized_width * scale))))
 
         # ------------------------------------------------------------------
-        # Resize content then paste onto the padded canvas (centered).
+        # Resize content then paste onto the padded canvas at the top-left
+        # corner, so that padding is only applied to the right and bottom
+        # edges instead of around the whole image.
         # ------------------------------------------------------------------
         image = image.resize(
             (resized_width, resized_height), resample=PIL.Image.Resampling.BICUBIC
@@ -6591,9 +6593,7 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
 
         background_color = tuple(int(x * 255) for x in self.mean)
         canvas = PIL.Image.new("RGB", (padded_width, padded_height), background_color)
-        paste_x = (padded_width - resized_width) // 2
-        paste_y = (padded_height - resized_height) // 2
-        canvas.paste(image, (paste_x, paste_y))
+        canvas.paste(image, (0, 0))
         image = canvas
 
         image = np.array(image, dtype=np.float32)
@@ -6610,6 +6610,8 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
             "images": image[None, ...],
             "image_height": padded_height,
             "image_width": padded_width,
+            "resized_height": resized_height,
+            "resized_width": resized_width,
         }
 
         return image[None, ...], (resized_width, resized_height)
@@ -6682,11 +6684,14 @@ class Qwen3VITAImageProcessor(BaseImageProcessor):
 
         width, height = image.size
         image_data = self.process_image(image_or_path, is_contiguous=True)
-        best_width = image_data["image_width"]
-        best_height = image_data["image_height"]
+        # Use the actual resized content size (excluding right/bottom padding)
+        # to compute the scale factor between the original image and the
+        # resized image content on the padded canvas.
+        resized_width = image_data.get("resized_width", image_data["image_width"])
+        resized_height = image_data.get("resized_height", image_data["image_height"])
 
-        scale_x = 1.0 * best_width / width
-        scale_y = 1.0 * best_height / height
+        scale_x = 1.0 * resized_width / width
+        scale_y = 1.0 * resized_height / height
 
         return scale_x, scale_y
 
