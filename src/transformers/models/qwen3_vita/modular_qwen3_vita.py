@@ -208,6 +208,58 @@ class Qwen3VITATextConfig(Qwen3Config):
 
 
 class Qwen3VITAOmniConfig(Qwen3Config):
+    r"""
+    downsample_hidden_size (`int`, *optional*, defaults to 512):
+        Hidden size of the Conv2d audio down-sampling front-end.
+    n_window (`int`, *optional*, defaults to 50):
+        Audio window size (in frames) used to chunk the mel features during training.
+    n_window_infer (`int`, *optional*, defaults to 800):
+        Audio window size (in frames) used to chunk the mel features at inference time.
+    conv_chunksize (`int`, *optional*, defaults to 500):
+        Chunk size used when running the audio convolution front-end to bound peak memory usage.
+    temporal_merge_size (`int`, *optional*, defaults to 2):
+        Temporal down-sampling factor applied to audio tokens before projection to the LM hidden size.
+    merger_hidden_size (`int`, *optional*, defaults to 4608):
+        Intermediate hidden size of the projector that maps encoder features to the LM hidden size.
+    out_hidden_size (`int`, *optional*, defaults to 4608):
+        Output hidden size of the projector (should match the LM hidden size).
+    video_group_attention (`bool`, *optional*, defaults to `False`):
+        Whether to split each video into `(image + audio*)` groups inside the joint encoder, so that attention is
+        restricted to the images/audios belonging to the same group.
+    video_fusion_layer_freq (`int` or `list`, *optional*):
+        Per-omni-encoder-layer mask controlling which layers apply video fusion attention. `None` makes every layer a
+        fusion layer; an `int` `N` makes layer `i` a fusion layer iff `i % N == 0`; a `list` of length
+        `num_hidden_layers` provides an explicit 0/1 mask (`1` = fusion layer, `0` = non-fusion layer).
+    video_omni_chunked_mthw_rope (`bool`, *optional*, defaults to `False`):
+        Whether to use the chunked 4D `(m, t, h, w)` RoPE variant for the omni encoder.
+    video_omni_interleaved_mthw_rope (`bool`, *optional*, defaults to `False`):
+        Whether to use the interleaved 4D `(m, t, h, w)` RoPE variant for the omni encoder. Takes precedence over the
+        chunked variant when both flags are set.
+    video_omni_interleaved_thw_section (`tuple(int, int, int)`, *optional*):
+        Optional explicit `(t_len, h_len, w_len)` split for the THW segment of the interleaved 4D RoPE variant. `None`
+        falls back to the default split where T takes the remainder.
+    rope_m_dim (`int`, *optional*, defaults to 4):
+        Size of the modality (M) segment of the 4D RoPE. Set to `0` to drop the M segment and degrade to a pure 3D
+        `(t, h, w)` RoPE.
+    rope_theta_m (`float`, *optional*, defaults to 100.0):
+        RoPE theta used for the modality (M) segment; small so that low-cardinality modality ids still produce
+        non-vanishing rotation angles.
+    rope_theta (`float`, *optional*, defaults to 10000.0):
+        RoPE theta used for the T / H / W segments.
+
+    ```python
+    >>> from transformers import Qwen3VITAOmniModel, Qwen3VITAOmniConfig
+
+    >>> # Initializing a Qwen3VITAOmni style configuration
+    >>> configuration = Qwen3VITAOmniConfig()
+
+    >>> # Initializing a model from the Qwen3VITAOmni-8B style configuration
+    >>> model = Qwen3VITAOmniModel(configuration)
+
+    >>> # Accessing the model configuration
+    >>> configuration = model.config
+    ```
+    """
 
     model_type = "qwen3_vita_omni"
     base_config_key = "omni_config"
@@ -4187,6 +4239,7 @@ class Qwen3_VITA_TOKEN(DEFAULT_TOKEN):
     CONTENT_TOKEN = "<content>"
     UP_TOKEN = "<up>"
     LEFT_TOKEN = "<left>"
+    LEFT_UP_TOKEN = "<left_up>"
 
     SMILES_START_TOKEN = "<smiles>"
     SMILES_END_TOKEN = "</smiles>"
@@ -4269,6 +4322,7 @@ class Qwen3_VITA_TOKEN(DEFAULT_TOKEN):
                 self.CONTENT_TOKEN,
                 self.UP_TOKEN,
                 self.LEFT_TOKEN,
+                self.LEFT_UP_TOKEN,
                 self.SMILES_START_TOKEN,
                 self.SMILES_END_TOKEN,
             ]

@@ -4238,6 +4238,7 @@ class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
     CONTENT_TOKEN = "<content>"
     UP_TOKEN = "<up>"
     LEFT_TOKEN = "<left>"
+    LEFT_UP_TOKEN = "<left_up>"
 
     SMILES_START_TOKEN = "<smiles>"
     SMILES_END_TOKEN = "</smiles>"
@@ -4313,6 +4314,7 @@ class Youtu_VITA_TOKEN(DEFAULT_TOKEN):
                 self.CONTENT_TOKEN,
                 self.UP_TOKEN,
                 self.LEFT_TOKEN,
+                self.LEFT_UP_TOKEN,
                 self.SMILES_START_TOKEN,
                 self.SMILES_END_TOKEN,
             ]
